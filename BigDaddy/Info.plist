@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>BigDaddy</string>
+  <key>CFBundleIdentifier</key>
+  <string>vip.bigdaddy.monitor</string>
+  <key>CFBundleName</key>
+  <string>BigDaddy</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.4</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>BigDaddy</string>
+  <key>BigDaddyAPIBaseURL</key>
+  <string>http://localhost:8009/api/v1</string>
+</dict>
+</plist>
