@@ -18,7 +18,7 @@ struct DeviceIdentity {
     let secretHash: String
 }
 
-struct ClientConfig: Codable {
+struct ClientConfig: Codable, Equatable {
     var bound: Bool = false
     var configVersion: Int = 1
     var screenshotIntervalMins: Int = 5
@@ -33,6 +33,27 @@ struct ClientConfig: Codable {
     var heartbeatIdleSeconds: Int = 900
     var idleThresholdSeconds: Int = 180
     var hasPendingCommand: Bool = false
+
+    init() {
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bound = try container.decodeIfPresent(Bool.self, forKey: .bound) ?? false
+        configVersion = try container.decodeIfPresent(Int.self, forKey: .configVersion) ?? 1
+        screenshotIntervalMins = try container.decodeIfPresent(Int.self, forKey: .screenshotIntervalMins) ?? 5
+        telegramBotToken = try container.decodeIfPresent(String.self, forKey: .telegramBotToken)
+        telegramChatId = try container.decodeIfPresent(String.self, forKey: .telegramChatId)
+        compressQuality = try container.decodeIfPresent(Double.self, forKey: .compressQuality) ?? 0.6
+        compressMaxWidth = try container.decodeIfPresent(Int.self, forKey: .compressMaxWidth) ?? 1280
+        aiEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiEnabled) ?? false
+        allowScreenshotAiProcessing = try container.decodeIfPresent(Bool.self, forKey: .allowScreenshotAiProcessing) ?? false
+        exitPasswordHash = try container.decodeIfPresent(String.self, forKey: .exitPasswordHash)
+        heartbeatActiveSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatActiveSeconds) ?? 60
+        heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 900
+        idleThresholdSeconds = try container.decodeIfPresent(Int.self, forKey: .idleThresholdSeconds) ?? 180
+        hasPendingCommand = try container.decodeIfPresent(Bool.self, forKey: .hasPendingCommand) ?? false
+    }
 }
 
 final class BigDaddyClient {
@@ -40,13 +61,18 @@ final class BigDaddyClient {
 
     let baseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")!
     let identity: DeviceIdentity
-    var config = ClientConfig()
+    var config: ClientConfig
     var lastHeartbeatDescription = "not sent"
     private var previousCrashAt: Date?
 
     init() {
         self.identity = IdentityStore.load()
+        self.config = ConfigStore.load() ?? ClientConfig()
         BigDaddyClient.lastSharedInstance = self
+    }
+
+    var configFilePath: String {
+        ConfigStore.configFileURL.path
     }
 
     var isIdle: Bool {
@@ -80,10 +106,23 @@ final class BigDaddyClient {
         _ = try? await request(path: "/bigdaddy/client/register", method: "POST", body: body, signed: false)
     }
 
-    func refreshConfig() async {
+    @discardableResult
+    func refreshConfig() async -> Bool {
         guard let data = try? await request(path: "/bigdaddy/client/config", method: "GET", body: nil, signed: true),
-              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else { return }
-        config = response.data
+              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else { return false }
+        let previous = config
+        let remote = response.data
+        if remote.bound {
+            config = remote
+            ConfigStore.save(config)
+        } else if config.bound {
+            config = ClientConfig()
+            ConfigStore.save(config)
+        } else {
+            config.bound = false
+            config.hasPendingCommand = false
+        }
+        return config != previous
     }
 
     func sendHeartbeat(event: EventType) async {
@@ -133,6 +172,7 @@ final class BigDaddyClient {
     }
 
     func pollCommands() async {
+        guard config.bound else { return }
         guard let data = try? await request(path: "/bigdaddy/client/commands?limit=10", method: "GET", body: nil, signed: true),
               let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
         for command in response.data where command.type == "TAKE_SCREENSHOT_NOW" {
@@ -216,6 +256,30 @@ final class BigDaddyClient {
     private static var lockFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/runtime.lock")
+    }
+}
+
+enum ConfigStore {
+    static var configFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BigDaddy/config.json")
+    }
+
+    static func load() -> ClientConfig? {
+        guard let data = try? Data(contentsOf: configFileURL) else { return nil }
+        return try? JSONDecoder.bigDaddy.decode(ClientConfig.self, from: data)
+    }
+
+    static func save(_ config: ClientConfig) {
+        do {
+            try FileManager.default.createDirectory(at: configFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(config)
+            try data.write(to: configFileURL, options: .atomic)
+        } catch {
+            NSLog("BigDaddy failed to save config: \(error.localizedDescription)")
+        }
     }
 }
 

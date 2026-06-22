@@ -16,12 +16,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         client.prepareRuntime()
         statusItem.button?.title = "BD"
         rebuildMenu()
+        scheduleTimers()
         Task {
             await client.register()
-            await client.refreshConfig()
+            let configChanged = await client.refreshConfig()
             await client.sendHeartbeat(event: client.consumePreviousCrash() == nil ? .start : .forceKill)
             await MainActor.run {
-                scheduleTimers()
+                if configChanged {
+                    scheduleTimers()
+                }
                 rebuildMenu()
             }
         }
@@ -38,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Heartbeat: \(client.lastHeartbeatDescription)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Screenshot every \(client.config.screenshotIntervalMins) min", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Send Screenshot Now", action: #selector(sendScreenshotNow), keyEquivalent: "s"))
+        menu.addItem(NSMenuItem(title: "Copy Config Path", action: #selector(copyConfigPath), keyEquivalent: "c"))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitWithPassword), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -51,11 +55,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         screenshotTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(client.config.screenshotIntervalMins * 60), repeats: true) { [weak self] _ in
             self?.performScheduledScreenshot()
         }
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(client.config.heartbeatActiveSeconds), repeats: true) { [weak self] _ in
+        let heartbeatSeconds = client.config.bound ? client.config.heartbeatActiveSeconds : max(client.config.heartbeatActiveSeconds, 300)
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(heartbeatSeconds), repeats: true) { [weak self] _ in
             Task { await self?.client.sendHeartbeat(event: self?.client.isIdle == true ? .idle : .heartbeat) }
         }
-        commandTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            Task { await self?.client.pollCommands() }
+        if client.config.bound {
+            commandTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                Task { await self?.client.pollCommands() }
+            }
         }
     }
 
@@ -81,6 +88,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func sendScreenshotNow() {
         Task { await client.captureAndSendScreenshot(reason: "manual") }
+    }
+
+    @objc private func copyConfigPath() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(client.configFilePath, forType: .string)
     }
 
     @objc private func quitWithPassword() {
