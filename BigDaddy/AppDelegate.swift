@@ -40,7 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Show Bind QR", action: #selector(showQr), keyEquivalent: "b"))
         menu.addItem(NSMenuItem(title: "Heartbeat: \(client.lastHeartbeatDescription)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Screenshot every \(client.config.screenshotIntervalMins) min", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Destination: \(client.hasScreenshotDestination ? "Telegram configured" : "Not configured")", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Send Screenshot Now", action: #selector(sendScreenshotNow), keyEquivalent: "s"))
+        menu.addItem(NSMenuItem(title: "Set Local Telegram", action: #selector(setLocalTelegram), keyEquivalent: "t"))
+        menu.addItem(NSMenuItem(title: "Clear Local Telegram", action: #selector(clearLocalTelegram), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Copy Config Path", action: #selector(copyConfigPath), keyEquivalent: "c"))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitWithPassword), keyEquivalent: "q"))
@@ -88,6 +91,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func sendScreenshotNow() {
         Task { await client.captureAndSendScreenshot(reason: "manual") }
+    }
+
+    @objc private func setLocalTelegram() {
+        let alert = NSAlert()
+        alert.messageText = "Set Local Telegram"
+        alert.informativeText = "This enables standalone screenshot sending before the Mac is bound to a parent dashboard account."
+        let tokenField = NSTextField(frame: NSRect(x: 0, y: 30, width: 360, height: 24))
+        tokenField.placeholderString = "Bot token"
+        tokenField.stringValue = client.config.telegramBotToken ?? ""
+        let chatField = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        chatField.placeholderString = "Chat ID"
+        chatField.stringValue = client.config.telegramChatId ?? ""
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 58))
+        container.addSubview(tokenField)
+        container.addSubview(chatField)
+        alert.accessoryView = container
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        client.saveLocalTelegramDestination(token: tokenField.stringValue, chatId: chatField.stringValue)
+        scheduleTimers()
+        rebuildMenu()
+    }
+
+    @objc private func clearLocalTelegram() {
+        client.clearLocalTelegramDestination()
+        rebuildMenu()
     }
 
     @objc private func copyConfigPath() {

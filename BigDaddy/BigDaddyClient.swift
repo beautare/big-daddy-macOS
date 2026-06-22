@@ -75,6 +75,12 @@ final class BigDaddyClient {
         ConfigStore.configFileURL.path
     }
 
+    var hasScreenshotDestination: Bool {
+        guard let token = config.telegramBotToken, let chatId = config.telegramChatId else { return false }
+        return !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !chatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var isIdle: Bool {
         let idleSeconds = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .mouseMoved)
         return idleSeconds > Double(config.idleThresholdSeconds)
@@ -152,7 +158,9 @@ final class BigDaddyClient {
     }
 
     func captureAndSendScreenshot(reason: String) async {
-        guard let token = config.telegramBotToken, let chatId = config.telegramChatId, !token.isEmpty, !chatId.isEmpty else { return }
+        guard hasScreenshotDestination,
+              let token = config.telegramBotToken,
+              let chatId = config.telegramChatId else { return }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             return
@@ -184,6 +192,19 @@ final class BigDaddyClient {
     func verifyExitPassword(_ value: String) -> Bool {
         guard config.exitPasswordHash != nil else { return true }
         return !value.isEmpty
+    }
+
+    func saveLocalTelegramDestination(token: String, chatId: String) {
+        config.bound = false
+        config.telegramBotToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.telegramChatId = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+        ConfigStore.save(config)
+    }
+
+    func clearLocalTelegramDestination() {
+        config.telegramBotToken = nil
+        config.telegramChatId = nil
+        ConfigStore.save(config)
     }
 
     static func sharedForceKillPing() {
