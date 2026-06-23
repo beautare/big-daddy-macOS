@@ -40,10 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Show Bind QR", action: #selector(showQr), keyEquivalent: "b"))
         menu.addItem(NSMenuItem(title: "Heartbeat: \(client.lastHeartbeatDescription)", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Screenshot every \(client.config.screenshotIntervalMins) min", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Destination: \(client.hasScreenshotDestination ? "Telegram configured" : "Not configured")", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Destination: \(client.hasScreenshotDestination ? (client.config.destinationEmail ?? "Configured") : "Not configured")", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Send Screenshot Now", action: #selector(sendScreenshotNow), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem(title: "Set Local Telegram", action: #selector(setLocalTelegram), keyEquivalent: "t"))
-        menu.addItem(NSMenuItem(title: "Clear Local Telegram", action: #selector(clearLocalTelegram), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Set Destination Email", action: #selector(setDestinationEmail), keyEquivalent: "e"))
+        menu.addItem(NSMenuItem(title: "Clear Destination Email", action: #selector(clearDestinationEmail), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Copy Config Path", action: #selector(copyConfigPath), keyEquivalent: "c"))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitWithPassword), keyEquivalent: "q"))
@@ -94,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 \(fingerprint)
                 
                 One-time Token:
-                \(token) (Valid for 10 minutes)
+                \(token) (Valid for 5 minutes)
                 
                 Binding Link:
                 \(bindUrlString)
@@ -113,30 +113,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await client.captureAndSendScreenshot(reason: "manual") }
     }
 
-    @objc private func setLocalTelegram() {
+    @objc private func setDestinationEmail() {
         let alert = NSAlert()
-        alert.messageText = "Set Local Telegram"
-        alert.informativeText = "This enables standalone screenshot sending before the Mac is bound to a parent dashboard account."
-        let tokenField = NSTextField(frame: NSRect(x: 0, y: 30, width: 360, height: 24))
-        tokenField.placeholderString = "Bot token"
-        tokenField.stringValue = client.config.telegramBotToken ?? ""
-        let chatField = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        chatField.placeholderString = "Chat ID"
-        chatField.stringValue = client.config.telegramChatId ?? ""
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 58))
-        container.addSubview(tokenField)
-        container.addSubview(chatField)
-        alert.accessoryView = container
+        alert.messageText = "Set Destination Email"
+        alert.informativeText = "Enter the parent email address where screenshot notifications will be sent."
+        let emailField = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        emailField.placeholderString = "parent@example.com"
+        emailField.stringValue = client.config.destinationEmail ?? ""
+        alert.accessoryView = emailField
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        client.saveLocalTelegramDestination(token: tokenField.stringValue, chatId: chatField.stringValue)
+        
+        let email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !email.contains("@") {
+            let errAlert = NSAlert()
+            errAlert.messageText = "Invalid Email"
+            errAlert.informativeText = "Please enter a valid email address."
+            errAlert.runModal()
+            return
+        }
+        client.saveLocalDestinationEmail(email)
         scheduleTimers()
         rebuildMenu()
     }
 
-    @objc private func clearLocalTelegram() {
-        client.clearLocalTelegramDestination()
+    @objc private func clearDestinationEmail() {
+        client.clearLocalDestinationEmail()
         rebuildMenu()
     }
 

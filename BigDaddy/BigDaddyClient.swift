@@ -22,8 +22,7 @@ struct ClientConfig: Codable, Equatable {
     var bound: Bool = false
     var configVersion: Int = 1
     var screenshotIntervalMins: Int = 5
-    var telegramBotToken: String?
-    var telegramChatId: String?
+    var destinationEmail: String?
     var compressQuality: Double = 0.6
     var compressMaxWidth: Int = 1280
     var aiEnabled: Bool = false
@@ -42,8 +41,7 @@ struct ClientConfig: Codable, Equatable {
         bound = try container.decodeIfPresent(Bool.self, forKey: .bound) ?? false
         configVersion = try container.decodeIfPresent(Int.self, forKey: .configVersion) ?? 1
         screenshotIntervalMins = try container.decodeIfPresent(Int.self, forKey: .screenshotIntervalMins) ?? 5
-        telegramBotToken = try container.decodeIfPresent(String.self, forKey: .telegramBotToken)
-        telegramChatId = try container.decodeIfPresent(String.self, forKey: .telegramChatId)
+        destinationEmail = try container.decodeIfPresent(String.self, forKey: .destinationEmail)
         compressQuality = try container.decodeIfPresent(Double.self, forKey: .compressQuality) ?? 0.6
         compressMaxWidth = try container.decodeIfPresent(Int.self, forKey: .compressMaxWidth) ?? 1280
         aiEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiEnabled) ?? false
@@ -77,9 +75,8 @@ final class BigDaddyClient {
     }
 
     var hasScreenshotDestination: Bool {
-        guard let token = config.telegramBotToken, let chatId = config.telegramChatId else { return false }
-        return !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !chatId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard let email = config.destinationEmail else { return false }
+        return !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var isIdle: Bool {
@@ -137,6 +134,10 @@ final class BigDaddyClient {
 
     func sendHeartbeat(event: EventType) async {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+        let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        let windowTitle = getActiveWindowTitle()
+        let activeUrl = getActiveBrowserUrl(appName: activeApp)
+        
         let body: [String: Any] = [
             "appVersion": version,
             "eventType": event.rawValue,
@@ -144,8 +145,9 @@ final class BigDaddyClient {
             "lastScreenshotAt": NSNull(),
             "cpuUsage": 0,
             "memoryUsageMb": currentMemoryMb(),
-            "activeAppName": NSWorkspace.shared.frontmostApplication?.localizedName ?? "",
-            "activeWindowTitle": "",
+            "activeAppName": activeApp,
+            "activeWindowTitle": windowTitle,
+            "activeUrl": activeUrl,
             "previousCrashAt": previousCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
             "metadata": ["screenRecordingGranted": CGPreflightScreenCaptureAccess()]
@@ -161,15 +163,145 @@ final class BigDaddyClient {
         }
     }
 
+    private var lastImagePixels: [UInt8]?
+
+    func isImageSimilarToLast(cgImage: CGImage) -> Bool {
+        let width = 8
+        let height = 8
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return false
+        }
+        context.interpolationQuality = .low
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        
+        guard let lastPixels = lastImagePixels else {
+            lastImagePixels = pixels
+            return false
+        }
+        lastImagePixels = pixels
+        
+        var diffSum: Int = 0
+        for i in 0..<pixels.count {
+            diffSum += abs(Int(pixels[i]) - Int(lastPixels[i]))
+        }
+        let averageDiff = Double(diffSum) / Double(pixels.count)
+        NSLog("BigDaddy: Screenshot similarity diff score = \(averageDiff)")
+        return averageDiff < 8.0
+    }
+
+    func getActiveBrowserUrl(appName: String) -> String {
+        var scriptString = ""
+        if appName.contains("Google Chrome") || appName.contains("Chrome") {
+            scriptString = """
+            tell application "Google Chrome"
+                if (count of windows) > 0 then
+                    return URL of active tab of first window
+                end if
+            end tell
+            return ""
+            """
+        } else if appName.contains("Safari") {
+            scriptString = """
+            tell application "Safari"
+                if (count of windows) > 0 then
+                    return URL of current tab of first window
+                end if
+            end tell
+            return ""
+            """
+        } else {
+            return ""
+        }
+        
+        if let script = NSAppleScript(source: scriptString) {
+            var error: NSDictionary?
+            let result = script.executeAndReturnError(&error)
+            if error == nil {
+                return result.stringValue ?? ""
+            }
+        }
+        return ""
+    }
+
+    func getActiveWindowTitle() -> String {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return "" }
+        let pid = frontApp.processIdentifier
+        let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
+        guard let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return "" }
+        for info in windowListInfo {
+            if let windowOwnerPID = info[kCGWindowOwnerPID as String] as? Int, windowOwnerPID == pid {
+                if let layer = info[kCGWindowLayer as String] as? Int, layer == 0 {
+                    if let title = info[kCGWindowName as String] as? String {
+                        return title
+                    }
+                }
+            }
+        }
+        return ""
+    }
+
+    func uploadScreenshot(imageData: Data, activeApp: String, windowTitle: String, activeUrl: String) async throws -> Data {
+        let method = "POST"
+        let boundary = "BigDaddy-Upload-\(UUID().uuidString)"
+        var components = URLComponents(url: baseURL.appendingPathComponent("/bigdaddy/client/screenshot"), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "activeAppName", value: activeApp),
+            URLQueryItem(name: "activeWindowTitle", value: windowTitle.isEmpty ? nil : windowTitle),
+            URLQueryItem(name: "activeUrl", value: activeUrl.isEmpty ? nil : activeUrl)
+        ]
+        
+        guard let url = components.url else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue(identity.fingerprint, forHTTPHeaderField: "X-Device-Fingerprint")
+        
+        let timestamp = String(Int(Date().timeIntervalSince1970))
+        let nonce = UUID().uuidString
+        let pathWithQuery = url.path + (url.query.map { "?\($0)" } ?? "")
+        let emptyHash = SHA256.hash(data: Data()).hex
+        let canonical = "\(method)\n\(pathWithQuery)\n\(emptyHash)\n\(timestamp)\n\(nonce)"
+        
+        let key = SymmetricKey(data: identity.secretHash.data(using: .utf8)!)
+        let signature = HMAC<SHA256>.authenticationCode(for: canonical.data(using: .utf8)!, using: key).data.base64URLEncodedString()
+        
+        request.setValue(timestamp, forHTTPHeaderField: "X-Device-Timestamp")
+        request.setValue(nonce, forHTTPHeaderField: "X-Device-Nonce")
+        request.setValue(signature, forHTTPHeaderField: "X-Device-Signature")
+        
+        var body = Data()
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"screenshot.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
+        body.append(imageData)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        request.httpBody = body
+        
+        let (data, _) = try await URLSession.shared.data(for: request)
+        return data
+    }
+
     func captureAndSendScreenshot(reason: String) async {
-        guard hasScreenshotDestination,
-              let token = config.telegramBotToken,
-              let chatId = config.telegramChatId else { return }
+        guard hasScreenshotDestination else { return }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             return
         }
         guard let image = CGDisplayCreateImage(CGMainDisplayID()) else { return }
+        
+        if isImageSimilarToLast(cgImage: image) {
+            NSLog("BigDaddy: Screenshot is similar to the last one, skip sending.")
+            return
+        }
+
         let bitmap = NSBitmapImageRep(cgImage: image)
         let width = CGFloat(config.compressMaxWidth)
         let scale = min(1, width / CGFloat(bitmap.pixelsWide))
@@ -178,9 +310,15 @@ final class BigDaddyClient {
         nsImage.lockFocus()
         NSImage(cgImage: image, size: NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)).draw(in: NSRect(origin: .zero, size: targetSize))
         nsImage.unlockFocus()
+        
         guard let tiff = nsImage.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return }
         let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: config.compressQuality]) ?? Data()
-        await sendTelegramPhoto(jpeg, token: token, chatId: chatId, reason: reason)
+        
+        let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        let windowTitle = getActiveWindowTitle()
+        let activeUrl = getActiveBrowserUrl(appName: activeApp)
+        
+        _ = try? await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
     }
 
     func pollCommands() async {
@@ -214,17 +352,29 @@ final class BigDaddyClient {
         return false
     }
 
-    func saveLocalTelegramDestination(token: String, chatId: String) {
+    func saveLocalDestinationEmail(_ email: String) {
         config.bound = false
-        config.telegramBotToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        config.telegramChatId = chatId.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.destinationEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
         ConfigStore.save(config)
+        
+        Task {
+            let body: [String: Any] = [
+                "destinationEmail": config.destinationEmail ?? ""
+            ]
+            _ = try? await request(path: "/bigdaddy/client/config", method: "POST", body: body, signed: true)
+        }
     }
 
-    func clearLocalTelegramDestination() {
-        config.telegramBotToken = nil
-        config.telegramChatId = nil
+    func clearLocalDestinationEmail() {
+        config.destinationEmail = nil
         ConfigStore.save(config)
+        
+        Task {
+            let body: [String: Any] = [
+                "destinationEmail": ""
+            ]
+            _ = try? await request(path: "/bigdaddy/client/config", method: "POST", body: body, signed: true)
+        }
     }
 
     static func sharedForceKillPing() {
@@ -238,21 +388,6 @@ final class BigDaddyClient {
             "completedAt": ISO8601DateFormatter().string(from: Date())
         ]
         _ = try? await request(path: "/bigdaddy/client/commands/\(commandId)/ack", method: "POST", body: body, signed: true)
-    }
-
-    private func sendTelegramPhoto(_ data: Data, token: String, chatId: String, reason: String) async {
-        let boundary = "BigDaddy-\(UUID().uuidString)"
-        var request = URLRequest(url: URL(string: "https://api.telegram.org/bot\(token)/sendPhoto")!)
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        var body = Data()
-        body.appendMultipartField(name: "chat_id", value: chatId, boundary: boundary)
-        body.appendMultipartField(name: "caption", value: "BigDaddy screenshot: \(reason)", boundary: boundary)
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"screenshot.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
-        body.append(data)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
-        request.httpBody = body
-        _ = try? await URLSession.shared.data(for: request)
     }
 
     private func request(path: String, method: String, body: [String: Any]?, signed: Bool) async throws -> Data {
