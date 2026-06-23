@@ -78,14 +78,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showQr() {
-        let alert = NSAlert()
-        alert.messageText = "Bind this Mac"
-        alert.informativeText = "Open the dashboard and enter this fingerprint:\n\n\(client.identity.fingerprint)\n\nURI:\nbigdaddy://bind?fingerprint=\(client.identity.fingerprint)"
-        alert.addButton(withTitle: "Copy")
-        alert.addButton(withTitle: "Close")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(client.identity.fingerprint, forType: .string)
+        Task {
+            await client.register()
+            await MainActor.run {
+                let fingerprint = client.identity.fingerprint
+                let token = client.bindToken ?? "N/A"
+                let bindUrlString = "https://dashboard.bigdaddy.com/bind?fingerprint=\(fingerprint)&token=\(token)"
+                
+                let alert = NSAlert()
+                alert.messageText = "Bind this Mac"
+                alert.informativeText = """
+                To bind this device, open your parent dashboard or visit the link below:
+                
+                Fingerprint:
+                \(fingerprint)
+                
+                One-time Token:
+                \(token) (Valid for 10 minutes)
+                
+                Binding Link:
+                \(bindUrlString)
+                """
+                alert.addButton(withTitle: "Copy Link")
+                alert.addButton(withTitle: "Close")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(bindUrlString, forType: .string)
+                }
+            }
         }
     }
 
@@ -134,9 +154,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        if client.verifyExitPassword(input.stringValue) {
-            client.sendShutdownSync()
-            NSApp.terminate(nil)
+        
+        let password = input.stringValue
+        Task {
+            let success = await client.verifyExitPassword(password)
+            await MainActor.run {
+                if success {
+                    client.sendShutdownSync()
+                    NSApp.terminate(nil)
+                } else {
+                    let errorAlert = NSAlert()
+                    errorAlert.messageText = "Authentication Failed"
+                    errorAlert.informativeText = "Invalid exit password or network unreachable."
+                    errorAlert.addButton(withTitle: "OK")
+                    errorAlert.runModal()
+                }
+            }
         }
     }
 

@@ -63,6 +63,7 @@ final class BigDaddyClient {
     let identity: DeviceIdentity
     var config: ClientConfig
     var lastHeartbeatDescription = "not sent"
+    var bindToken: String?
     private var previousCrashAt: Date?
 
     init() {
@@ -109,7 +110,10 @@ final class BigDaddyClient {
             "hostname": Host.current().localizedName ?? "Mac",
             "osVersion": ProcessInfo.processInfo.operatingSystemVersionString
         ]
-        _ = try? await request(path: "/bigdaddy/client/register", method: "POST", body: body, signed: false)
+        if let data = try? await request(path: "/bigdaddy/client/register", method: "POST", body: body, signed: false),
+           let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<DeviceResponse>.self, from: data) {
+            self.bindToken = response.data.bindToken
+        }
     }
 
     @discardableResult
@@ -189,9 +193,25 @@ final class BigDaddyClient {
         }
     }
 
-    func verifyExitPassword(_ value: String) -> Bool {
-        guard config.exitPasswordHash != nil else { return true }
-        return !value.isEmpty
+    func verifyExitPassword(_ value: String) async -> Bool {
+        guard config.bound else {
+            return true
+        }
+        guard config.exitPasswordHash != nil else {
+            return true
+        }
+        let body: [String: Any] = [
+            "exitPassword": value
+        ]
+        do {
+            let data = try await request(path: "/bigdaddy/client/verify-exit", method: "POST", body: body, signed: true)
+            if let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<Bool>.self, from: data) {
+                return response.data
+            }
+        } catch {
+            NSLog("BigDaddy: verifyExitPassword request failed: \(error.localizedDescription)")
+        }
+        return false
     }
 
     func saveLocalTelegramDestination(token: String, chatId: String) {
@@ -308,6 +328,18 @@ struct ApiResponse<T: Codable>: Codable {
     let code: Int
     let message: String
     let data: T
+}
+
+struct DeviceResponse: Codable {
+    let deviceFingerprint: String
+    let deviceName: String?
+    let status: String
+    let latestEvent: String?
+    let appVersion: String?
+    let lastHeartbeatAt: Date?
+    let lastScreenshotAt: Date?
+    let boundAt: Date?
+    let bindToken: String?
 }
 
 struct Command: Codable {
