@@ -1,6 +1,20 @@
 import AppKit
 import CryptoKit
 import Security
+import ApplicationServices
+
+enum Localization {
+    static var isChinese: Bool {
+        if let language = Locale.preferredLanguages.first {
+            return language.hasPrefix("zh")
+        }
+        return false
+    }
+    
+    static func string(zh: String, en: String) -> String {
+        return isChinese ? zh : en
+    }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
@@ -123,6 +137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func showQr() {
+        guard checkAndRequestPermissions() else { return }
+        
         Task {
             await client.register()
             await MainActor.run {
@@ -130,14 +146,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 let initialToken = client.bindToken ?? "000000"
                 
                 let alert = NSAlert()
-                alert.messageText = "设备绑定验证"
-                alert.informativeText = "请在家长端仪表盘输入下方的 6 位动态验证码，或者复制链接进行绑定。\n\n设备指纹 (Fingerprint):\n\(fingerprint)"
+                alert.messageText = Localization.string(zh: "设备绑定验证", en: "Device Binding Verification")
+                alert.informativeText = Localization.string(
+                    zh: "请在家长端仪表盘输入下方的 6 位动态验证码，或者复制链接进行绑定。\n\n设备指纹 (Fingerprint):\n\(fingerprint)",
+                    en: "Please enter the 6-digit dynamic verification code below on the parent dashboard, or copy the link to bind.\n\nDevice Fingerprint:\n\(fingerprint)"
+                )
                 
                 let accessory = self.createAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
                 alert.accessoryView = accessory
                 
-                alert.addButton(withTitle: "复制绑定链接")
-                alert.addButton(withTitle: "关闭")
+                alert.addButton(withTitle: Localization.string(zh: "复制绑定链接", en: "Copy Binding Link"))
+                alert.addButton(withTitle: Localization.string(zh: "关闭", en: "Close"))
                 
                 // 初始化倒计时
                 self.countdownSeconds = 300
@@ -282,7 +301,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let minutes = countdownSeconds / 60
         let seconds = countdownSeconds % 60
         let timeString = String(format: "%02d:%02d", minutes, seconds)
-        countdownLabel?.stringValue = "验证码将在 \(timeString) 后自动更新"
+        countdownLabel?.stringValue = Localization.string(
+            zh: "验证码将在 \(timeString) 后自动更新",
+            en: "Verification code will auto-update in \(timeString)"
+        )
     }
 
     @objc private func sendScreenshotNow() {
@@ -326,14 +348,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     @objc private func quitWithPassword() {
         let alert = NSAlert()
-        alert.messageText = "退出 BigDaddy 客户端"
-        alert.informativeText = "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可正常关闭客户端。"
+        alert.messageText = Localization.string(zh: "退出 BigDaddy 客户端", en: "Exit BigDaddy Client")
+        alert.informativeText = Localization.string(
+            zh: "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可正常关闭客户端。",
+            en: "Please generate a secure exit verification code on the parent dashboard, enter it to close the client."
+        )
         
         let accessory = self.createExitAccessoryView()
         alert.accessoryView = accessory
         
-        alert.addButton(withTitle: "安全退出")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: Localization.string(zh: "安全退出", en: "Secure Exit"))
+        alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
         
         // 初始化倒计时
         self.countdownSeconds = 300
@@ -361,9 +386,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let code = self.exitDigitFields.map { $0.stringValue }.joined()
         if code.count < 6 {
             let errorAlert = NSAlert()
-            errorAlert.messageText = "验证失败"
-            errorAlert.informativeText = "请输入完整的 6 位验证码。"
-            errorAlert.addButton(withTitle: "确认")
+            errorAlert.messageText = Localization.string(zh: "验证失败", en: "Verification Failed")
+            errorAlert.informativeText = Localization.string(zh: "请输入完整的 6 位验证码。", en: "Please enter the complete 6-digit verification code.")
+            errorAlert.addButton(withTitle: Localization.string(zh: "确认", en: "Confirm"))
             errorAlert.runModal()
             return
         }
@@ -376,8 +401,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                     NSApp.terminate(nil)
                 } else {
                     let errorAlert = NSAlert()
-                    errorAlert.messageText = "认证失败"
-                    errorAlert.informativeText = "退出验证码不正确或已过期，请重新在家长端生成后重试。"
+                    errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
+                    errorAlert.informativeText = Localization.string(
+                        zh: "退出验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The exit code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                    )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
                 }
@@ -462,7 +490,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         } else {
             self.countdownTimer?.invalidate()
             self.countdownTimer = nil
-            exitCountdownLabel?.stringValue = "验证码已超时失效，请关闭此窗口并重新获取"
+            exitCountdownLabel?.stringValue = Localization.string(
+                zh: "验证码已超时失效，请关闭此窗口并重新获取",
+                en: "Verification code expired. Please close this window and try again."
+            )
             exitCountdownLabel?.textColor = NSColor.systemRed
         }
     }
@@ -472,7 +503,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let minutes = countdownSeconds / 60
         let seconds = countdownSeconds % 60
         let timeString = String(format: "%02d:%02d", minutes, seconds)
-        exitCountdownLabel?.stringValue = "验证码将在 \(timeString) 后失效"
+        exitCountdownLabel?.stringValue = Localization.string(
+            zh: "验证码将在 \(timeString) 后失效",
+            en: "Verification code will expire in \(timeString)"
+        )
     }
 
     func controlTextDidChange(_ obj: Notification) {
@@ -509,5 +543,193 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         signal(SIGTERM) { _ in BigDaddyClient.sharedForceKillPing() }
         signal(SIGINT) { _ in BigDaddyClient.sharedForceKillPing() }
         signal(SIGHUP) { _ in BigDaddyClient.sharedForceKillPing() }
+    }
+
+    private func checkScreenRecordingPermission() -> Bool {
+        if CGPreflightScreenCaptureAccess() {
+            return true
+        }
+        // 尝试以 1x1 像素做真实截屏校验，绕过 ad-hoc / 无 bundle ID 导致的 preflight 错误
+        if CGDisplayCreateImage(CGMainDisplayID(), rect: CGRect(x: 0, y: 0, width: 1, height: 1)) != nil {
+            return true
+        }
+        return false
+    }
+
+    private func createPermissionCheckerView(hasAccessibility: Bool, hasScreenCapture: Bool) -> NSView {
+        // 创建具有明确 frame 的普通 NSView 作为最外层容器，撑开 NSAlert 的 accessoryView 空间
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 120))
+        
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.spacing = 16
+        container.alignment = .leading
+        container.edgeInsets = NSEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
+        container.translatesAutoresizingMaskIntoConstraints = false
+        
+        parentView.addSubview(container)
+        
+        // 用 Auto Layout 让 container 贴满 parentView
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: parentView.topAnchor),
+            container.bottomAnchor.constraint(equalTo: parentView.bottomAnchor),
+            container.leadingAnchor.constraint(equalTo: parentView.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: parentView.trailingAnchor)
+        ])
+        
+        // 辅助功能行
+        let accRow = createPermissionRow(
+            title: Localization.string(zh: "辅助功能权限", en: "Accessibility Permission"),
+            description: Localization.string(
+                zh: "用于分析前台活动窗口及防止软件被恶意关闭",
+                en: "Analyze active windows and prevent unauthorized closure"
+            ),
+            isGranted: hasAccessibility,
+            action: #selector(openAccessibilitySettings)
+        )
+        container.addArrangedSubview(accRow)
+        
+        // 屏幕录制行
+        let screenRow = createPermissionRow(
+            title: Localization.string(zh: "屏幕录制权限", en: "Screen Recording Permission"),
+            description: Localization.string(
+                zh: "用于定时捕捉屏幕图像以上报至网页控制端",
+                en: "Periodically capture screenshots for parental dashboard"
+            ),
+            isGranted: hasScreenCapture,
+            action: #selector(openScreenRecordingSettings)
+        )
+        container.addArrangedSubview(screenRow)
+        
+        return parentView
+    }
+    
+    private func createPermissionRow(title: String, description: String, isGranted: Bool, action: Selector) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 12
+        row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        
+        // 1. 状态图标
+        let statusLabel = NSTextField(labelWithString: isGranted ? "✅" : "❌")
+        statusLabel.font = NSFont.systemFont(ofSize: 18)
+        row.addArrangedSubview(statusLabel)
+        
+        // 2. 文本介绍
+        let textStack = NSStackView()
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 2
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+        
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 13)
+        titleLabel.textColor = NSColor.labelColor
+        textStack.addArrangedSubview(titleLabel)
+        
+        let descLabel = NSTextField(labelWithString: description)
+        descLabel.font = NSFont.systemFont(ofSize: 11)
+        descLabel.textColor = NSColor.secondaryLabelColor
+        descLabel.cell?.wraps = true
+        descLabel.cell?.isScrollable = false
+        textStack.addArrangedSubview(descLabel)
+        
+        row.addArrangedSubview(textStack)
+        
+        // 3. 操作按钮 (利用 textStack 自动拉伸，将按钮顶到最右侧)
+        let button = NSButton()
+        button.bezelStyle = .rounded
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 90).isActive = true
+        
+        if isGranted {
+            button.title = Localization.string(zh: "已授权", en: "Authorized")
+            button.isEnabled = false
+        } else {
+            button.title = Localization.string(zh: "去授权", en: "Authorize")
+            button.target = self
+            button.action = action
+        }
+        row.addArrangedSubview(button)
+        
+        // 约束优先级与拉伸对齐
+        row.distribution = .fill
+        textStack.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        button.setContentHuggingPriority(.required, for: .horizontal)
+        
+        return row
+    }
+
+    private func checkAndRequestPermissions() -> Bool {
+        let hasAccessibility = AXIsProcessTrustedWithOptions(nil)
+        let hasScreenCapture = checkScreenRecordingPermission()
+        
+        if hasAccessibility && hasScreenCapture {
+            return true
+        }
+        
+        let alert = NSAlert()
+        alert.messageText = Localization.string(zh: "需要系统权限", en: "System Permissions Required")
+        alert.informativeText = Localization.string(
+            zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要以下权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
+            en: "To protect your child, BigDaddy needs the following permissions. Click 'Authorize' to grant access in System Settings, then click 'I've enabled, continue'."
+        )
+        
+        let accessory = createPermissionCheckerView(hasAccessibility: hasAccessibility, hasScreenCapture: hasScreenCapture)
+        alert.accessoryView = accessory
+        
+        alert.addButton(withTitle: Localization.string(zh: "我已开启，继续绑定", en: "I've enabled, continue"))
+        alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
+        
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            let hasAccessibilityNow = AXIsProcessTrustedWithOptions(nil)
+            let hasScreenCaptureNow = checkScreenRecordingPermission()
+            
+            if hasAccessibilityNow && !hasScreenCaptureNow {
+                let restartAlert = NSAlert()
+                restartAlert.messageText = Localization.string(zh: "需要重启应用生效", en: "Restart Required")
+                restartAlert.informativeText = Localization.string(
+                    zh: "如果您已在系统设置中允许了屏幕录制权限，请点击“重启应用”使其生效；否则请点击“返回”先去授权。",
+                    en: "If you have enabled screen recording in System Settings, click 'Restart App' to apply it; otherwise click 'Back' to authorize first."
+                )
+                restartAlert.addButton(withTitle: Localization.string(zh: "重启应用", en: "Restart App"))
+                restartAlert.addButton(withTitle: Localization.string(zh: "返回", en: "Back"))
+                
+                if restartAlert.runModal() == .alertFirstButtonReturn {
+                    restartApplication()
+                }
+            }
+            
+            // 家长配置好后点击“继续”，递归刷新自检状态
+            return checkAndRequestPermissions()
+        }
+        
+        return false
+    }
+
+    private func restartApplication() {
+        guard let executablePath = Bundle.main.executablePath else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        try? process.run()
+        NSApp.terminate(nil)
+    }
+
+    @objc private func openAccessibilitySettings() {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+    
+    @objc private func openScreenRecordingSettings() {
+        CGRequestScreenCaptureAccess()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }
