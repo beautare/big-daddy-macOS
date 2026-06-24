@@ -484,11 +484,16 @@ struct Command: Codable {
 
 enum IdentityStore {
     static func load() -> DeviceIdentity {
+        print("BigDaddy: IdentityStore.load started")
         let secret = keychainValue(key: "deviceSecret") ?? UUID().uuidString + UUID().uuidString
+        print("BigDaddy: keychain deviceSecret loaded")
         setKeychainValue(secret, key: "deviceSecret")
+        print("BigDaddy: keychain deviceSecret saved")
         let platform = IOPlatformUUID.read() ?? Host.current().localizedName ?? "BigDaddyMac"
+        print("BigDaddy: platform UUID read complete")
         let fingerprint = SHA256.hash(data: platform.data(using: .utf8)!).hex
         let secretHash = SHA256.hash(data: secret.data(using: .utf8)!).hex
+        print("BigDaddy: IdentityStore.load completed, fingerprint: \(fingerprint)")
         return DeviceIdentity(fingerprint: fingerprint, secretHash: secretHash)
     }
 
@@ -520,16 +525,25 @@ enum IdentityStore {
 
 enum IOPlatformUUID {
     static func read() -> String? {
+        print("BigDaddy: IOPlatformUUID.read started")
         let task = Process()
         task.launchPath = "/usr/sbin/ioreg"
         task.arguments = ["-rd1", "-c", "IOPlatformExpertDevice"]
         let pipe = Pipe()
         task.standardOutput = pipe
-        try? task.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        return output.split(separator: "\n").first { $0.contains("IOPlatformUUID") }?
-            .split(separator: "\"").dropFirst(3).first.map(String.init)
+        do {
+            try task.run()
+            print("BigDaddy: ioreg task launched successfully")
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            let uuid = output.split(separator: "\n").first { $0.contains("IOPlatformUUID") }?
+                .split(separator: "\"").dropFirst(3).first.map(String.init)
+            print("BigDaddy: ioreg task read completed, uuid is nil: \(uuid == nil)")
+            return uuid
+        } catch {
+            print("BigDaddy Error: Failed to run ioreg task: \(error.localizedDescription)")
+            return nil
+        }
     }
 }
 

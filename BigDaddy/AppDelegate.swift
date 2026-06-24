@@ -2,10 +2,9 @@ import AppKit
 import CryptoKit
 import Security
 
-@main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
     private var heartbeatTimer: Timer?
@@ -18,26 +17,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var exitCountdownLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        print("BigDaddy: applicationDidFinishLaunching started")
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        print("BigDaddy: StatusItem created")
         NSApp.setActivationPolicy(.accessory)
         installSignalHandlers()
+        print("BigDaddy: signal handlers installed")
         client.prepareRuntime()
+        print("BigDaddy: runtime prepared")
         if #available(macOS 11.0, *) {
             if let image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "BigDaddy") {
                 image.isTemplate = true
-                statusItem.button?.image = image
+                statusItem?.button?.image = image
+                print("BigDaddy: StatusItem image set successfully")
             } else {
-                statusItem.button?.title = "BD"
+                statusItem?.button?.title = "BD"
+                print("BigDaddy: StatusItem image load failed, fallback to BD title")
             }
         } else {
-            statusItem.button?.title = "BD"
+            statusItem?.button?.title = "BD"
+            print("BigDaddy: StatusItem title set to BD")
         }
         rebuildMenu()
+        print("BigDaddy: menu rebuilt")
         scheduleTimers()
+        print("BigDaddy: timers scheduled")
         Task {
+            print("BigDaddy: async task background register started")
             await client.register()
+            print("BigDaddy: async task background config refresh started")
             let configChanged = await client.refreshConfig()
+            print("BigDaddy: async task background heartbeat sending started")
             await client.sendHeartbeat(event: client.consumePreviousCrash() == nil ? .start : .forceKill)
             await MainActor.run {
+                print("BigDaddy: async task background completed, updating UI configChanged: \(configChanged)")
                 if configChanged {
                     scheduleTimers()
                 }
@@ -77,7 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "安全退出", action: #selector(quitWithPassword), keyEquivalent: "q"))
-        statusItem.menu = menu
+        statusItem?.menu = menu
     }
 
     private func scheduleTimers() {
