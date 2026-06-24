@@ -3,7 +3,7 @@ import CryptoKit
 import Security
 
 @main
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
@@ -13,12 +13,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var countdownSeconds = 300
     private var digitLabels: [NSTextField] = []
     private var countdownLabel: NSTextField?
+    private var exitDigitFields: [NSTextField] = []
+    private var exitCountdownLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         installSignalHandlers()
         client.prepareRuntime()
-        statusItem.button?.title = "BD"
+        if #available(macOS 11.0, *) {
+            if let image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "BigDaddy") {
+                image.isTemplate = true
+                statusItem.button?.image = image
+            } else {
+                statusItem.button?.title = "BD"
+            }
+        } else {
+            statusItem.button?.title = "BD"
+        }
         rebuildMenu()
         scheduleTimers()
         Task {
@@ -40,17 +51,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Fingerprint: \(client.identity.fingerprint.prefix(12))...", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Show Bind QR", action: #selector(showQr), keyEquivalent: "b"))
-        menu.addItem(NSMenuItem(title: "Heartbeat: \(client.lastHeartbeatDescription)", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Screenshot every \(client.config.screenshotIntervalMins) min", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Destination: \(client.hasScreenshotDestination ? (client.config.destinationEmail ?? "Configured") : "Not configured")", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Send Screenshot Now", action: #selector(sendScreenshotNow), keyEquivalent: "s"))
-        menu.addItem(NSMenuItem(title: "Set Destination Email", action: #selector(setDestinationEmail), keyEquivalent: "e"))
-        menu.addItem(NSMenuItem(title: "Clear Destination Email", action: #selector(clearDestinationEmail), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Copy Config Path", action: #selector(copyConfigPath), keyEquivalent: "c"))
+        
+        if client.config.bound {
+            let statusItem = NSMenuItem(title: "状态: 已受保护", action: nil, keyEquivalent: "")
+            statusItem.isEnabled = false
+            menu.addItem(statusItem)
+            
+            menu.addItem(NSMenuItem(title: "立即同步截图", action: #selector(sendScreenshotNow), keyEquivalent: "s"))
+            menu.addItem(.separator())
+            
+            menu.addItem(NSMenuItem(title: "设置接收邮箱", action: #selector(setDestinationEmail), keyEquivalent: "e"))
+            if client.config.destinationEmail != nil {
+                menu.addItem(NSMenuItem(title: "清除接收邮箱", action: #selector(clearDestinationEmail), keyEquivalent: ""))
+            }
+        } else {
+            let statusItem = NSMenuItem(title: "状态: 未绑定", action: nil, keyEquivalent: "")
+            statusItem.isEnabled = false
+            menu.addItem(statusItem)
+            
+            menu.addItem(NSMenuItem(title: "绑定此 Mac", action: #selector(showQr), keyEquivalent: "b"))
+            menu.addItem(.separator())
+            menu.addItem(NSMenuItem(title: "设置接收邮箱", action: #selector(setDestinationEmail), keyEquivalent: "e"))
+        }
+        
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quitWithPassword), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "安全退出", action: #selector(quitWithPassword), keyEquivalent: "q"))
         statusItem.menu = menu
     }
 
@@ -283,27 +308,178 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitWithPassword() {
         let alert = NSAlert()
-        alert.messageText = "Exit BigDaddy"
-        alert.informativeText = "Enter the parent exit password."
-        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        alert.accessoryView = input
-        alert.addButton(withTitle: "Quit")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        alert.messageText = "退出 BigDaddy 客户端"
+        alert.informativeText = "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可正常关闭客户端。"
         
-        let password = input.stringValue
+        let accessory = self.createExitAccessoryView()
+        alert.accessoryView = accessory
+        
+        alert.addButton(withTitle: "安全退出")
+        alert.addButton(withTitle: "取消")
+        
+        // 初始化倒计时
+        self.countdownSeconds = 300
+        self.updateExitCountdownLabelText()
+        
+        // 启动倒计时 Timer
+        self.countdownTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.tickExitCountdown()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.countdownTimer = timer
+        
+        // 运行 Alert Modal
+        let response = alert.runModal()
+        
+        // Modal 结束，释放计时器
+        self.countdownTimer?.invalidate()
+        self.countdownTimer = nil
+        
+        guard response == .alertFirstButtonReturn else { return }
+        
+        let code = self.exitDigitFields.map { $0.stringValue }.joined()
+        if code.count < 6 {
+            let errorAlert = NSAlert()
+            errorAlert.messageText = "验证失败"
+            errorAlert.informativeText = "请输入完整的 6 位验证码。"
+            errorAlert.addButton(withTitle: "确认")
+            errorAlert.runModal()
+            return
+        }
+        
         Task {
-            let success = await client.verifyExitPassword(password)
+            let success = await client.verifyExitPassword(code)
             await MainActor.run {
                 if success {
                     client.sendShutdownSync()
                     NSApp.terminate(nil)
                 } else {
                     let errorAlert = NSAlert()
-                    errorAlert.messageText = "Authentication Failed"
-                    errorAlert.informativeText = "Invalid exit password or network unreachable."
+                    errorAlert.messageText = "认证失败"
+                    errorAlert.informativeText = "退出验证码不正确或已过期，请重新在家长端生成后重试。"
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
+                }
+            }
+        }
+    }
+
+    private func createExitAccessoryView() -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.spacing = 16
+        container.alignment = .centerX
+        container.wantsLayer = true
+        
+        let digitsStack = NSStackView()
+        digitsStack.orientation = .horizontal
+        digitsStack.spacing = 8
+        digitsStack.alignment = .centerY
+        
+        self.exitDigitFields.removeAll()
+        
+        for _ in 0..<6 {
+            let box = NSBox()
+            box.boxType = .custom
+            box.borderWidth = 1.0
+            box.borderColor = NSColor.separatorColor
+            box.cornerRadius = 6.0
+            box.fillColor = NSColor.controlBackgroundColor
+            box.wantsLayer = true
+            
+            box.translatesAutoresizingMaskIntoConstraints = false
+            box.widthAnchor.constraint(equalToConstant: 36).isActive = true
+            box.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            
+            let field = NSTextField()
+            field.isEditable = true
+            field.isSelectable = true
+            field.isBordered = false
+            field.drawsBackground = false
+            field.alignment = .center
+            field.font = NSFont.boldSystemFont(ofSize: 22)
+            field.textColor = NSColor.labelColor
+            field.delegate = self
+            
+            field.translatesAutoresizingMaskIntoConstraints = false
+            box.contentView?.addSubview(field)
+            
+            if let contentView = box.contentView {
+                NSLayoutConstraint.activate([
+                    field.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+                    field.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1)
+                ])
+            }
+            
+            digitsStack.addArrangedSubview(box)
+            self.exitDigitFields.append(field)
+        }
+        
+        let countdownField = NSTextField()
+        countdownField.isEditable = false
+        countdownField.isSelectable = false
+        countdownField.isBordered = false
+        countdownField.drawsBackground = false
+        countdownField.alignment = .center
+        countdownField.font = NSFont.systemFont(ofSize: 12)
+        countdownField.textColor = NSColor.secondaryLabelColor
+        self.exitCountdownLabel = countdownField
+        
+        container.addArrangedSubview(digitsStack)
+        container.addArrangedSubview(countdownField)
+        
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        
+        return container
+    }
+
+    private func tickExitCountdown() {
+        if countdownSeconds > 0 {
+            countdownSeconds -= 1
+            updateExitCountdownLabelText()
+        } else {
+            self.countdownTimer?.invalidate()
+            self.countdownTimer = nil
+            exitCountdownLabel?.stringValue = "验证码已超时失效，请关闭此窗口并重新获取"
+            exitCountdownLabel?.textColor = NSColor.systemRed
+        }
+    }
+
+    private func updateExitCountdownLabelText() {
+        guard countdownSeconds > 0 else { return }
+        let minutes = countdownSeconds / 60
+        let seconds = countdownSeconds % 60
+        let timeString = String(format: "%02d:%02d", minutes, seconds)
+        exitCountdownLabel?.stringValue = "验证码将在 \(timeString) 后失效"
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let textField = obj.object as? NSTextField else { return }
+        
+        var text = textField.stringValue
+        if text.count > 1 {
+            text = String(text.prefix(1))
+            textField.stringValue = text
+        }
+        
+        let filtered = text.filter { $0.isNumber }
+        if filtered != text {
+            textField.stringValue = filtered
+            text = filtered
+        }
+        
+        if text.count == 1 {
+            if let index = exitDigitFields.firstIndex(of: textField) {
+                if index < 5 {
+                    textField.window?.makeFirstResponder(exitDigitFields[index + 1])
+                }
+            }
+        } else if text.isEmpty {
+            if let index = exitDigitFields.firstIndex(of: textField) {
+                if index > 0 {
+                    textField.window?.makeFirstResponder(exitDigitFields[index - 1])
                 }
             }
         }
