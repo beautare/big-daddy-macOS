@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var screenshotTimer: Timer?
     private var heartbeatTimer: Timer?
     private var commandTimer: Timer?
+    private var countdownTimer: Timer?
+    private var countdownSeconds = 300
+    private var digitLabels: [NSTextField] = []
+    private var countdownLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -82,31 +86,160 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await client.register()
             await MainActor.run {
                 let fingerprint = client.identity.fingerprint
-                let token = client.bindToken ?? "N/A"
-                let bindUrlString = "https://dashboard.bigdaddy.com/bind?fingerprint=\(fingerprint)&token=\(token)"
+                let initialToken = client.bindToken ?? "000000"
                 
                 let alert = NSAlert()
-                alert.messageText = "Bind this Mac"
-                alert.informativeText = """
-                To bind this device, open your parent dashboard or visit the link below:
+                alert.messageText = "设备绑定验证"
+                alert.informativeText = "请在家长端仪表盘输入下方的 6 位动态验证码，或者复制链接进行绑定。\n\n设备指纹 (Fingerprint):\n\(fingerprint)"
                 
-                Fingerprint:
-                \(fingerprint)
+                let accessory = self.createAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
+                alert.accessoryView = accessory
                 
-                One-time Token:
-                \(token) (Valid for 5 minutes)
+                alert.addButton(withTitle: "复制绑定链接")
+                alert.addButton(withTitle: "关闭")
                 
-                Binding Link:
-                \(bindUrlString)
-                """
-                alert.addButton(withTitle: "Copy Link")
-                alert.addButton(withTitle: "Close")
-                if alert.runModal() == .alertFirstButtonReturn {
+                // 初始化倒计时
+                self.countdownSeconds = 300
+                self.updateCountdownLabelText()
+                
+                // 启动倒计时 Timer，使用 .common 模式
+                self.countdownTimer?.invalidate()
+                let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+                    self?.tickCountdown()
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                self.countdownTimer = timer
+                
+                // 运行 Alert Modal
+                let response = alert.runModal()
+                
+                // Modal 结束，销毁计时器
+                self.countdownTimer?.invalidate()
+                self.countdownTimer = nil
+                
+                if response == .alertFirstButtonReturn {
+                    let currentToken = self.digitLabels.map { $0.stringValue }.joined()
+                    let bindUrlString = "https://dashboard.bigdaddy.com/bind?fingerprint=\(fingerprint)&token=\(currentToken)"
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(bindUrlString, forType: .string)
                 }
             }
         }
+    }
+
+    private func createAccessoryView(fingerprint: String, initialToken: String) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.spacing = 16
+        container.alignment = .centerX
+        container.wantsLayer = true
+        
+        // 1. 水平数字框的 StackView
+        let digitsStack = NSStackView()
+        digitsStack.orientation = .horizontal
+        digitsStack.spacing = 8
+        digitsStack.alignment = .centerY
+        
+        self.digitLabels.removeAll()
+        
+        // 苹果的原生验证码框通常是灰白背景、细灰色边框和轻微圆角
+        let paddedToken = initialToken.padding(toLength: 6, withPad: "0", startingAt: 0)
+        let chars = Array(paddedToken)
+        
+        for i in 0..<6 {
+            let box = NSBox()
+            box.boxType = .custom
+            box.borderWidth = 1.0
+            box.borderColor = NSColor.separatorColor
+            box.cornerRadius = 6.0
+            box.fillColor = NSColor.controlBackgroundColor
+            box.wantsLayer = true
+            
+            // 设置固定大小
+            box.translatesAutoresizingMaskIntoConstraints = false
+            box.widthAnchor.constraint(equalToConstant: 36).isActive = true
+            box.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            
+            let label = NSTextField()
+            label.isEditable = false
+            label.isSelectable = false
+            label.isBordered = false
+            label.drawsBackground = false
+            label.alignment = .center
+            label.font = NSFont.boldSystemFont(ofSize: 22)
+            label.textColor = NSColor.labelColor
+            label.stringValue = String(chars[i])
+            
+            label.translatesAutoresizingMaskIntoConstraints = false
+            box.contentView?.addSubview(label)
+            
+            if let contentView = box.contentView {
+                NSLayoutConstraint.activate([
+                    label.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+                    label.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1) // 轻微校正垂直居中
+                ])
+            }
+            
+            digitsStack.addArrangedSubview(box)
+            self.digitLabels.append(label)
+        }
+        
+        // 2. 倒计时文本框
+        let countdownField = NSTextField()
+        countdownField.isEditable = false
+        countdownField.isSelectable = false
+        countdownField.isBordered = false
+        countdownField.drawsBackground = false
+        countdownField.alignment = .center
+        countdownField.font = NSFont.systemFont(ofSize: 12)
+        countdownField.textColor = NSColor.secondaryLabelColor
+        self.countdownLabel = countdownField
+        
+        container.addArrangedSubview(digitsStack)
+        container.addArrangedSubview(countdownField)
+        
+        // 设置容器的宽度，给 Alert 预留足够空间
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.widthAnchor.constraint(equalToConstant: 320).isActive = true
+        
+        return container
+    }
+
+    private func tickCountdown() {
+        if countdownSeconds > 0 {
+            countdownSeconds -= 1
+            updateCountdownLabelText()
+        } else {
+            // 倒计时归零，静默获取新验证码
+            Task {
+                await refreshBindToken()
+            }
+        }
+    }
+
+    private func refreshBindToken() async {
+        await client.register()
+        let token = client.bindToken ?? "000000"
+        await MainActor.run {
+            self.countdownSeconds = 300
+            self.updateDigitBoxes(with: token)
+            self.updateCountdownLabelText()
+        }
+    }
+
+    private func updateDigitBoxes(with token: String) {
+        let paddedToken = token.padding(toLength: 6, withPad: "0", startingAt: 0)
+        let chars = Array(paddedToken)
+        for i in 0..<min(chars.count, digitLabels.count) {
+            digitLabels[i].stringValue = String(chars[i])
+        }
+    }
+
+    private func updateCountdownLabelText() {
+        let minutes = countdownSeconds / 60
+        let seconds = countdownSeconds % 60
+        let timeString = String(format: "%02d:%02d", minutes, seconds)
+        countdownLabel?.stringValue = "验证码将在 \(timeString) 后自动更新"
     }
 
     @objc private func sendScreenshotNow() {
