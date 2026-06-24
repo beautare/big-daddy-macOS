@@ -3,6 +3,7 @@ import CryptoKit
 import Security
 
 @main
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let client = BigDaddyClient()
@@ -85,7 +86,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         commandTimer?.invalidate()
 
         screenshotTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(client.config.screenshotIntervalMins * 60), repeats: true) { [weak self] _ in
-            self?.performScheduledScreenshot()
+            Task { @MainActor in
+                self?.performScheduledScreenshot()
+            }
         }
         let heartbeatSeconds = client.config.bound ? client.config.heartbeatActiveSeconds : max(client.config.heartbeatActiveSeconds, 300)
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(heartbeatSeconds), repeats: true) { [weak self] _ in
@@ -130,7 +133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 // 启动倒计时 Timer，使用 .common 模式
                 self.countdownTimer?.invalidate()
                 let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-                    self?.tickCountdown()
+                    Task { @MainActor in
+                        self?.tickCountdown()
+                    }
                 }
                 RunLoop.main.add(timer, forMode: .common)
                 self.countdownTimer = timer
@@ -324,7 +329,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         // 启动倒计时 Timer
         self.countdownTimer?.invalidate()
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.tickExitCountdown()
+            Task { @MainActor in
+                self?.tickExitCountdown()
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.countdownTimer = timer

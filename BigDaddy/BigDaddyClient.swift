@@ -103,7 +103,7 @@ final class BigDaddyClient {
         let body: [String: Any] = [
             "deviceFingerprint": identity.fingerprint,
             "deviceSecretHash": identity.secretHash,
-            "appVersion": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0",
+            "appVersion": Bundle.self.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0",
             "hostname": Host.current().localizedName ?? "Mac",
             "osVersion": ProcessInfo.processInfo.operatingSystemVersionString
         ]
@@ -133,7 +133,7 @@ final class BigDaddyClient {
     }
 
     func sendHeartbeat(event: EventType) async {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+        let version = Bundle.self.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let windowTitle = getActiveWindowTitle()
         let activeUrl = getActiveBrowserUrl(appName: activeApp)
