@@ -144,13 +144,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             await MainActor.run {
                 let fingerprint = client.identity.fingerprint
                 let initialToken = client.bindToken ?? "000000"
-                
                 let alert = NSAlert()
                 alert.messageText = Localization.string(zh: "设备绑定验证", en: "Device Binding Verification")
                 alert.informativeText = Localization.string(
-                    zh: "请在家长端仪表盘输入下方的 6 位动态验证码，或者复制链接进行绑定。\n\n设备指纹 (Fingerprint):\n\(fingerprint)",
-                    en: "Please enter the 6-digit dynamic verification code below on the parent dashboard, or copy the link to bind.\n\nDevice Fingerprint:\n\(fingerprint)"
+                    zh: "请在家长端仪表盘输入下方的 6 位动态验证码，或者复制链接进行绑定。",
+                    en: "Please enter the 6-digit dynamic verification code below on the parent dashboard, or copy the link to bind."
                 )
+                
+                if #available(macOS 11.0, *) {
+                    if let image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "BigDaddy") {
+                        image.isTemplate = true
+                        alert.icon = image
+                    }
+                }
                 
                 let accessory = self.createAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
                 alert.accessoryView = accessory
@@ -190,11 +196,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func createAccessoryView(fingerprint: String, initialToken: String) -> NSView {
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 110))
+        
         let container = NSStackView()
         container.orientation = .vertical
-        container.spacing = 16
+        container.spacing = 12
         container.alignment = .centerX
-        container.wantsLayer = true
+        container.translatesAutoresizingMaskIntoConstraints = false
+        
+        parentView.addSubview(container)
+        
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: parentView.topAnchor),
+            container.bottomAnchor.constraint(equalTo: parentView.bottomAnchor),
+            container.leadingAnchor.constraint(equalTo: parentView.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: parentView.trailingAnchor)
+        ])
         
         // 1. 水平数字框的 StackView
         let digitsStack = NSStackView()
@@ -257,14 +274,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         countdownField.textColor = NSColor.secondaryLabelColor
         self.countdownLabel = countdownField
         
+        // 3. 友好的设备识别码文本框
+        let displayId: String
+        if fingerprint.count > 12 {
+            let head = fingerprint.prefix(6)
+            let tail = fingerprint.suffix(6)
+            displayId = "\(head)...\(tail)".uppercased()
+        } else {
+            displayId = fingerprint.uppercased()
+        }
+        
+        let deviceIdField = NSTextField()
+        deviceIdField.isEditable = false
+        deviceIdField.isSelectable = true
+        deviceIdField.isBordered = false
+        deviceIdField.drawsBackground = false
+        deviceIdField.alignment = .center
+        deviceIdField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        deviceIdField.textColor = NSColor.tertiaryLabelColor
+        deviceIdField.stringValue = Localization.string(
+            zh: "设备识别码: \(displayId)",
+            en: "Device ID: \(displayId)"
+        )
+        
         container.addArrangedSubview(digitsStack)
         container.addArrangedSubview(countdownField)
+        container.addArrangedSubview(deviceIdField)
         
-        // 设置容器的宽度，给 Alert 预留足够空间
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.widthAnchor.constraint(equalToConstant: 320).isActive = true
-        
-        return container
+        return parentView
     }
 
     private func tickCountdown() {
