@@ -11,6 +11,7 @@ enum EventType: String, Codable {
     case resume = "RESUME"
     case shutdown = "SHUTDOWN"
     case forceKill = "FORCE_KILL"
+    case configUpdated = "CONFIG_UPDATED"
 }
 
 struct DeviceIdentity {
@@ -18,11 +19,22 @@ struct DeviceIdentity {
     let secretHash: String
 }
 
+/// 通知渠道配置（后端转发截图，不存储图片）
+struct NotificationChannels: Codable, Equatable {
+    var email: String?
+    var telegramBotToken: String?
+    var telegramChatId: String?
+    var whatsappPhone: String?
+}
+
 struct ClientConfig: Codable, Equatable {
     var bound: Bool = false
     var configVersion: Int = 1
     var screenshotIntervalMins: Int = 5
-    var destinationEmail: String?
+    /// 是否启用定时截图（默认 false，由家长在后端配置开启）
+    var screenshotEnabled: Bool = false
+    /// 通知渠道（用于截图转发，后端不持久化图片）
+    var notificationChannels: NotificationChannels = NotificationChannels()
     var compressQuality: Double = 0.6
     var compressMaxWidth: Int = 1280
     var aiEnabled: Bool = false
@@ -41,7 +53,8 @@ struct ClientConfig: Codable, Equatable {
         bound = try container.decodeIfPresent(Bool.self, forKey: .bound) ?? false
         configVersion = try container.decodeIfPresent(Int.self, forKey: .configVersion) ?? 1
         screenshotIntervalMins = try container.decodeIfPresent(Int.self, forKey: .screenshotIntervalMins) ?? 5
-        destinationEmail = try container.decodeIfPresent(String.self, forKey: .destinationEmail)
+        screenshotEnabled = try container.decodeIfPresent(Bool.self, forKey: .screenshotEnabled) ?? false
+        notificationChannels = try container.decodeIfPresent(NotificationChannels.self, forKey: .notificationChannels) ?? NotificationChannels()
         compressQuality = try container.decodeIfPresent(Double.self, forKey: .compressQuality) ?? 0.6
         compressMaxWidth = try container.decodeIfPresent(Int.self, forKey: .compressMaxWidth) ?? 1280
         aiEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiEnabled) ?? false
@@ -74,9 +87,9 @@ final class BigDaddyClient {
         ConfigStore.configFileURL.path
     }
 
+    /// 是否有可用通知渠道（决定是否单独发送截图）
     var hasScreenshotDestination: Bool {
-        guard let email = config.destinationEmail else { return false }
-        return !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        config.screenshotEnabled
     }
 
     var isIdle: Bool {
@@ -132,17 +145,19 @@ final class BigDaddyClient {
         return config != previous
     }
 
+    /// 记录最近一次截图时间，随心跟上报
+    private var lastScreenshotAt: Date?
+
     func sendHeartbeat(event: EventType) async {
         let version = Bundle.self.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let windowTitle = getActiveWindowTitle()
         let activeUrl = getActiveBrowserUrl(appName: activeApp)
-        
-        let body: [String: Any] = [
+
+        var body: [String: Any] = [
             "appVersion": version,
             "eventType": event.rawValue,
             "lastHeartbeatAt": ISO8601DateFormatter().string(from: Date()),
-            "lastScreenshotAt": NSNull(),
             "cpuUsage": 0,
             "memoryUsageMb": currentMemoryMb(),
             "activeAppName": activeApp,
@@ -152,6 +167,12 @@ final class BigDaddyClient {
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
             "metadata": ["screenRecordingGranted": CGPreflightScreenCaptureAccess()]
         ]
+        // 如果有截图记录，一并上报
+        if let lastShot = lastScreenshotAt {
+            body["lastScreenshotAt"] = ISO8601DateFormatter().string(from: lastShot)
+        } else {
+            body["lastScreenshotAt"] = NSNull()
+        }
         _ = try? await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
         lastHeartbeatDescription = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
     }
@@ -290,14 +311,15 @@ final class BigDaddyClient {
     }
 
     func captureAndSendScreenshot(reason: String) async {
-        guard hasScreenshotDestination else { return }
+        // screenshotEnabled 由后端配置控制，默认关闭
+        guard config.screenshotEnabled || reason == "command" else { return }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             return
         }
         guard let image = CGDisplayCreateImage(CGMainDisplayID()) else { return }
-        
-        if isImageSimilarToLast(cgImage: image) {
+
+        if reason != "command" && isImageSimilarToLast(cgImage: image) {
             NSLog("BigDaddy: Screenshot is similar to the last one, skip sending.")
             return
         }
@@ -310,15 +332,22 @@ final class BigDaddyClient {
         nsImage.lockFocus()
         NSImage(cgImage: image, size: NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)).draw(in: NSRect(origin: .zero, size: targetSize))
         nsImage.unlockFocus()
-        
+
         guard let tiff = nsImage.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return }
         let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: config.compressQuality]) ?? Data()
-        
+
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let windowTitle = getActiveWindowTitle()
         let activeUrl = getActiveBrowserUrl(appName: activeApp)
-        
-        _ = try? await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
+
+        do {
+            _ = try await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
+            // 成功发送后更新截图时间
+            lastScreenshotAt = Date()
+            NSLog("BigDaddy: Screenshot uploaded (庭因 \(reason)).")
+        } catch {
+            NSLog("BigDaddy: Screenshot upload failed: \(error.localizedDescription)")
+        }
     }
 
     func pollCommands() async {
@@ -350,31 +379,6 @@ final class BigDaddyClient {
             NSLog("BigDaddy: verifyExitPassword request failed: \(error.localizedDescription)")
         }
         return false
-    }
-
-    func saveLocalDestinationEmail(_ email: String) {
-        config.bound = false
-        config.destinationEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        ConfigStore.save(config)
-        
-        Task {
-            let body: [String: Any] = [
-                "destinationEmail": config.destinationEmail ?? ""
-            ]
-            _ = try? await request(path: "/bigdaddy/client/config", method: "POST", body: body, signed: true)
-        }
-    }
-
-    func clearLocalDestinationEmail() {
-        config.destinationEmail = nil
-        ConfigStore.save(config)
-        
-        Task {
-            let body: [String: Any] = [
-                "destinationEmail": ""
-            ]
-            _ = try? await request(path: "/bigdaddy/client/config", method: "POST", body: body, signed: true)
-        }
     }
 
     static func sharedForceKillPing() {

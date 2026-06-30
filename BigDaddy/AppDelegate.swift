@@ -62,7 +62,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             print("BigDaddy: async task background config refresh started")
             let configChanged = await client.refreshConfig()
             print("BigDaddy: async task background heartbeat sending started")
-            await client.sendHeartbeat(event: client.consumePreviousCrash() == nil ? .start : .forceKill)
+            let startEvent: EventType = client.consumePreviousCrash() == nil ? .start : .forceKill
+            await client.sendHeartbeat(event: startEvent)
+            // 如果配置有变化，额外发送 CONFIG_UPDATED 事件
+            if configChanged {
+                await client.sendHeartbeat(event: .configUpdated)
+            }
             await MainActor.run {
                 print("BigDaddy: async task background completed, updating UI configChanged: \(configChanged)")
                 if configChanged {
@@ -79,48 +84,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     private func rebuildMenu() {
         let menu = NSMenu()
-        
+
         if client.config.bound {
-            let statusItem = NSMenuItem(title: "状态: 已受保护", action: nil, keyEquivalent: "")
+            let statusItem = NSMenuItem(
+                title: Localization.string(zh: "状态: 已受保护", en: "Status: Protected"),
+                action: nil, keyEquivalent: ""
+            )
             statusItem.isEnabled = false
             menu.addItem(statusItem)
-            
-            menu.addItem(NSMenuItem(title: "立即同步截图", action: #selector(sendScreenshotNow), keyEquivalent: "s"))
+
+            menu.addItem(NSMenuItem(
+                title: Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"),
+                action: #selector(sendScreenshotNow), keyEquivalent: "s"
+            ))
             menu.addItem(.separator())
-            
-            menu.addItem(NSMenuItem(title: "设置接收邮箱", action: #selector(setDestinationEmail), keyEquivalent: "e"))
-            if client.config.destinationEmail != nil {
-                menu.addItem(NSMenuItem(title: "清除接收邮箱", action: #selector(clearDestinationEmail), keyEquivalent: ""))
-            }
         } else {
-            let statusItem = NSMenuItem(title: "状态: 未绑定", action: nil, keyEquivalent: "")
+            let statusItem = NSMenuItem(
+                title: Localization.string(zh: "状态: 未绑定", en: "Status: Unbound"),
+                action: nil, keyEquivalent: ""
+            )
             statusItem.isEnabled = false
             menu.addItem(statusItem)
-            
-            menu.addItem(NSMenuItem(title: "绑定此 Mac", action: #selector(showQr), keyEquivalent: "b"))
+
+            menu.addItem(NSMenuItem(
+                title: Localization.string(zh: "绑定此 Mac", en: "Bind This Mac"),
+                action: #selector(showQr), keyEquivalent: "b"
+            ))
             menu.addItem(.separator())
-            menu.addItem(NSMenuItem(title: "设置接收邮箱", action: #selector(setDestinationEmail), keyEquivalent: "e"))
         }
-        
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "安全退出", action: #selector(quitWithPassword), keyEquivalent: "q"))
+
+        menu.addItem(NSMenuItem(
+            title: Localization.string(zh: "安全退出", en: "Secure Exit"),
+            action: #selector(quitWithPassword), keyEquivalent: "q"
+        ))
         statusItem?.menu = menu
     }
+
+    // 跟踪 IDLE/RESUME 状态转换
+    private var wasIdle = false
 
     private func scheduleTimers() {
         screenshotTimer?.invalidate()
         heartbeatTimer?.invalidate()
         commandTimer?.invalidate()
 
-        screenshotTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(client.config.screenshotIntervalMins * 60), repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.performScheduledScreenshot()
+        // 定时截图（由后端 screenshotEnabled 控制，调度本身照常）
+        screenshotTimer = Timer.scheduledTimer(
+            withTimeInterval: TimeInterval(client.config.screenshotIntervalMins * 60),
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in self?.performScheduledScreenshot() }
+        }
+
+        let heartbeatSeconds = client.config.bound
+            ? client.config.heartbeatActiveSeconds
+            : max(client.config.heartbeatActiveSeconds, 300)
+
+        heartbeatTimer = Timer.scheduledTimer(
+            withTimeInterval: TimeInterval(heartbeatSeconds),
+            repeats: true
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task {
+                let isIdle = await self.client.isIdle
+                if !isIdle && self.wasIdle {
+                    // 从 IDLE 恢复 → 发送 RESUME 事件
+                    await self.client.sendHeartbeat(event: .resume)
+                } else {
+                    await self.client.sendHeartbeat(event: isIdle ? .idle : .heartbeat)
+                }
+                await MainActor.run { self.wasIdle = isIdle }
             }
         }
-        let heartbeatSeconds = client.config.bound ? client.config.heartbeatActiveSeconds : max(client.config.heartbeatActiveSeconds, 300)
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(heartbeatSeconds), repeats: true) { [weak self] _ in
-            Task { await self?.client.sendHeartbeat(event: self?.client.isIdle == true ? .idle : .heartbeat) }
-        }
+
         if client.config.bound {
             commandTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
                 Task { await self?.client.pollCommands() }
@@ -346,36 +382,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     @objc private func sendScreenshotNow() {
         Task { await client.captureAndSendScreenshot(reason: "manual") }
-    }
-
-    @objc private func setDestinationEmail() {
-        let alert = NSAlert()
-        alert.messageText = "Set Destination Email"
-        alert.informativeText = "Enter the parent email address where screenshot notifications will be sent."
-        let emailField = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        emailField.placeholderString = "parent@example.com"
-        emailField.stringValue = client.config.destinationEmail ?? ""
-        alert.accessoryView = emailField
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        
-        let email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !email.contains("@") {
-            let errAlert = NSAlert()
-            errAlert.messageText = "Invalid Email"
-            errAlert.informativeText = "Please enter a valid email address."
-            errAlert.runModal()
-            return
-        }
-        client.saveLocalDestinationEmail(email)
-        scheduleTimers()
-        rebuildMenu()
-    }
-
-    @objc private func clearDestinationEmail() {
-        client.clearLocalDestinationEmail()
-        rebuildMenu()
     }
 
     @objc private func copyConfigPath() {
