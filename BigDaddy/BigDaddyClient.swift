@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import CryptoKit
 import Darwin
 import Foundation
@@ -158,8 +159,6 @@ final class BigDaddyClient {
             "appVersion": version,
             "eventType": event.rawValue,
             "lastHeartbeatAt": ISO8601DateFormatter().string(from: Date()),
-            "cpuUsage": 0,
-            "memoryUsageMb": currentMemoryMb(),
             "activeAppName": activeApp,
             "activeWindowTitle": windowTitle,
             "activeUrl": activeUrl,
@@ -422,15 +421,31 @@ final class BigDaddyClient {
         return data
     }
 
-    private func currentMemoryMb() -> Double {
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
+    func generateBindQRCode() -> NSImage? {
+        let content = "bigdaddy://bind?fingerprint=\(identity.fingerprint)&token=\(bindToken ?? "")"
+        guard let data = content.data(using: .utf8) else { return nil }
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("H", forKey: "inputCorrectionLevel")
+        guard let ciImage = filter.outputImage else { return nil }
+        let scale = CGAffineTransform(scaleX: 10, y: 10)
+        let scaledImage = ciImage.transformed(by: scale)
+        let rep = NSCIImageRep(ciImage: scaledImage)
+        let image = NSImage(size: rep.size)
+        image.addRepresentation(rep)
+        return image
+    }
+
+    func bindWithCode(_ code: String) async throws -> Bool {
+        let body: [String: Any] = [
+            "bindCode": code,
+            "deviceFingerprint": identity.fingerprint
+        ]
+        guard let data = try? await request(path: "/bigdaddy/client/bind-with-code", method: "POST", body: body, signed: false),
+              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<DeviceResponse>.self, from: data) else {
+            return false
         }
-        return result == KERN_SUCCESS ? Double(info.resident_size) / 1024.0 / 1024.0 : 0
+        return response.code == 200
     }
 
     private static var lockFileURL: URL {

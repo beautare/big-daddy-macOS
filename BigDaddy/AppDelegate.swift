@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var countdownSeconds = 300
     private var digitLabels: [NSTextField] = []
     private var countdownLabel: NSTextField?
+    private var qrImageView: NSImageView?
     private var exitDigitFields: [NSTextField] = []
     private var exitCountdownLabel: NSTextField?
 
@@ -107,8 +108,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             menu.addItem(statusItem)
 
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "绑定此 Mac", en: "Bind This Mac"),
+                title: Localization.string(zh: "绑定此 Mac (扫码)", en: "Bind This Mac (QR)"),
                 action: #selector(showQr), keyEquivalent: "b"
+            ))
+            menu.addItem(NSMenuItem(
+                title: Localization.string(zh: "输入家长绑定码", en: "Enter Parent Bind Code"),
+                action: #selector(showBindCodeInput), keyEquivalent: ""
             ))
             menu.addItem(.separator())
         }
@@ -223,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 
                 if response == .alertFirstButtonReturn {
                     let currentToken = self.digitLabels.map { $0.stringValue }.joined()
-                    let bindUrlString = "https://dashboard.bigdaddy.com/bind?fingerprint=\(fingerprint)&token=\(currentToken)"
+                    let bindUrlString = "bigdaddy://bind?fingerprint=\(fingerprint)&token=\(currentToken)"
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(bindUrlString, forType: .string)
                 }
@@ -232,11 +237,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func createAccessoryView(fingerprint: String, initialToken: String) -> NSView {
-        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 110))
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 380))
         
         let container = NSStackView()
         container.orientation = .vertical
-        container.spacing = 12
+        container.spacing = 10
         container.alignment = .centerX
         container.translatesAutoresizingMaskIntoConstraints = false
         
@@ -249,7 +254,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             container.trailingAnchor.constraint(equalTo: parentView.trailingAnchor)
         ])
         
-        // 1. 水平数字框的 StackView
+        // 1. 展示二维码 (方式A)
+        let qrView = NSImageView()
+        qrView.image = client.generateBindQRCode()
+        qrView.imageScaling = .scaleProportionallyUpOrDown
+        qrView.translatesAutoresizingMaskIntoConstraints = false
+        qrView.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        qrView.heightAnchor.constraint(equalToConstant: 180).isActive = true
+        self.qrImageView = qrView
+        
+        let qrDescLabel = NSTextField()
+        qrDescLabel.isEditable = false
+        qrDescLabel.isSelectable = false
+        qrDescLabel.isBordered = false
+        qrDescLabel.drawsBackground = false
+        qrDescLabel.alignment = .center
+        qrDescLabel.font = NSFont.systemFont(ofSize: 11)
+        qrDescLabel.textColor = NSColor.secondaryLabelColor
+        qrDescLabel.stringValue = Localization.string(
+            zh: "家长扫描上述二维码完成绑定",
+            en: "Parent: scan the QR code above to bind"
+        )
+        
+        // 分割说明：或动态输入验证码
+        let codeDescLabel = NSTextField()
+        codeDescLabel.isEditable = false
+        codeDescLabel.isSelectable = false
+        codeDescLabel.isBordered = false
+        codeDescLabel.drawsBackground = false
+        codeDescLabel.alignment = .center
+        codeDescLabel.font = NSFont.boldSystemFont(ofSize: 11)
+        codeDescLabel.textColor = NSColor.labelColor
+        codeDescLabel.stringValue = Localization.string(
+            zh: "或在家长端输入 6 位验证码",
+            en: "Or enter the 6-digit code on the parent dashboard"
+        )
+        
+        // 2. 水平数字框的 StackView
         let digitsStack = NSStackView()
         digitsStack.orientation = .horizontal
         digitsStack.spacing = 8
@@ -257,7 +298,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         
         self.digitLabels.removeAll()
         
-        // 苹果的原生验证码框通常是灰白背景、细灰色边框和轻微圆角
         let paddedToken = initialToken.padding(toLength: 6, withPad: "0", startingAt: 0)
         let chars = Array(paddedToken)
         
@@ -270,10 +310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             box.fillColor = NSColor.controlBackgroundColor
             box.wantsLayer = true
             
-            // 设置固定大小
             box.translatesAutoresizingMaskIntoConstraints = false
-            box.widthAnchor.constraint(equalToConstant: 36).isActive = true
-            box.heightAnchor.constraint(equalToConstant: 44).isActive = true
+            box.widthAnchor.constraint(equalToConstant: 30).isActive = true
+            box.heightAnchor.constraint(equalToConstant: 38).isActive = true
             
             let label = NSTextField()
             label.isEditable = false
@@ -281,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             label.isBordered = false
             label.drawsBackground = false
             label.alignment = .center
-            label.font = NSFont.boldSystemFont(ofSize: 22)
+            label.font = NSFont.boldSystemFont(ofSize: 18)
             label.textColor = NSColor.labelColor
             label.stringValue = String(chars[i])
             
@@ -291,7 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             if let contentView = box.contentView {
                 NSLayoutConstraint.activate([
                     label.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-                    label.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1) // 轻微校正垂直居中
+                    label.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1)
                 ])
             }
             
@@ -299,18 +338,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             self.digitLabels.append(label)
         }
         
-        // 2. 倒计时文本框
+        // 3. 倒计时文本框
         let countdownField = NSTextField()
         countdownField.isEditable = false
         countdownField.isSelectable = false
         countdownField.isBordered = false
         countdownField.drawsBackground = false
         countdownField.alignment = .center
-        countdownField.font = NSFont.systemFont(ofSize: 12)
+        countdownField.font = NSFont.systemFont(ofSize: 11)
         countdownField.textColor = NSColor.secondaryLabelColor
         self.countdownLabel = countdownField
         
-        // 3. 友好的设备识别码文本框
+        // 4. 设备识别码文本框
         let displayId: String
         if fingerprint.count > 12 {
             let head = fingerprint.prefix(6)
@@ -326,13 +365,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         deviceIdField.isBordered = false
         deviceIdField.drawsBackground = false
         deviceIdField.alignment = .center
-        deviceIdField.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        deviceIdField.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
         deviceIdField.textColor = NSColor.tertiaryLabelColor
         deviceIdField.stringValue = Localization.string(
             zh: "设备识别码: \(displayId)",
             en: "Device ID: \(displayId)"
         )
         
+        container.addArrangedSubview(qrView)
+        container.addArrangedSubview(qrDescLabel)
+        container.addArrangedSubview(codeDescLabel)
         container.addArrangedSubview(digitsStack)
         container.addArrangedSubview(countdownField)
         container.addArrangedSubview(deviceIdField)
@@ -367,6 +409,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let chars = Array(paddedToken)
         for i in 0..<min(chars.count, digitLabels.count) {
             digitLabels[i].stringValue = String(chars[i])
+        }
+        qrImageView?.image = client.generateBindQRCode()
+    }
+
+    @objc private func showBindCodeInput() {
+        let alert = NSAlert()
+        alert.messageText = Localization.string(
+            zh: "输入家长提供的绑定码",
+            en: "Enter the bind code from parent"
+        )
+        alert.informativeText = Localization.string(
+            zh: "请在家长仪表盘获取 6 位绑定码",
+            en: "Get the 6-digit bind code from the dashboard"
+        )
+        
+        let inputField = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 28))
+        inputField.placeholderString = "000000"
+        inputField.alignment = .center
+        inputField.font = NSFont.monospacedSystemFont(ofSize: 18, weight: .bold)
+        alert.accessoryView = inputField
+        
+        alert.addButton(withTitle: Localization.string(zh: "确认绑定", en: "Confirm Bind"))
+        alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
+        
+        if alert.runModal() == .alertFirstButtonReturn {
+            let code = inputField.stringValue.trimmingCharacters(in: .whitespaces)
+            guard code.count == 6, code.allSatisfy({ $0.isNumber }) else {
+                let errorAlert = NSAlert()
+                errorAlert.messageText = Localization.string(zh: "绑定码格式错误", en: "Invalid bind code format")
+                errorAlert.informativeText = Localization.string(zh: "请输入 6 位数字", en: "Please enter 6 digits")
+                errorAlert.runModal()
+                return
+            }
+            
+            Task {
+                do {
+                    let success = try await client.bindWithCode(code)
+                    if success {
+                        _ = try await client.refreshConfig()
+                        rebuildMenu()
+                        scheduleTimers()
+                        await MainActor.run {
+                            let successAlert = NSAlert()
+                            successAlert.messageText = Localization.string(zh: "绑定成功！", en: "Bind Successful!")
+                            successAlert.informativeText = Localization.string(zh: "设备已与家长账户关联", en: "Device is now linked to parent account")
+                            successAlert.runModal()
+                        }
+                    } else {
+                        await MainActor.run {
+                            let errorAlert = NSAlert()
+                            errorAlert.messageText = Localization.string(zh: "绑定失败", en: "Bind Failed")
+                            errorAlert.informativeText = Localization.string(zh: "绑定码无效或已过期", en: "Invalid or expired bind code")
+                            errorAlert.runModal()
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        let errorAlert = NSAlert()
+                        errorAlert.messageText = Localization.string(zh: "绑定失败", en: "Bind Failed")
+                        errorAlert.informativeText = error.localizedDescription
+                        errorAlert.runModal()
+                    }
+                }
+            }
         }
     }
 
