@@ -343,7 +343,9 @@ final class BigDaddyClient {
             _ = try await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
             // 成功发送后更新截图时间
             lastScreenshotAt = Date()
-            NSLog("BigDaddy: Screenshot uploaded (庭因 \(reason)).")
+            // 知情透明：把本次截图动作写入本机可查看/可导出的守护记录
+            AuditLog.record("SCREENSHOT_SENT reason=\(reason) app=\(activeApp) window=\(windowTitle)")
+            NSLog("BigDaddy: Screenshot uploaded (reason: \(reason)).")
         } catch {
             NSLog("BigDaddy: Screenshot upload failed: \(error.localizedDescription)")
         }
@@ -445,12 +447,44 @@ final class BigDaddyClient {
               let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<DeviceResponse>.self, from: data) else {
             return false
         }
+        if response.code == 200 {
+            AuditLog.record("DEVICE_BOUND 本设备已在设备端确认后与家长账户建立守护关系")
+        }
         return response.code == 200
     }
 
     private static var lockFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/runtime.lock")
+    }
+}
+
+/// 本机守护记录（知情透明）：把每一次实际发生的采集/上报动作追加到本地明文日志，
+/// 孩子和家长都可以在设备上直接查看或导出，用于印证"采集了什么、什么时候采集"。
+/// 这是"可导出审计留痕"的落地，不是隐蔽后台行为。
+enum AuditLog {
+    static var auditFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BigDaddy/guardian-audit.log")
+    }
+
+    static func record(_ line: String) {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let entry = "\(stamp)\t\(line)\n"
+        let url = auditFileURL
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard let data = entry.data(using: .utf8) else { return }
+            if FileManager.default.fileExists(atPath: url.path), let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            NSLog("BigDaddy: audit log write failed: \(error.localizedDescription)")
+        }
     }
 }
 

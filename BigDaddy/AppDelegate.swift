@@ -55,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
+        presentFirstRunDisclosureIfNeeded()
         scheduleTimers()
         print("BigDaddy: timers scheduled")
         Task {
@@ -117,6 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             ))
             menu.addItem(.separator())
         }
+
+        // 知情透明：任何状态下孩子都能查看"守护说明"和导出"本机守护记录"
+        menu.addItem(NSMenuItem(
+            title: Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"),
+            action: #selector(showTransparencyInfo), keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"),
+            action: #selector(exportAuditLog), keyEquivalent: ""
+        ))
+        menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(
             title: Localization.string(zh: "安全退出", en: "Secure Exit"),
@@ -490,6 +502,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         Task { await client.captureAndSendScreenshot(reason: "manual") }
     }
 
+    /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停
+    @objc private func showTransparencyInfo() {
+        let alert = NSAlert()
+        alert.messageText = Localization.string(
+            zh: "关于本机的家庭守护",
+            en: "About the Family Guardian on This Mac"
+        )
+        alert.informativeText = Localization.string(
+            zh: """
+            这台 Mac 正在运行 BigDaddy 家庭守护，由你的家长（法定监护人）在你知情的前提下与你共同使用。
+
+            • 采集内容：当前活动应用与窗口标题的使用摘要；仅当家长在仪表盘开启截图时，才会定时截屏。
+            • 谁能看到：仅与本设备完成绑定的家长本人。服务器只做中转，不保存截图原图。
+            • 你的知情权：菜单栏图标一直可见；每次实际发送的截图都会记录在“本机守护记录”里，你可以随时导出查看。
+            • 暂停/停止：请与家长沟通，由家长在仪表盘生成退出验证码或解除绑定。
+            """,
+            en: """
+            This Mac runs BigDaddy Family Guardian, used with your knowledge by your parent (legal guardian).
+
+            • What it collects: usage summaries of the active app and window title; screenshots are taken only if a parent turns them on in the dashboard.
+            • Who can see it: only the parent bound to this device. The server relays and never stores screenshots.
+            • Your visibility: the menu bar icon is always shown; every screenshot actually sent is written to the local Guardian Log, which you can export anytime.
+            • Pause/stop: talk to your parent, who can issue an exit code or unbind the device in the dashboard.
+            """
+        )
+        alert.addButton(withTitle: Localization.string(zh: "我知道了", en: "Got it"))
+        alert.addButton(withTitle: Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"))
+        if alert.runModal() == .alertSecondButtonReturn {
+            exportAuditLog()
+        }
+    }
+
+    /// 在访达中定位本机守护记录文件，供孩子/家长查看或导出
+    @objc private func exportAuditLog() {
+        let url = AuditLog.auditFileURL
+        if !FileManager.default.fileExists(atPath: url.path) {
+            AuditLog.record("LOG_INITIALIZED 守护记录已创建")
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// 首次启动时，向使用本机的孩子展示一次知情披露
+    private func presentFirstRunDisclosureIfNeeded() {
+        let marker = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BigDaddy/disclosure-shown")
+        guard !FileManager.default.fileExists(atPath: marker.path) else { return }
+        showTransparencyInfo()
+        try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data().write(to: marker)
+        AuditLog.record("DISCLOSURE_SHOWN 已向使用者展示知情披露")
+    }
+
     @objc private func copyConfigPath() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(client.configFilePath, forType: .string)
@@ -730,8 +794,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let accRow = createPermissionRow(
             title: Localization.string(zh: "辅助功能权限", en: "Accessibility Permission"),
             description: Localization.string(
-                zh: "用于分析前台活动窗口及防止软件被恶意关闭",
-                en: "Analyze active windows and prevent unauthorized closure"
+                zh: "用于读取前台活动窗口标题，生成使用摘要（家庭已知情）",
+                en: "Read active window titles to build usage summaries (with the family's knowledge)"
             ),
             isGranted: hasAccessibility,
             action: #selector(openAccessibilitySettings)
