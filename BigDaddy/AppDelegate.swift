@@ -96,7 +96,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        client.sendShutdownSync()
+        // SHUTDOWN 心跳只在 quitWithPassword 里校验通过后同步发送一次；这里不再重复
+        // 调用 sendShutdownSync()，否则用户点击"安全退出"时会先在 quitWithPassword
+        // 里发一次，随后 NSApp.terminate(nil) 触发本方法时又发一次，导致家长端收到
+        // 两条 SHUTDOWN 记录。若进程是被信号杀死（非本方法触发的正常退出），由
+        // installSignalHandlers 里的 FORCE_KILL 上报负责如实反映。
     }
 
     private func rebuildMenu() {

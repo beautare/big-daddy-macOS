@@ -267,12 +267,22 @@ final class BigDaddyClient {
         }
     }
 
-    /// 正常退出（已通过远程验证码确认）：上报 SHUTDOWN 并清除墓碑文件。
-    func sendShutdownSync() {
+    /// 正常退出（已通过远程验证码确认）：同步阻塞发送 SHUTDOWN 心跳，确保 HTTP 请求
+    /// 在进程真正退出前已经从本机发出，再清除墓碑文件。此前用 Task.detached 异步发起
+    /// 后立即返回，调用方紧接着 NSApp.terminate() 可能在请求真正发出前就把进程杀掉，
+    /// 导致家长端收不到孩子正常退出的记录。这里用信号量把异步请求桥接成同步阻塞，
+    /// 并设置较短的超时（默认 2.5 秒）防止网络异常时卡死退出流程——不强求等到服务端
+    /// 响应，只保证请求已经发出或已经写入补发队列。
+    /// 注意：全局只应在这一处（quitWithPassword 校验通过后）调用一次；
+    /// applicationWillTerminate 不再重复调用，避免 SHUTDOWN 被重复上报两次。
+    func sendShutdownSync(timeout: TimeInterval = 2.5) {
+        let semaphore = DispatchSemaphore(value: 0)
         Task.detached {
             await self.sendHeartbeat(event: .shutdown)
-            try? FileManager.default.removeItem(at: Self.lockFileURL)
+            semaphore.signal()
         }
+        _ = semaphore.wait(timeout: .now() + timeout)
+        try? FileManager.default.removeItem(at: Self.lockFileURL)
     }
 
     /// 限时上报，用于信号处理场景：绝不无限等待网络，避免拖着进程迟迟无法退出。
@@ -657,9 +667,11 @@ enum AuditLog {
     }
 }
 
-/// 断网容错：心跳/事件发送失败时，把请求体原样缓存到本地文件（每行一条 JSON），
-/// 绝不缓存截图字节。网络恢复后由 BigDaddyClient 的 NWPathMonitor 触发补发，
-/// 重新签名（HMAC 时间戳必须是发送时刻的新值，不能复用失败时的旧签名）后清空。
+/// 断网容错：心跳/事件发送失败时，把请求体缓存到本地文件（内存中每行一条 JSON），
+/// 绝不缓存截图字节。心跳里包含活动窗口标题、浏览器 URL 等隐私字段，落盘前用
+/// AES-GCM 加密（见 PendingQueueCrypto），磁盘上不会出现明文。网络恢复后由
+/// BigDaddyClient 的 NWPathMonitor 触发补发，重新签名（HMAC 时间戳必须是发送时刻的
+/// 新值，不能复用失败时的旧签名）后清空。
 enum PendingQueue {
     static var queueFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -690,17 +702,83 @@ enum PendingQueue {
         }
     }
 
+    /// 先按新的 AES-GCM 加密格式解密；如果失败（多半是磁盘上还留着升级前的旧版本
+    /// 明文 JSONL 文件），一次性按明文兼容读取。读到的内容会在下一次 write()（无论是
+    /// enqueue 追加新条目，还是 drainAll 清空队列）时按新格式重新落盘，之后就不再
+    /// 需要兼容分支。
     private static func readLines() -> [String] {
-        guard let data = try? Data(contentsOf: queueFileURL),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").map(String.init)
+        guard let data = try? Data(contentsOf: queueFileURL) else { return [] }
+        if let text = decrypt(data) {
+            return text.split(separator: "\n").map(String.init)
+        }
+        if let text = String(data: data, encoding: .utf8) {
+            NSLog("BigDaddy: pending queue file is legacy plaintext format, will re-encrypt on next write")
+            return text.split(separator: "\n").map(String.init)
+        }
+        return []
     }
 
     private static func write(_ lines: [String]) {
         let url = queueFileURL
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let text = lines.joined(separator: "\n")
-        try? text.data(using: .utf8)?.write(to: url, options: .atomic)
+        guard let sealed = encrypt(text) else { return }
+        try? sealed.write(to: url, options: .atomic)
+    }
+
+    private static func encrypt(_ text: String) -> Data? {
+        guard let plaintext = text.data(using: .utf8) else { return nil }
+        let key = PendingQueueCrypto.loadOrCreateKey()
+        guard let sealedBox = try? AES.GCM.seal(plaintext, using: key) else { return nil }
+        return sealedBox.combined
+    }
+
+    private static func decrypt(_ data: Data) -> String? {
+        let key = PendingQueueCrypto.loadOrCreateKey()
+        guard let sealedBox = try? AES.GCM.SealedBox(combined: data),
+              let plaintext = try? AES.GCM.open(sealedBox, using: key) else { return nil }
+        return String(data: plaintext, encoding: .utf8)
+    }
+}
+
+/// 补发队列的加密密钥：与设备身份的 deviceSecret 分开、单独存一条 Keychain 记录，
+/// 首次使用时生成一个真正随机的 256-bit 对称密钥并持久化，之后每次启动直接复用同一把
+/// 密钥，保证之前落盘的队列文件在下次读取时依然能解密。
+enum PendingQueueCrypto {
+    private static let account = "pendingQueueKey"
+
+    static func loadOrCreateKey() -> SymmetricKey {
+        if let data = keychainData() {
+            return SymmetricKey(data: data)
+        }
+        let newKey = SymmetricKey(size: .bits256)
+        setKeychainData(newKey.withUnsafeBytes { Data($0) })
+        return newKey
+    }
+
+    private static func keychainData() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "BigDaddy",
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return data
+    }
+
+    private static func setKeychainData(_ value: Data) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "BigDaddy",
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+        var attributes = query
+        attributes[kSecValueData as String] = value
+        SecItemAdd(attributes as CFDictionary, nil)
     }
 }
 
@@ -800,7 +878,9 @@ struct ScreenshotUploadResponse: Codable {
 enum IdentityStore {
     static func load() -> DeviceIdentity {
         print("BigDaddy: IdentityStore.load started")
-        let secret = keychainValue(key: "deviceSecret") ?? UUID().uuidString + UUID().uuidString
+        // 已存在的旧设备沿用 Keychain 里保存过的旧格式 secret（无论格式如何都继续可用，
+        // 不做强制迁移）；只有全新安装/全新生成指纹时才会调用 generateSecret()。
+        let secret = keychainValue(key: "deviceSecret") ?? generateSecret()
         print("BigDaddy: keychain deviceSecret loaded")
         setKeychainValue(secret, key: "deviceSecret")
         print("BigDaddy: keychain deviceSecret saved")
@@ -810,6 +890,20 @@ enum IdentityStore {
         let secretHash = SHA256.hash(data: secret.data(using: .utf8)!).hex
         print("BigDaddy: IdentityStore.load completed, fingerprint: \(fingerprint)")
         return DeviceIdentity(fingerprint: fingerprint, secretHash: secretHash)
+    }
+
+    /// 生成密码学安全的 32 字节随机 deviceSecret（用 SecRandomCopyBytes，而不是拼接
+    /// 两个 UUID 字符串这种可预测格式），十六进制编码后作为 String 存入 Keychain，
+    /// 与现有消费方（SHA256 取 secretHash、HMAC 签名）完全兼容，无需改动下游逻辑。
+    private static func generateSecret() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            // 极罕见的降级路径：系统随机数生成失败时退回旧格式，保证指纹生成流程
+            // 不会因此崩溃或阻塞设备绑定。
+            return UUID().uuidString + UUID().uuidString
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
     private static func keychainValue(key: String) -> String? {
