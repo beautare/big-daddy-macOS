@@ -17,12 +17,14 @@ enum Localization {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
     private var heartbeatTimer: Timer?
     private var commandTimer: Timer?
+    private var configTimer: Timer?
+    private var screenshotFlashTimer: Timer?
     private var countdownTimer: Timer?
     private var countdownSeconds = 300
     private var digitLabels: [NSTextField] = []
@@ -30,6 +32,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var qrImageView: NSImageView?
     private var exitDigitFields: [NSTextField] = []
     private var exitCountdownLabel: NSTextField?
+    /// 必须持有引用，否则 DispatchSourceSignal 会被提前释放、信号监听失效
+    private var signalSources: [DispatchSourceSignal] = []
+    // 菜单里需要"打开前动态刷新"的只读展示项（心跳状态/下次截屏倒计时/当前配置摘要）
+    private var heartbeatStatusMenuItem: NSMenuItem?
+    private var nextScreenshotMenuItem: NSMenuItem?
+    private var configSummaryMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("BigDaddy: applicationDidFinishLaunching started")
@@ -40,19 +48,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         print("BigDaddy: signal handlers installed")
         client.prepareRuntime()
         print("BigDaddy: runtime prepared")
-        if #available(macOS 11.0, *) {
-            if let image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "BigDaddy") {
-                image.isTemplate = true
-                statusItem?.button?.image = image
-                print("BigDaddy: StatusItem image set successfully")
-            } else {
-                statusItem?.button?.title = "BD"
-                print("BigDaddy: StatusItem image load failed, fallback to BD title")
-            }
-        } else {
-            statusItem?.button?.title = "BD"
-            print("BigDaddy: StatusItem title set to BD")
-        }
+        client.startNetworkMonitoring()
+        print("BigDaddy: network monitoring started")
+        LaunchAgentInstaller.installIfNeeded()
+        print("BigDaddy: launch agent checked")
+        // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
+        updateStatusItemAppearance()
+        print("BigDaddy: StatusItem appearance set")
+        // 监听"实际发生截图"事件，触发孩子端即时可见提示
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(onScreenshotSent),
+            name: BigDaddyClient.screenshotSentNotification, object: nil
+        )
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
         presentFirstRunDisclosureIfNeeded()
@@ -64,8 +71,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             print("BigDaddy: async task background config refresh started")
             let configChanged = await client.refreshConfig()
             print("BigDaddy: async task background heartbeat sending started")
-            let startEvent: EventType = client.consumePreviousCrash() == nil ? .start : .forceKill
-            await client.sendHeartbeat(event: startEvent)
+            // 本次启动永远是 START 事件；如果检测到上次异常终止，通过
+            // previousCrashAt 字段"如实补报"，而不是把这次正常启动本身
+            // 标记成 FORCE_KILL（那样会让后端把重启误判成刚刚发生的强杀）。
+            if let crashedAt = client.detectedPreviousCrash {
+                AuditLog.record("PREVIOUS_CRASH_DETECTED at=\(ISO8601DateFormatter().string(from: crashedAt))")
+            }
+            let reported = await client.sendHeartbeat(event: .start)
+            if reported {
+                client.clearPreviousCrash()
+            }
             // 如果配置有变化，额外发送 CONFIG_UPDATED 事件
             if configChanged {
                 await client.sendHeartbeat(event: .configUpdated)
@@ -86,6 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     private func rebuildMenu() {
         let menu = NSMenu()
+        menu.delegate = self
 
         if client.config.bound {
             let statusItem = NSMenuItem(
@@ -94,6 +110,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             )
             statusItem.isEnabled = false
             menu.addItem(statusItem)
+
+            // 常驻可见提示：截图开启时，孩子在菜单里一眼可见"家长可远程截屏"
+            let screenshotStateItem = NSMenuItem(
+                title: client.config.screenshotEnabled
+                    ? Localization.string(zh: "📸 截图已开启：家长可远程截屏（本机会记录）",
+                                          en: "📸 Screenshots ON: parent can capture (logged on this Mac)")
+                    : Localization.string(zh: "截图: 未开启", en: "Screenshots: OFF"),
+                action: nil, keyEquivalent: ""
+            )
+            screenshotStateItem.isEnabled = false
+            menu.addItem(screenshotStateItem)
+
+            // 运行状态：最近一次心跳送达时间，孩子/家长一眼可见守护是否还在正常运作
+            let heartbeatItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            heartbeatItem.isEnabled = false
+            menu.addItem(heartbeatItem)
+            self.heartbeatStatusMenuItem = heartbeatItem
+
+            // 下一次截屏倒计时（仅截图开启时有意义）
+            if client.config.screenshotEnabled {
+                let countdownItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                countdownItem.isEnabled = false
+                menu.addItem(countdownItem)
+                self.nextScreenshotMenuItem = countdownItem
+            } else {
+                self.nextScreenshotMenuItem = nil
+            }
+
+            // 当前配置只读展示：修改集中在家长 Dashboard，这里只做展示
+            let configSummaryItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            configSummaryItem.isEnabled = false
+            menu.addItem(configSummaryItem)
+            self.configSummaryMenuItem = configSummaryItem
 
             menu.addItem(NSMenuItem(
                 title: Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"),
@@ -117,6 +166,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 action: #selector(showBindCodeInput), keyEquivalent: ""
             ))
             menu.addItem(.separator())
+            self.heartbeatStatusMenuItem = nil
+            self.nextScreenshotMenuItem = nil
+            self.configSummaryMenuItem = nil
         }
 
         // 知情透明：任何状态下孩子都能查看"守护说明"和导出"本机守护记录"
@@ -130,11 +182,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         ))
         menu.addItem(.separator())
 
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let versionItem = NSMenuItem(
+            title: Localization.string(zh: "版本 \(version)", en: "Version \(version)"),
+            action: nil, keyEquivalent: ""
+        )
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+        menu.addItem(.separator())
+
         menu.addItem(NSMenuItem(
             title: Localization.string(zh: "安全退出", en: "Secure Exit"),
             action: #selector(quitWithPassword), keyEquivalent: "q"
         ))
         statusItem?.menu = menu
+        updateStatusItemAppearance()
+        refreshDynamicMenuItems()
+    }
+
+    /// 打开菜单前刷新一次动态项，确保心跳状态/倒计时/配置摘要是"打开那一刻"的真实值，
+    /// 而不需要靠后台不断重建整个菜单来维持新鲜度。
+    private func refreshDynamicMenuItems() {
+        heartbeatStatusMenuItem?.title = Localization.string(
+            zh: "最近心跳: \(client.lastHeartbeatDescription)",
+            en: "Last heartbeat: \(client.lastHeartbeatDescription)"
+        )
+
+        if let item = nextScreenshotMenuItem {
+            if let fireDate = screenshotTimer?.fireDate {
+                let remaining = max(0, Int(fireDate.timeIntervalSinceNow))
+                let mm = remaining / 60
+                let ss = remaining % 60
+                item.title = Localization.string(
+                    zh: String(format: "下次截屏: %02d:%02d 后", mm, ss),
+                    en: String(format: "Next screenshot in %02d:%02d", mm, ss)
+                )
+            } else {
+                item.title = Localization.string(zh: "下次截屏: 未安排", en: "Next screenshot: not scheduled")
+            }
+        }
+
+        if let item = configSummaryMenuItem {
+            let channels = client.config.notificationChannels
+            let hasChannel = !(channels.email ?? "").isEmpty || !(channels.telegramChatId ?? "").isEmpty
+            let channelDesc = hasChannel
+                ? Localization.string(zh: "已配置", en: "configured")
+                : Localization.string(zh: "未配置", en: "not configured")
+            item.title = Localization.string(
+                zh: "当前配置: 截屏间隔 \(client.config.screenshotIntervalMins) 分钟 · 通知渠道\(channelDesc)",
+                en: "Config: every \(client.config.screenshotIntervalMins) min · channel \(channelDesc)"
+            )
+        }
+    }
+
+    /// 用户点开菜单栏图标的那一刻，把心跳状态/倒计时/配置摘要刷新成最新值。
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshDynamicMenuItems()
+    }
+
+    /// 让菜单栏图标反映当前"截图是否开启 / 是否正在截图 / 权限是否缺失"，作为孩子端常驻可见指示。
+    /// - off: 盾牌；on: 眼睛（正被家长可视）；capturing: 相机（此刻正在截屏）；
+    /// - missingPermission: 家长已开启截图但系统权限未授权，三角警示号提示"配置了但实际不生效"。
+    private func updateStatusItemAppearance(capturing: Bool = false) {
+        guard let button = statusItem?.button else { return }
+        let on = client.config.screenshotEnabled
+        let missingPermission = on && !checkScreenRecordingPermission()
+        if #available(macOS 11.0, *) {
+            let symbol: String
+            let desc: String
+            if capturing {
+                symbol = "camera.fill"; desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
+            } else if missingPermission {
+                symbol = "exclamationmark.triangle.fill"
+                desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限", en: "BigDaddy screenshots on but missing system permission")
+            } else if on {
+                symbol = "eye.fill"; desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
+            } else {
+                symbol = "shield.fill"; desc = "BigDaddy"
+            }
+            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: desc) {
+                image.isTemplate = true
+                button.image = image
+                button.title = ""
+                return
+            }
+        }
+        button.image = nil
+        button.title = capturing ? "BD●REC" : (missingPermission ? "BD⚠" : (on ? "BD●" : "BD"))
+    }
+
+    /// 每次实际发生截图时被调用：图标短暂切到"相机"态，并推送本机通知，确保孩子端即时可见。
+    @objc private func onScreenshotSent() {
+        updateStatusItemAppearance(capturing: true)
+        screenshotFlashTimer?.invalidate()
+        screenshotFlashTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.updateStatusItemAppearance() }
+        }
+        postLocalNotice(
+            title: Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent"),
+            body: Localization.string(zh: "本次截图已写入“本机守护记录”，可在菜单中导出查看。",
+                                      en: "This capture is written to the local Guardian Log; export it from the menu.")
+        )
+    }
+
+    /// 本机通知（无需额外权限），用于把"发生了什么"即时告知使用本机的孩子。
+    private func postLocalNotice(title: String, body: String) {
+        let notice = NSUserNotification()
+        notice.title = title
+        notice.informativeText = body
+        NSUserNotificationCenter.default.deliver(notice)
     }
 
     // 跟踪 IDLE/RESUME 状态转换
@@ -142,8 +298,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     private func scheduleTimers() {
         screenshotTimer?.invalidate()
-        heartbeatTimer?.invalidate()
-        commandTimer?.invalidate()
 
         // 定时截图（由后端 screenshotEnabled 控制，调度本身照常）
         screenshotTimer = Timer.scheduledTimer(
@@ -153,30 +307,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             Task { @MainActor in self?.performScheduledScreenshot() }
         }
 
-        let heartbeatSeconds = client.config.bound
-            ? client.config.heartbeatActiveSeconds
-            : max(client.config.heartbeatActiveSeconds, 300)
+        scheduleNextHeartbeat()
+        scheduleNextCommandPoll()
 
-        heartbeatTimer = Timer.scheduledTimer(
-            withTimeInterval: TimeInterval(heartbeatSeconds),
-            repeats: true
-        ) { [weak self] _ in
+        // 定期拉取配置，使家长在后端的开启/撤销近实时生效，并让状态变化对孩子端可见
+        configTimer?.invalidate()
+        configTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { await self?.pollConfigForChildVisibility() }
+        }
+    }
+
+    /// 心跳定时器自我重排：活跃态用 heartbeatActiveSeconds（默认 60s），空闲态改用
+    /// heartbeatIdleSeconds（默认 900s/15 分钟）。此前是固定间隔的 repeating Timer，
+    /// 空闲时只是心跳里的 eventType 换成 IDLE，触发频率从未真正降下来。
+    private func scheduleNextHeartbeat() {
+        heartbeatTimer?.invalidate()
+        let interval: TimeInterval = wasIdle
+            ? TimeInterval(client.config.heartbeatIdleSeconds)
+            : TimeInterval(client.config.bound ? client.config.heartbeatActiveSeconds : max(client.config.heartbeatActiveSeconds, 300))
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             guard let self else { return }
+            let previouslyIdle = self.wasIdle
             Task {
                 let isIdle = await self.client.isIdle
-                if !isIdle && self.wasIdle {
-                    // 从 IDLE 恢复 → 发送 RESUME 事件
+                if !isIdle && previouslyIdle {
+                    // 从 IDLE 恢复 → 立即发送 RESUME 并拉取最新配置，恢复正常节奏
                     await self.client.sendHeartbeat(event: .resume)
+                    _ = await self.client.refreshConfig()
                 } else {
                     await self.client.sendHeartbeat(event: isIdle ? .idle : .heartbeat)
                 }
-                await MainActor.run { self.wasIdle = isIdle }
+                await MainActor.run {
+                    self.wasIdle = isIdle
+                    self.scheduleNextHeartbeat()
+                    self.triggerImmediateCommandPollIfNeeded()
+                }
             }
         }
+    }
 
-        if client.config.bound {
-            commandTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-                Task { await self?.client.pollCommands() }
+    /// 命令轮询自我重排：活跃态 30 秒一次，空闲态降到 5 分钟一次。
+    private func scheduleNextCommandPoll() {
+        commandTimer?.invalidate()
+        guard client.config.bound else { return }
+        let interval: TimeInterval = wasIdle ? 300 : 30
+        commandTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            Task {
+                await self.client.pollCommands()
+                await MainActor.run { self.scheduleNextCommandPoll() }
+            }
+        }
+    }
+
+    /// 心跳/配置响应里如果带回 hasPendingCommand=true，立即触发一次命令轮询，
+    /// 不等下一次定时轮询窗口，缩短"测试截图命令"从下发到执行的延迟。
+    private func triggerImmediateCommandPollIfNeeded() {
+        guard client.config.bound, client.config.hasPendingCommand else { return }
+        commandTimer?.invalidate()
+        Task {
+            await client.pollCommands()
+            await MainActor.run { self.scheduleNextCommandPoll() }
+        }
+    }
+
+    /// 近实时拉取配置：一旦家长开启或撤销截图，立即更新常驻指示并通知孩子端。
+    private func pollConfigForChildVisibility() async {
+        let before = client.config.screenshotEnabled
+        let changed = await client.refreshConfig()
+        guard changed else { return }
+        let after = client.config.screenshotEnabled
+        await MainActor.run {
+            rebuildMenu()
+            updateStatusItemAppearance()
+            triggerImmediateCommandPollIfNeeded()
+            if after != before {
+                AuditLog.record("SCREENSHOT_TOGGLE state=\(after ? "ENABLED" : "DISABLED") source=remote")
+                postLocalNotice(
+                    title: after
+                        ? Localization.string(zh: "家长已开启截图", en: "Parent turned screenshots ON")
+                        : Localization.string(zh: "家长已关闭截图", en: "Parent turned screenshots OFF"),
+                    body: after
+                        ? Localization.string(zh: "家长现在可以远程截屏，本机会持续记录每一次截图。",
+                                              en: "Your parent can now capture screenshots; every capture is logged on this Mac.")
+                        : Localization.string(zh: "截图功能已停止。",
+                                              en: "Screenshot capture has been turned off.")
+                )
             }
         }
     }
@@ -426,6 +642,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func showBindCodeInput() {
+        // 之前只有"扫码绑定"这条路径会检查屏幕录制/辅助功能权限，从这里绑定的设备
+        // 会在毫无权限提示的情况下直接完成绑定，后续截图静默失败。两条绑定路径都要检查。
+        guard checkAndRequestPermissions() else { return }
+
         let alert = NSAlert()
         alert.messageText = Localization.string(
             zh: "输入家长提供的绑定码",
@@ -509,21 +729,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             zh: "关于本机的家庭守护",
             en: "About the Family Guardian on This Mac"
         )
+        // 采集说明随当前真实状态变化，避免"文案说没开、实际已开"的表里不一
+        let shotStatusZh = client.config.screenshotEnabled
+            ? "截图当前【已开启】：家长可远程截屏，每一张都会记录在本机。"
+            : "截图当前【未开启】：仅生成活动应用与窗口标题的使用摘要，不截屏。"
+        let shotStatusEn = client.config.screenshotEnabled
+            ? "Screenshots are currently ON: your parent can capture the screen; every capture is logged here."
+            : "Screenshots are currently OFF: only usage summaries of the active app/window are collected, no screen capture."
         alert.informativeText = Localization.string(
             zh: """
             这台 Mac 正在运行 BigDaddy 家庭守护，由你的家长（法定监护人）在你知情的前提下与你共同使用。
 
-            • 采集内容：当前活动应用与窗口标题的使用摘要；仅当家长在仪表盘开启截图时，才会定时截屏。
+            • 采集内容：当前活动应用与窗口标题的使用摘要。\(shotStatusZh)
             • 谁能看到：仅与本设备完成绑定的家长本人。服务器只做中转，不保存截图原图。
-            • 你的知情权：菜单栏图标一直可见；每次实际发送的截图都会记录在“本机守护记录”里，你可以随时导出查看。
+            • 你的知情权：菜单栏图标会随截图开关变化；开启后菜单会常驻显示提示，每次实际截图都会弹出通知并写入“本机守护记录”，你可以随时导出查看。
             • 暂停/停止：请与家长沟通，由家长在仪表盘生成退出验证码或解除绑定。
             """,
             en: """
             This Mac runs BigDaddy Family Guardian, used with your knowledge by your parent (legal guardian).
 
-            • What it collects: usage summaries of the active app and window title; screenshots are taken only if a parent turns them on in the dashboard.
+            • What it collects: usage summaries of the active app and window title. \(shotStatusEn)
             • Who can see it: only the parent bound to this device. The server relays and never stores screenshots.
-            • Your visibility: the menu bar icon is always shown; every screenshot actually sent is written to the local Guardian Log, which you can export anytime.
+            • Your visibility: the menu bar icon changes with the screenshot switch; when on, the menu shows a standing notice, and every capture pops a notification and is written to the local Guardian Log you can export anytime.
             • Pause/stop: talk to your parent, who can issue an exit code or unbind the device in the dashboard.
             """
         )
@@ -752,10 +979,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
     }
 
+    /// C 的裸 signal() 处理器里不允许做内存分配、发起网络请求或创建 Swift Task
+    /// （非 async-signal-safe），之前的实现在处理器里直接触发异步网络调用，有
+    /// 死锁/崩溃风险；而且从未调用 exit()，一旦自定义处理器接管了默认终止行为，
+    /// SIGTERM/SIGINT/SIGHUP 可能根本杀不死进程，只能靠 kill -9 兜底。
+    /// 这里改用 DispatchSourceSignal：先用 SIG_IGN 屏蔽默认终止动作，再在正常
+    /// GCD 队列上异步处理信号（可以安全地做网络上报），处理完成后显式 exit(0)。
     private func installSignalHandlers() {
-        signal(SIGTERM) { _ in BigDaddyClient.sharedForceKillPing() }
-        signal(SIGINT) { _ in BigDaddyClient.sharedForceKillPing() }
-        signal(SIGHUP) { _ in BigDaddyClient.sharedForceKillPing() }
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            source.setEventHandler {
+                BigDaddyClient.sharedForceKillPing {
+                    exit(0)
+                }
+            }
+            source.resume()
+            signalSources.append(source)
+        }
     }
 
     private func checkScreenRecordingPermission() -> Bool {

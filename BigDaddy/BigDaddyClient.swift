@@ -1,8 +1,10 @@
 import AppKit
+import ApplicationServices
 import CoreImage
 import CryptoKit
 import Darwin
 import Foundation
+import Network
 import Security
 
 enum EventType: String, Codable {
@@ -13,6 +15,7 @@ enum EventType: String, Codable {
     case shutdown = "SHUTDOWN"
     case forceKill = "FORCE_KILL"
     case configUpdated = "CONFIG_UPDATED"
+    case commandAck = "COMMAND_ACK"
 }
 
 struct DeviceIdentity {
@@ -40,7 +43,9 @@ struct ClientConfig: Codable, Equatable {
     var compressMaxWidth: Int = 1280
     var aiEnabled: Bool = false
     var allowScreenshotAiProcessing: Bool = false
-    var exitPasswordHash: String?
+    /// 已绑定设备恒为 true：退出验证不是持久化开关，而是家长每次都要在 Dashboard
+    /// 实时生成一次性验证码（见 verifyExitPassword），这里只用于 UI 展示"是否需要验证退出"。
+    var hasExitPassword: Bool = false
     var heartbeatActiveSeconds: Int = 60
     var heartbeatIdleSeconds: Int = 900
     var idleThresholdSeconds: Int = 180
@@ -60,7 +65,7 @@ struct ClientConfig: Codable, Equatable {
         compressMaxWidth = try container.decodeIfPresent(Int.self, forKey: .compressMaxWidth) ?? 1280
         aiEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiEnabled) ?? false
         allowScreenshotAiProcessing = try container.decodeIfPresent(Bool.self, forKey: .allowScreenshotAiProcessing) ?? false
-        exitPasswordHash = try container.decodeIfPresent(String.self, forKey: .exitPasswordHash)
+        hasExitPassword = try container.decodeIfPresent(Bool.self, forKey: .hasExitPassword) ?? false
         heartbeatActiveSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatActiveSeconds) ?? 60
         heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 900
         idleThresholdSeconds = try container.decodeIfPresent(Int.self, forKey: .idleThresholdSeconds) ?? 180
@@ -94,7 +99,11 @@ final class BigDaddyClient {
     }
 
     var isIdle: Bool {
-        let idleSeconds = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: .mouseMoved)
+        // 之前只看 .mouseMoved，只打字不动鼠标会被误判为空闲。改用 kCGAnyInputEventType
+        // （rawValue ~0，即 CGEventSourceSecondsSinceLastInputEvent 的语义）覆盖键盘/
+        // 鼠标/触控板等全部输入类型。
+        let anyInputEventType = CGEventType(rawValue: ~UInt32(0))!
+        let idleSeconds = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: anyInputEventType)
         return idleSeconds > Double(config.idleThresholdSeconds)
     }
 
@@ -107,10 +116,14 @@ final class BigDaddyClient {
         try? "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
     }
 
-    func consumePreviousCrash() -> Date? {
-        let crash = previousCrashAt
+    /// 非破坏性读取：调用方据此判断"上次是否异常终止"，不清空状态。
+    /// 清空由 clearPreviousCrash() 单独负责，必须在 previousCrashAt 已经通过
+    /// sendHeartbeat 上报给后端之后才调用——此前的实现把"读取"和"清空"合并成一步，
+    /// 导致上报心跳时 previousCrashAt 已经被清空，后端永远收不到崩溃时间戳。
+    var detectedPreviousCrash: Date? { previousCrashAt }
+
+    func clearPreviousCrash() {
         previousCrashAt = nil
-        return crash
     }
 
     func register() async {
@@ -134,14 +147,17 @@ final class BigDaddyClient {
         let previous = config
         let remote = response.data
         if remote.bound {
+            // 已绑定：后端配置是权威策略，完整应用并持久化
             config = remote
             ConfigStore.save(config)
-        } else if config.bound {
-            config = ClientConfig()
-            ConfigStore.save(config)
         } else {
+            // 未绑定只是连接性/绑定状态信号，不是权威策略——不能用它整体覆盖本地
+            // 配置（哪怕是"曾经绑定、现在被解绑"这种状态转换），只更新 bound 相关
+            // 字段。此前的实现在这个转换时会执行 config = ClientConfig()，把整份
+            // 本地配置重置为默认值，是对规格明确要求的违反。
             config.bound = false
             config.hasPendingCommand = false
+            ConfigStore.save(config)
         }
         return config != previous
     }
@@ -149,7 +165,34 @@ final class BigDaddyClient {
     /// 记录最近一次截图时间，随心跟上报
     private var lastScreenshotAt: Date?
 
-    func sendHeartbeat(event: EventType) async {
+    /// 简单的客户端侧应用分类，口径与后端 AI 日报调度器的确定性分类保持一致
+    /// （LEARNING/CREATIVE/COMMUNICATION/ENTERTAINMENT/GAME/BROWSER/UNKNOWN）。
+    private func classifyAppType(appName: String) -> String {
+        let lower = appName.lowercased()
+        if lower.contains("chrome") || lower.contains("safari") || lower.contains("firefox") || lower.contains("edge") {
+            return "BROWSER"
+        }
+        if lower.contains("steam") || lower.contains("epic") || lower.contains("battle.net") {
+            return "GAME"
+        }
+        if lower.contains("code") || lower.contains("xcode") || lower.contains("terminal") || lower.contains("pages") || lower.contains("keynote") || lower.contains("numbers") {
+            return "LEARNING"
+        }
+        if lower.contains("photoshop") || lower.contains("procreate") || lower.contains("figma") || lower.contains("sketch") {
+            return "CREATIVE"
+        }
+        if lower.contains("discord") || lower.contains("slack") || lower.contains("wechat") || lower.contains("messages") || lower.contains("mail") {
+            return "COMMUNICATION"
+        }
+        if lower.contains("music") || lower.contains("tv") || lower.contains("netflix") || lower.contains("spotify") {
+            return "ENTERTAINMENT"
+        }
+        return appName.isEmpty ? "UNKNOWN" : "UNKNOWN"
+    }
+
+    /// 发送心跳。返回是否成功送达后端，供强杀/退出等需要"确认上报后才清理本地状态"的调用方判断。
+    @discardableResult
+    func sendHeartbeat(event: EventType) async -> Bool {
         let version = Bundle.self.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let windowTitle = getActiveWindowTitle()
@@ -161,10 +204,14 @@ final class BigDaddyClient {
             "lastHeartbeatAt": ISO8601DateFormatter().string(from: Date()),
             "activeAppName": activeApp,
             "activeWindowTitle": windowTitle,
+            "appType": classifyAppType(appName: activeApp),
             "activeUrl": activeUrl,
             "previousCrashAt": previousCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
-            "metadata": ["screenRecordingGranted": CGPreflightScreenCaptureAccess()]
+            "metadata": [
+                "screenRecordingGranted": CGPreflightScreenCaptureAccess(),
+                "accessibilityGranted": AXIsProcessTrustedWithOptions(nil)
+            ]
         ]
         // 如果有截图记录，一并上报
         if let lastShot = lastScreenshotAt {
@@ -172,14 +219,93 @@ final class BigDaddyClient {
         } else {
             body["lastScreenshotAt"] = NSNull()
         }
-        _ = try? await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
-        lastHeartbeatDescription = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        do {
+            let data = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
+            if let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<HeartbeatResponse>.self, from: data),
+               let pending = response.data.hasPendingCommand {
+                config.hasPendingCommand = pending
+            }
+            lastHeartbeatDescription = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+            return true
+        } catch {
+            NSLog("BigDaddy: heartbeat failed, queuing for retry: \(error.localizedDescription)")
+            PendingQueue.enqueue(body)
+            return false
+        }
     }
 
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSatisfied = false
+
+    /// 用 NWPathMonitor 监听网络恢复：一旦从"不可达"变为"可达"，尝试补发积压的心跳。
+    func startNetworkMonitoring() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let satisfied = path.status == .satisfied
+            if satisfied && !self.lastPathSatisfied {
+                Task { await self.flushPendingQueue() }
+            }
+            self.lastPathSatisfied = satisfied
+        }
+        monitor.start(queue: DispatchQueue(label: "com.bigdaddy.pathmonitor"))
+        pathMonitor = monitor
+    }
+
+    /// 补发断网期间积压的心跳；单条失败则重新入队，等待下一次网络恢复。
+    func flushPendingQueue() async {
+        let pending = PendingQueue.drainAll()
+        guard !pending.isEmpty else { return }
+        NSLog("BigDaddy: network recovered, flushing \(pending.count) queued heartbeat(s)")
+        for body in pending {
+            do {
+                _ = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
+            } catch {
+                PendingQueue.enqueue(body)
+            }
+        }
+    }
+
+    /// 正常退出（已通过远程验证码确认）：上报 SHUTDOWN 并清除墓碑文件。
     func sendShutdownSync() {
         Task.detached {
             await self.sendHeartbeat(event: .shutdown)
             try? FileManager.default.removeItem(at: Self.lockFileURL)
+        }
+    }
+
+    /// 限时上报，用于信号处理场景：绝不无限等待网络，避免拖着进程迟迟无法退出。
+    /// 返回是否确认送达（超时或请求失败都算未确认）。
+    private func sendForceKillHeartbeatWithTimeout(seconds: UInt64 = 2) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.sendHeartbeat(event: .forceKill) }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+    }
+
+    /// 收到 SIGTERM/SIGINT/SIGHUP 时调用：这些信号意味着进程被外部终止，而不是
+    /// 孩子通过菜单走验证码确认的正常退出，因此上报事件类型是 FORCE_KILL 而不是
+    /// SHUTDOWN，让家长知道守护进程是被意外/强制关闭的。只有确认上报成功才清除
+    /// 墓碑文件；上报失败或超时（例如进程正被系统强制拖走）则保留墓碑，交给下次
+    /// 启动时的兜底检测补报，避免这次事件被无声丢弃。
+    static func sharedForceKillPing(completion: @escaping () -> Void) {
+        guard let instance = lastSharedInstance else {
+            completion()
+            return
+        }
+        Task {
+            let reported = await instance.sendForceKillHeartbeatWithTimeout()
+            if reported {
+                try? FileManager.default.removeItem(at: lockFileURL)
+            }
+            completion()
         }
     }
 
@@ -309,18 +435,45 @@ final class BigDaddyClient {
         return data
     }
 
-    func captureAndSendScreenshot(reason: String) async {
-        // screenshotEnabled 由后端配置控制，默认关闭
-        guard config.screenshotEnabled || reason == "command" else { return }
+    /// 截图实际发生时广播，供 UI 层给孩子端即时可见提示
+    static let screenshotSentNotification = Notification.Name("BigDaddyScreenshotSent")
+
+    /// 逐步降低 JPEG quality 直到落在目标大小区间以内（不强求下限，避免对本来就很
+    /// 小的截图做无意义的画质牺牲），而不是像之前那样只压缩一次就直接上传。
+    private func compressToTargetSize(_ rep: NSBitmapImageRep, startQuality: Double) -> Data {
+        let targetMaxBytes = 300 * 1024
+        var quality = startQuality
+        var data = rep.representation(using: .jpeg, properties: [.compressionFactor: quality]) ?? Data()
+        while data.count > targetMaxBytes && quality > 0.1 {
+            quality = max(0.1, quality - 0.1)
+            if let smaller = rep.representation(using: .jpeg, properties: [.compressionFactor: quality]) {
+                data = smaller
+            } else {
+                break
+            }
+        }
+        return data
+    }
+
+    /// 返回是否真正完成了一次截图上传尝试（用于命令回执：截图被禁用/无权限/上传失败
+    /// 都不应该回执 SUCCEEDED，此前命令通道无条件回执成功，是一种"假成功"）。
+    @discardableResult
+    func captureAndSendScreenshot(reason: String) async -> Bool {
+        // screenshotEnabled 由后端配置控制，默认关闭。
+        // 任何路径（定时/手动/命令）都必须在开启后才允许截屏，命令通道不再绕过此开关。
+        guard config.screenshotEnabled else {
+            NSLog("BigDaddy: screenshot disabled, ignoring capture request (reason: \(reason)).")
+            return false
+        }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
-            return
+            return false
         }
-        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else { return }
+        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else { return false }
 
         if reason != "command" && isImageSimilarToLast(cgImage: image) {
             NSLog("BigDaddy: Screenshot is similar to the last one, skip sending.")
-            return
+            return false
         }
 
         let bitmap = NSBitmapImageRep(cgImage: image)
@@ -332,22 +485,35 @@ final class BigDaddyClient {
         NSImage(cgImage: image, size: NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)).draw(in: NSRect(origin: .zero, size: targetSize))
         nsImage.unlockFocus()
 
-        guard let tiff = nsImage.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return }
-        let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: config.compressQuality]) ?? Data()
+        guard let tiff = nsImage.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return false }
+        let jpeg = compressToTargetSize(rep, startQuality: config.compressQuality)
 
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let windowTitle = getActiveWindowTitle()
         let activeUrl = getActiveBrowserUrl(appName: activeApp)
 
         do {
-            _ = try await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
+            let responseData = try await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
             // 成功发送后更新截图时间
             lastScreenshotAt = Date()
             // 知情透明：把本次截图动作写入本机可查看/可导出的守护记录
             AuditLog.record("SCREENSHOT_SENT reason=\(reason) app=\(activeApp) window=\(windowTitle)")
+            // 后端会明确告知是否真的转发成功（而不是只确认"收到了文件"），
+            // 未送达时也要如实记录，避免家长/孩子都以为已经发出去了。
+            if let decoded = try? JSONDecoder.bigDaddy.decode(ApiResponse<ScreenshotUploadResponse>.self, from: responseData),
+               decoded.data.delivered == false {
+                AuditLog.record("SCREENSHOT_NOT_DELIVERED reason=\(decoded.data.reason ?? "UNKNOWN")")
+                NSLog("BigDaddy: Screenshot uploaded but not delivered to any channel: \(decoded.data.reason ?? "unknown")")
+            }
+            // 即时可见：广播截图事件，UI 层据此闪烁菜单栏图标并弹出本机通知
+            await MainActor.run {
+                NotificationCenter.default.post(name: BigDaddyClient.screenshotSentNotification, object: nil)
+            }
             NSLog("BigDaddy: Screenshot uploaded (reason: \(reason)).")
+            return true
         } catch {
             NSLog("BigDaddy: Screenshot upload failed: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -356,16 +522,23 @@ final class BigDaddyClient {
         guard let data = try? await request(path: "/bigdaddy/client/commands?limit=10", method: "GET", body: nil, signed: true),
               let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
         for command in response.data where command.type == "TAKE_SCREENSHOT_NOW" {
-            await captureAndSendScreenshot(reason: "command")
-            await ack(commandId: command.commandId, status: "SUCCEEDED", message: "Screenshot command processed")
+            // 之前无条件回执 SUCCEEDED，哪怕截图因为未开启/无权限/上传失败而根本没发生，
+            // 家长在 Dashboard 看到的命令状态是假的。现在按实际结果回执。
+            let succeeded = await captureAndSendScreenshot(reason: "command")
+            await ack(
+                commandId: command.commandId,
+                status: succeeded ? "SUCCEEDED" : "FAILED",
+                message: succeeded ? "Screenshot command processed" : "Screenshot not captured (disabled, missing permission, or upload failed)"
+            )
         }
     }
 
     func verifyExitPassword(_ value: String) async -> Bool {
+        // 未绑定设备没有家长账户可以生成退出验证码，允许直接退出。
+        // 已绑定设备必须始终远程校验——不能因为本地状态判断就跳过，
+        // 否则任意 6 位数字都能绕过退出确认（曾经的漏洞：旧代码在
+        // config.exitPasswordHash == nil 时直接放行，而该字段现在恒为空）。
         guard config.bound else {
-            return true
-        }
-        guard config.exitPasswordHash != nil else {
             return true
         }
         let body: [String: Any] = [
@@ -380,10 +553,6 @@ final class BigDaddyClient {
             NSLog("BigDaddy: verifyExitPassword request failed: \(error.localizedDescription)")
         }
         return false
-    }
-
-    static func sharedForceKillPing() {
-        lastSharedInstance?.sendShutdownSync()
     }
 
     private func ack(commandId: String, status: String, message: String) async {
@@ -488,6 +657,86 @@ enum AuditLog {
     }
 }
 
+/// 断网容错：心跳/事件发送失败时，把请求体原样缓存到本地文件（每行一条 JSON），
+/// 绝不缓存截图字节。网络恢复后由 BigDaddyClient 的 NWPathMonitor 触发补发，
+/// 重新签名（HMAC 时间戳必须是发送时刻的新值，不能复用失败时的旧签名）后清空。
+enum PendingQueue {
+    static var queueFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BigDaddy/pending-heartbeats.jsonl")
+    }
+    /// 上限保护，避免长期离线导致队列文件无限增长
+    private static let maxEntries = 200
+
+    static func enqueue(_ body: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: body),
+              let line = String(data: data, encoding: .utf8) else { return }
+        var lines = readLines()
+        lines.append(line)
+        if lines.count > maxEntries {
+            lines.removeFirst(lines.count - maxEntries)
+        }
+        write(lines)
+    }
+
+    /// 取出全部积压条目并清空队列文件；补发失败的条目由调用方重新 enqueue。
+    static func drainAll() -> [[String: Any]] {
+        let lines = readLines()
+        write([])
+        return lines.compactMap { line in
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return obj
+        }
+    }
+
+    private static func readLines() -> [String] {
+        guard let data = try? Data(contentsOf: queueFileURL),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init)
+    }
+
+    private static func write(_ lines: [String]) {
+        let url = queueFileURL
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let text = lines.joined(separator: "\n")
+        try? text.data(using: .utf8)?.write(to: url, options: .atomic)
+    }
+}
+
+/// 用户级 LaunchAgent，实现开机自动启动（RunAtLoad），不使用特权 daemon。
+/// 注：不设置 KeepAlive——"崩溃后自动拉起"这类连续性模式按设计需要家长在
+/// Dashboard 显式开启才能启用，后端目前还没有提供这个配置项，暂缓实现；
+/// 这里先落地规格里最基础的"开机自动启动"，对孩子在系统设置的登录项列表
+/// 里始终可见，也可以随时自行移除。
+enum LaunchAgentInstaller {
+    static var launchAgentURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.bigdaddy.client.plist")
+    }
+
+    static func installIfNeeded() {
+        guard let executablePath = Bundle.main.executablePath else { return }
+        let plist: [String: Any] = [
+            "Label": "com.bigdaddy.client",
+            "ProgramArguments": [executablePath],
+            "RunAtLoad": true,
+            "KeepAlive": false
+        ]
+        let url = launchAgentURL
+        // 已存在且内容一致就跳过，避免每次启动都重写文件
+        if let existingData = try? Data(contentsOf: url),
+           let existingPlist = try? PropertyListSerialization.propertyList(from: existingData, format: nil) as? NSDictionary,
+           existingPlist == (plist as NSDictionary) {
+            return
+        }
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) else { return }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
+        AuditLog.record("LAUNCH_AGENT_INSTALLED path=\(executablePath)")
+    }
+}
+
 enum ConfigStore {
     static var configFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -533,6 +782,19 @@ struct DeviceResponse: Codable {
 struct Command: Codable {
     let commandId: String
     let type: String
+}
+
+struct HeartbeatResponse: Codable {
+    let configVersion: Int?
+    let configChanged: Bool?
+    let hasPendingCommand: Bool?
+}
+
+struct ScreenshotUploadResponse: Codable {
+    let delivered: Bool?
+    let emailStatus: String?
+    let telegramStatus: String?
+    let reason: String?
 }
 
 enum IdentityStore {
