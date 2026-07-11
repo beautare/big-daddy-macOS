@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <title>BigDaddy Updates</title>
+    <link>https://beautare.github.io/big-daddy-macOS/appcast.xml</link>
+    <description>BigDaddy for macOS release feed</description>
+    <language>zh</language>
+    <!-- ITEMS -->
+    <item>
+      <title>Version 0.2.1</title>
+      <pubDate>Sat, 11 Jul 2026 03:13:47 +0000</pubDate>
+      <sparkle:version>19</sparkle:version>
+      <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.2.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.2.1/BigDaddy-v0.2.1.dmg" sparkle:edSignature="ZCe5J3tSt5bp9m81sa4j1vsjYVraVvSpNqlq62LFPOx3J+HCPjJSY881+cbtDKfPmowTmXtMcHuqg1NiUGLdDg==" length="418382" type="application/octet-stream" />
+    </item>
+  </channel>
+</rss>
