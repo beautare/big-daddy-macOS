@@ -8,9 +8,15 @@ let package = Package(
     products: [
         .executable(name: "BigDaddy", targets: ["BigDaddy"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.4")
+    ],
     targets: [
         .executableTarget(
             name: "BigDaddy",
+            dependencies: [
+                .product(name: "Sparkle", package: "Sparkle")
+            ],
             path: "BigDaddy",
             exclude: ["Info.plist"]
         )

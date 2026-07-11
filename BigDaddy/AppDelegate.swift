@@ -2,6 +2,7 @@ import AppKit
 import CryptoKit
 import Security
 import ApplicationServices
+import Sparkle
 
 enum Localization {
     static var isChinese: Bool {
@@ -38,6 +39,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var heartbeatStatusMenuItem: NSMenuItem?
     private var nextScreenshotMenuItem: NSMenuItem?
     private var configSummaryMenuItem: NSMenuItem?
+    // startingUpdater: true 后立即开始按 SUScheduledCheckInterval 后台检查；
+    // 是否自动检查由 Sparkle 首次运行时弹出的系统对话框询问用户（Info.plist 未设置
+    // SUEnableAutomaticChecks，交由 Sparkle 自行询问并记住用户的选择）。
+    private lazy var updaterController = SPUStandardUpdaterController(
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("BigDaddy: applicationDidFinishLaunching started")
@@ -50,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         print("BigDaddy: runtime prepared")
         client.startNetworkMonitoring()
         print("BigDaddy: network monitoring started")
+        _ = updaterController // 触发 lazy 初始化，启动 Sparkle 后台更新检查
+        print("BigDaddy: Sparkle updater started")
         LaunchAgentInstaller.installIfNeeded()
         print("BigDaddy: launch agent checked")
         // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
@@ -193,6 +202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         )
         versionItem.isEnabled = false
         menu.addItem(versionItem)
+
+        menu.addItem(NSMenuItem(
+            title: Localization.string(zh: "检查更新…", en: "Check for Updates…"),
+            action: #selector(checkForUpdates), keyEquivalent: ""
+        ))
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(
@@ -724,6 +738,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     @objc private func sendScreenshotNow() {
         Task { await client.captureAndSendScreenshot(reason: "manual") }
+    }
+
+    @objc private func checkForUpdates() {
+        updaterController.checkForUpdates(nil)
     }
 
     /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停

@@ -15,9 +15,11 @@ echo "Building BigDaddy version ${VERSION} (Build ${BUILD_NUMBER})..."
 rm -rf "${BUILD_DIR}" "${DIST_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources" "${DIST_DIR}"
 
-swift build --package-path "${ROOT_DIR}" -c release
+# 同时编译 arm64 + x86_64，产出单个 universal 二进制，覆盖 Apple Silicon 和 Intel
+swift build --package-path "${ROOT_DIR}" -c release --arch arm64 --arch x86_64
+BIN_DIR=$(swift build --package-path "${ROOT_DIR}" -c release --arch arm64 --arch x86_64 --show-bin-path)
 
-cp "${ROOT_DIR}/.build/release/BigDaddy" "${APP_DIR}/Contents/MacOS/BigDaddy"
+cp "${BIN_DIR}/BigDaddy" "${APP_DIR}/Contents/MacOS/BigDaddy"
 cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
 
 # 临时向打包的 Info.plist 写入构建号，代码库中的源文件保持不变
@@ -35,16 +37,32 @@ mkdir -p "${STAGING_DIR}"
 cp -R "${APP_DIR}" "${STAGING_DIR}/BigDaddy.app"
 ln -s /Applications "${STAGING_DIR}/Applications"
 
+DMG_PATH="${DIST_DIR}/BigDaddy-v${VERSION}.dmg"
+
 hdiutil create \
   -srcfolder "${STAGING_DIR}" \
   -volname "BigDaddy Installer" \
   -fs HFS+ \
   -fsargs "-c c=64,a=16,e=16" \
   -format UDZO \
-  "${DIST_DIR}/BigDaddy-v${VERSION}.dmg"
+  "${DMG_PATH}"
 
 if [[ "${CODESIGN_IDENTITY}" != "-" ]]; then
-  codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${DIST_DIR}/BigDaddy-v${VERSION}.dmg"
+  codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${DMG_PATH}"
+
+  # 公证：只有传入了 App Store Connect API Key 才会执行，本地手动打包可以不设置这三个变量跳过
+  if [[ -n "${APPLE_API_KEY_PATH:-}" && -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_ISSUER_ID:-}" ]]; then
+    echo "Submitting for notarization..."
+    xcrun notarytool submit "${DMG_PATH}" \
+      --key "${APPLE_API_KEY_PATH}" \
+      --key-id "${APPLE_API_KEY_ID}" \
+      --issuer "${APPLE_API_ISSUER_ID}" \
+      --wait
+    xcrun stapler staple "${DMG_PATH}"
+    xcrun stapler validate "${DMG_PATH}"
+  else
+    echo "Skipping notarization (APPLE_API_KEY_PATH/APPLE_API_KEY_ID/APPLE_API_ISSUER_ID not set)"
+  fi
 fi
 
-echo "DMG: ${DIST_DIR}/BigDaddy-v${VERSION}.dmg"
+echo "DMG: ${DMG_PATH}"
