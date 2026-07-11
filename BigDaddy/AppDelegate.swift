@@ -331,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 定期拉取配置，使家长在后端的开启/撤销近实时生效，并让状态变化对孩子端可见
         configTimer?.invalidate()
         configTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { await self?.pollConfigForChildVisibility() }
+            Task { [weak self] in await self?.pollConfigForChildVisibility() }
         }
     }
 
@@ -344,9 +344,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             ? TimeInterval(client.config.heartbeatIdleSeconds)
             : TimeInterval(client.config.bound ? client.config.heartbeatActiveSeconds : max(client.config.heartbeatActiveSeconds, 300))
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
-            guard let self else { return }
-            let previouslyIdle = self.wasIdle
-            Task {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let previouslyIdle = self.wasIdle
                 let isIdle = await self.client.isIdle
                 if !isIdle && previouslyIdle {
                     // 从 IDLE 恢复 → 立即发送 RESUME 并拉取最新配置，恢复正常节奏
@@ -355,11 +355,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 } else {
                     await self.client.sendHeartbeat(event: isIdle ? .idle : .heartbeat)
                 }
-                await MainActor.run {
-                    self.wasIdle = isIdle
-                    self.scheduleNextHeartbeat()
-                    self.triggerImmediateCommandPollIfNeeded()
-                }
+                self.wasIdle = isIdle
+                self.scheduleNextHeartbeat()
+                self.triggerImmediateCommandPollIfNeeded()
             }
         }
     }
