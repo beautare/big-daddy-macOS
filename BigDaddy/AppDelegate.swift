@@ -294,7 +294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         updateStatusItemAppearance(capturing: true)
         screenshotFlashTimer?.invalidate()
         screenshotFlashTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.updateStatusItemAppearance() }
+            Task { @MainActor [weak self] in self?.updateStatusItemAppearance() }
         }
         postLocalNotice(
             title: Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent"),
@@ -322,7 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             withTimeInterval: TimeInterval(client.config.screenshotIntervalMins * 60),
             repeats: true
         ) { [weak self] _ in
-            Task { @MainActor in self?.performScheduledScreenshot() }
+            Task { @MainActor [weak self] in self?.performScheduledScreenshot() }
         }
 
         scheduleNextHeartbeat()
@@ -458,7 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 启动倒计时 Timer，使用 .common 模式
                 self.countdownTimer?.invalidate()
                 let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-                    Task { @MainActor in
+                    Task { @MainActor [weak self] in
                         self?.tickCountdown()
                     }
                 }
@@ -829,7 +829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 启动倒计时 Timer
         self.countdownTimer?.invalidate()
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.tickExitCountdown()
             }
         }
