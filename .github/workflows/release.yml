@@ -15,6 +15,13 @@ jobs:
   build:
     runs-on: macos-14
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [universal, arm64, x86_64]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build_number: ${{ steps.version.outputs.build_number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,15 +60,19 @@ jobs:
         run: |
           echo -n "$APPLE_API_KEY_P8_BASE64" | base64 --decode -o "$RUNNER_TEMP/AuthKey.p8"
 
-      - name: Build, sign, notarize, package DMG
+      - name: Build, sign, notarize, package DMG (${{ matrix.arch }})
         env:
+          ARCH: ${{ matrix.arch }}
           CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         run: ./scripts/package.sh
 
+      # Sparkle 应用内自动更新只走 universal 版本的 appcast，
+      # 精简架构包只作为官网的"首次安装包"，避免拆分 appcast 带来的复杂度和风险。
       - name: Sign update archive for Sparkle
+        if: matrix.arch == 'universal'
         id: sparkle_sign
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
@@ -77,10 +88,49 @@ jobs:
           SIGNATURE=$(echo "$RESULT" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
           LENGTH=$(echo "$RESULT" | sed -n 's/.*length="\([^"]*\)".*/\1/p')
 
-          echo "dmg_path=${DMG_PATH}" >> "$GITHUB_OUTPUT"
-          echo "dmg_name=$(basename "$DMG_PATH")" >> "$GITHUB_OUTPUT"
-          echo "signature=${SIGNATURE}" >> "$GITHUB_OUTPUT"
-          echo "length=${LENGTH}" >> "$GITHUB_OUTPUT"
+          {
+            echo "DMG_NAME=$(basename "$DMG_PATH")"
+            echo "EDSIGNATURE=${SIGNATURE}"
+            echo "DMG_LENGTH=${LENGTH}"
+          } > dist/sparkle.env
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      BUILD_NUMBER: ${{ needs.build.outputs.build_number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all architecture artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dmg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Load Sparkle signing output
+        id: sparkle_sign
+        run: |
+          set -a
+          source dist/sparkle.env
+          set +a
+          echo "dmg_name=${DMG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "signature=${EDSIGNATURE}" >> "$GITHUB_OUTPUT"
+          echo "length=${DMG_LENGTH}" >> "$GITHUB_OUTPUT"
+          rm -f dist/sparkle.env
 
       - name: Checksum
         run: shasum -a 256 dist/*.dmg | tee dist/checksums.txt
@@ -95,8 +145,6 @@ jobs:
 
       - name: Update appcast.xml on gh-pages
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
           MIN_OS: "12.4"
           DMG_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
           EDSIGNATURE: ${{ steps.sparkle_sign.outputs.signature }}

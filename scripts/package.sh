@@ -8,16 +8,42 @@ DIST_DIR="${ROOT_DIR}/dist"
 STAGING_DIR="${BUILD_DIR}/staging"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 
+# ARCH 控制产出哪种二进制：
+#   universal (默认) = arm64 + x86_64 合并成单个通用二进制，兼容所有 Mac
+#   arm64            = 仅 Apple Silicon 原生二进制，体积更小
+#   x86_64           = 仅 Intel 原生二进制，体积更小
+ARCH="${ARCH:-universal}"
+case "${ARCH}" in
+  universal)
+    ARCH_FLAGS=(--arch arm64 --arch x86_64)
+    DMG_SUFFIX=""
+    VOLNAME="BigDaddy Installer"
+    ;;
+  arm64)
+    ARCH_FLAGS=(--arch arm64)
+    DMG_SUFFIX="-arm64"
+    VOLNAME="BigDaddy Installer (Apple Silicon)"
+    ;;
+  x86_64)
+    ARCH_FLAGS=(--arch x86_64)
+    DMG_SUFFIX="-x86_64"
+    VOLNAME="BigDaddy Installer (Intel)"
+    ;;
+  *)
+    echo "Unknown ARCH '${ARCH}' (expected universal|arm64|x86_64)" >&2
+    exit 1
+    ;;
+esac
+
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "${ROOT_DIR}/BigDaddy/Info.plist")
 BUILD_NUMBER=$(git -C "${ROOT_DIR}" rev-list --count HEAD 2>/dev/null || echo "1")
-echo "Building BigDaddy version ${VERSION} (Build ${BUILD_NUMBER})..."
+echo "Building BigDaddy version ${VERSION} (Build ${BUILD_NUMBER}, arch=${ARCH})..."
 
 rm -rf "${BUILD_DIR}" "${DIST_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources" "${DIST_DIR}"
 
-# 同时编译 arm64 + x86_64，产出单个 universal 二进制，覆盖 Apple Silicon 和 Intel
-swift build --package-path "${ROOT_DIR}" -c release --arch arm64 --arch x86_64
-BIN_DIR=$(swift build --package-path "${ROOT_DIR}" -c release --arch arm64 --arch x86_64 --show-bin-path)
+swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}"
+BIN_DIR=$(swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}" --show-bin-path)
 
 cp "${BIN_DIR}/BigDaddy" "${APP_DIR}/Contents/MacOS/BigDaddy"
 cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
@@ -37,11 +63,11 @@ mkdir -p "${STAGING_DIR}"
 cp -R "${APP_DIR}" "${STAGING_DIR}/BigDaddy.app"
 ln -s /Applications "${STAGING_DIR}/Applications"
 
-DMG_PATH="${DIST_DIR}/BigDaddy-v${VERSION}.dmg"
+DMG_PATH="${DIST_DIR}/BigDaddy-v${VERSION}${DMG_SUFFIX}.dmg"
 
 hdiutil create \
   -srcfolder "${STAGING_DIR}" \
-  -volname "BigDaddy Installer" \
+  -volname "${VOLNAME}" \
   -fs HFS+ \
   -fsargs "-c c=64,a=16,e=16" \
   -format UDZO \
