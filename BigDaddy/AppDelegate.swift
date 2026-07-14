@@ -164,18 +164,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(.separator())
         } else {
             let statusItem = NSMenuItem(
-                title: Localization.string(zh: "状态: 未绑定", en: "Status: Unbound"),
+                title: Localization.string(zh: "⚠️ 状态: 尚未绑定家长账号 (未开启守护)", en: "⚠️ Status: Unbound (Guardianship Pending)"),
                 action: nil, keyEquivalent: ""
             )
             statusItem.isEnabled = false
             menu.addItem(statusItem)
 
+            let hintItem = NSMenuItem(
+                title: Localization.string(zh: "💡 未绑定时仅进行最基础登记，不采集行为明细", en: "💡 Unbound: Coarse registry only, no activity details logged"),
+                action: nil, keyEquivalent: ""
+            )
+            hintItem.isEnabled = false
+            menu.addItem(hintItem)
+
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "绑定此 Mac (扫码)", en: "Bind This Mac (QR)"),
+                title: Localization.string(zh: "⚡️ 绑定此 Mac (生成二维码)", en: "⚡️ Bind This Mac (Show QR Code)"),
                 action: #selector(showQr), keyEquivalent: "b"
             ))
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "输入家长绑定码", en: "Enter Parent Bind Code"),
+                title: Localization.string(zh: "🔑 输入家长 Dashboard 6位绑定码", en: "🔑 Enter Parent 6-Digit Bind Code"),
                 action: #selector(showBindCodeInput), keyEquivalent: ""
             ))
             menu.addItem(.separator())
