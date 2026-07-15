@@ -178,11 +178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(hintItem)
 
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "⚡️ 绑定此 Mac (生成二维码)", en: "⚡️ Bind This Mac (Show QR Code)"),
+                title: Localization.string(zh: "⚡️ 开始绑定：生成二维码给家长扫描", en: "⚡️ Start Binding (Show a QR Code for Your Parent to Scan)"),
                 action: #selector(showQr), keyEquivalent: "b"
             ))
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "🔑 输入家长 Dashboard 6位绑定码", en: "🔑 Enter Parent 6-Digit Bind Code"),
+                title: Localization.string(zh: "🔑 已有家长的绑定码？点此输入", en: "🔑 Have a Code From Your Parent? Enter It Here"),
                 action: #selector(showBindCodeInput), keyEquivalent: ""
             ))
             menu.addItem(.separator())
@@ -276,14 +276,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             let symbol: String
             let desc: String
             if capturing {
-                symbol = "camera.fill"; desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
+                symbol = "camera"; desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
             } else if missingPermission {
-                symbol = "exclamationmark.triangle.fill"
+                symbol = "exclamationmark.triangle"
                 desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限", en: "BigDaddy screenshots on but missing system permission")
             } else if on {
-                symbol = "eye.fill"; desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
+                symbol = "eye"; desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
             } else {
-                symbol = "shield.fill"; desc = "BigDaddy"
+                symbol = "shield"; desc = "BigDaddy"
             }
             if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: desc) {
                 image.isTemplate = true
@@ -444,7 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 )
                 
                 if #available(macOS 11.0, *) {
-                    if let image = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "BigDaddy") {
+                    if let image = NSImage(systemSymbolName: "shield", accessibilityDescription: "BigDaddy") {
                         image.isTemplate = true
                         alert.icon = image
                     }
@@ -453,7 +453,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 let accessory = self.createAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
                 alert.accessoryView = accessory
                 
-                alert.addButton(withTitle: Localization.string(zh: "复制绑定链接", en: "Copy Binding Link"))
+                alert.addButton(withTitle: Localization.string(zh: "复制绑定信息", en: "Copy Binding Info"))
                 alert.addButton(withTitle: Localization.string(zh: "关闭", en: "Close"))
                 
                 // 初始化倒计时
@@ -478,10 +478,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 self.countdownTimer = nil
                 
                 if response == .alertFirstButtonReturn {
+                    // 之前这里复制的是 bigdaddy:// 自定义协议链接，但项目里从未注册过这个协议的处理程序
+                    // （Info.plist 没有 CFBundleURLTypes，也没有 application(_:open:)），打开它没有任何反应。
+                    // 家长端从来只有网页仪表盘，也没有对应的接收方。改成直接复制人话说明 + 验证码。
                     let currentToken = self.digitLabels.map { $0.stringValue }.joined()
-                    let bindUrlString = "bigdaddy://bind?fingerprint=\(fingerprint)&token=\(currentToken)"
+                    let bindText = Localization.string(
+                        zh: "BigDaddy 绑定码：\(currentToken)（5 分钟内有效）。请把这条信息发给家长，家长在仪表盘输入验证码即可完成绑定。",
+                        en: "BigDaddy bind code: \(currentToken) (valid for 5 minutes). Send this to your parent — they can finish binding by entering the code on the parent dashboard."
+                    )
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(bindUrlString, forType: .string)
+                    NSPasteboard.general.setString(bindText, forType: .string)
+                    self.postLocalNotice(
+                        title: Localization.string(zh: "绑定信息已复制", en: "Binding info copied"),
+                        body: Localization.string(
+                            zh: "发送给家长，家长在仪表盘输入验证码即可完成绑定。",
+                            en: "Send it to your parent — they can finish binding by entering the code on the dashboard."
+                        )
+                    )
                 }
             }
         }
