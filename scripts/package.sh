@@ -48,8 +48,10 @@ BIN_DIR=$(swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}"
 cp "${BIN_DIR}/BigDaddy" "${APP_DIR}/Contents/MacOS/BigDaddy"
 cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
 
-# 临时向打包的 Info.plist 写入构建号，代码库中的源文件保持不变
+# 临时向打包的 Info.plist 写入构建号和生产 API 地址，代码库中的源文件保持不变
+# （源文件里的 localhost:8009 只用于本地 `swift run` 开发调试）
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "${APP_DIR}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :BigDaddyAPIBaseURL ${BIGDADDY_API_BASE_URL:-https://proxy-ko.bigdaddy.mom/api/v1}" "${APP_DIR}/Contents/Info.plist"
 
 if [[ "${CODESIGN_IDENTITY}" == "-" ]]; then
   codesign --force --sign "-" "${APP_DIR}"
