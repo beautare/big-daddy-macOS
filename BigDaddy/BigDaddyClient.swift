@@ -629,14 +629,23 @@ final class BigDaddyClient {
             "bindCode": code,
             "deviceFingerprint": identity.fingerprint
         ]
-        guard let data = try? await request(path: "/bigdaddy/client/bind-with-code", method: "POST", body: body, signed: false),
-              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<DeviceResponse>.self, from: data) else {
-            return false
+        let data = try await request(path: "/bigdaddy/client/bind-with-code", method: "POST", body: body, signed: false)
+        // 只按信封里的业务码判定成败，不解析完整 DeviceResponse——那些字段客户端用不到，
+        // 而它一旦解析失败会把已在后端提交成功的绑定误报成失败（传输错误由上面的 try 单独抛出）
+        guard let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data) else {
+            throw BigDaddyServerError(message: Localization.string(
+                zh: "服务器响应无法解析，请稍后在仪表盘确认绑定状态",
+                en: "Unable to parse server response. Please check binding status on the dashboard."
+            ))
         }
-        if response.code == 200 {
+        if envelope.code == 200 {
             AuditLog.record("DEVICE_BOUND 本设备已在设备端确认后与家长账户建立守护关系")
+            return true
         }
-        return response.code == 200
+        if !envelope.message.isEmpty {
+            throw BigDaddyServerError(message: envelope.message)
+        }
+        return false
     }
 
     private static var lockFileURL: URL {
@@ -852,6 +861,18 @@ struct ApiResponse<T: Codable>: Codable {
     let data: T
 }
 
+/// 只含业务码和消息的响应信封：错误响应的 data 为 null，无法按 ApiResponse<T> 解析
+struct ApiEnvelope: Codable {
+    let code: Int
+    let message: String
+}
+
+/// 携带后端 message 的业务错误，让弹窗能直接展示真实原因而不是笼统的"绑定码无效"
+struct BigDaddyServerError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 struct DeviceResponse: Codable {
     let deviceFingerprint: String
     let deviceName: String?
@@ -964,10 +985,44 @@ enum IOPlatformUUID {
 }
 
 extension JSONDecoder {
+    /// 后端 Jackson 序列化 LocalDateTime 输出 "2026-07-16T23:01:02.123456"——无时区、带小数秒，
+    /// 而 Foundation 的 .iso8601 策略要求带时区、不带小数秒，解析必然失败。曾导致 bind-with-code
+    /// 的成功响应（boundAt 非空）解析失败被吞掉，误报"绑定失败"。这里两类格式都接受。
     static var bigDaddy: JSONDecoder {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let raw = try container.decode(String.self)
+            if let date = BigDaddyDateParser.parse(raw) { return date }
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unrecognized date: \(raw)")
+        }
         return decoder
+    }
+}
+
+enum BigDaddyDateParser {
+    private static let iso8601Fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let iso8601 = ISO8601DateFormatter()
+    /// LocalDateTime 不携带时区，按本机时区解释
+    private static let localDateTime: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return formatter
+    }()
+
+    static func parse(_ raw: String) -> Date? {
+        if let date = iso8601Fractional.date(from: raw) ?? iso8601.date(from: raw) {
+            return date
+        }
+        // Jackson LocalDateTime 的小数秒位数不定（0–9 位），截掉后按秒级精度解析
+        let withoutFraction = raw.split(separator: ".").first.map(String.init) ?? raw
+        return localDateTime.date(from: withoutFraction)
     }
 }
 

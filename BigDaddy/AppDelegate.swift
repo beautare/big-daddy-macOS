@@ -483,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     // 家长端从来只有网页仪表盘，也没有对应的接收方。改成直接复制人话说明 + 验证码。
                     let currentToken = self.digitLabels.map { $0.stringValue }.joined()
                     let bindText = Localization.string(
-                        zh: "BigDaddy 绑定码：\(currentToken)（5 分钟内有效）。请把这条信息发给家长，家长在仪表盘输入验证码即可完成绑定。",
+                        zh: "BigDaddy 绑定码：\(currentToken)（5 分钟内有效）。请把这条信息发给家长，家长在仪表盘输入绑定码即可完成绑定。",
                         en: "BigDaddy bind code: \(currentToken) (valid for 5 minutes). Send this to your parent — they can finish binding by entering the code on the parent dashboard."
                     )
                     NSPasteboard.general.clearContents()
@@ -491,7 +491,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     self.postLocalNotice(
                         title: Localization.string(zh: "绑定信息已复制", en: "Binding info copied"),
                         body: Localization.string(
-                            zh: "发送给家长，家长在仪表盘输入验证码即可完成绑定。",
+                            zh: "发送给家长，家长在仪表盘输入绑定码即可完成绑定。",
                             en: "Send it to your parent — they can finish binding by entering the code on the dashboard."
                         )
                     )
