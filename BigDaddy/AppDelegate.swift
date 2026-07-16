@@ -202,7 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         ))
         menu.addItem(.separator())
 
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let version = AppVersion.current
         let versionItem = NSMenuItem(
             title: Localization.string(zh: "版本 \(version)", en: "Version \(version)"),
             action: nil, keyEquivalent: ""

@@ -23,6 +23,13 @@ struct DeviceIdentity {
     let secretHash: String
 }
 
+/// 应用版本的单一来源：正式 .app 读打包时由 CI/package.sh 写入的 CFBundleShortVersionString；
+/// 裸二进制（swift run / Xcode 直接运行）没有 Info.plist，统一返回 "dev"——
+/// 菜单栏和上报后端必须用同一个值，此前分别兜底成 "?" 和假版本号 "1.0.0"，造成三处版本各说各话。
+enum AppVersion {
+    static let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+}
+
 /// 通知渠道配置（后端转发截图，不存储图片）
 struct NotificationChannels: Codable, Equatable {
     var email: String?
@@ -130,7 +137,7 @@ final class BigDaddyClient {
         let body: [String: Any] = [
             "deviceFingerprint": identity.fingerprint,
             "deviceSecretHash": identity.secretHash,
-            "appVersion": Bundle.self.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0",
+            "appVersion": AppVersion.current,
             "hostname": Host.current().localizedName ?? "Mac",
             "osVersion": ProcessInfo.processInfo.operatingSystemVersionString
         ]
@@ -193,7 +200,7 @@ final class BigDaddyClient {
     /// 发送心跳。返回是否成功送达后端，供强杀/退出等需要"确认上报后才清理本地状态"的调用方判断。
     @discardableResult
     func sendHeartbeat(event: EventType) async -> Bool {
-        let version = Bundle.self.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+        let version = AppVersion.current
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let windowTitle = getActiveWindowTitle()
         let activeUrl = getActiveBrowserUrl(appName: activeApp)
