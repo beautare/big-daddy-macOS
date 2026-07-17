@@ -20,6 +20,8 @@
   <string>BigDaddy</string>
   <key>BigDaddyAPIBaseURL</key>
   <string>http://localhost:8009/api/v1</string>
+  <key>BigDaddyDashboardBaseURL</key>
+  <string>http://localhost:4000</string>
   <key>SUFeedURL</key>
   <string>https://beautare.github.io/big-daddy-macOS/appcast.xml</string>
   <key>SUPublicEDKey</key>

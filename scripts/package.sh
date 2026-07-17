@@ -58,6 +58,7 @@ cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAPIBaseURL ${BIGDADDY_API_BASE_URL:-https://proxy-ko.bigdaddy.mom/api/v1}" "${APP_DIR}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :BigDaddyDashboardBaseURL ${BIGDADDY_DASHBOARD_BASE_URL:-https://dashboard.bigdaddy.mom}" "${APP_DIR}/Contents/Info.plist"
 
 if [[ "${CODESIGN_IDENTITY}" == "-" ]]; then
   codesign --force --sign "-" "${APP_DIR}"

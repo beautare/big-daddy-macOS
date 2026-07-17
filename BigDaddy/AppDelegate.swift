@@ -11,9 +11,32 @@ enum Localization {
         }
         return false
     }
-    
+
     static func string(zh: String, en: String) -> String {
         return isChinese ? zh : en
+    }
+}
+
+/// modal 弹窗（NSAlert.runModal）期间主队列不排空，后台任务的结果不能用
+/// Task { @MainActor } / DispatchQueue.main 送回界面；改为写入这个带锁的信箱，
+/// 由 selector 计时器的 tick（modal 期间照常触发）在主线程取走并应用。
+/// 必须放在 AppDelegate 外部：嵌套类型会继承 @MainActor 隔离，后台任务就没法写入了。
+final class BindTokenMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    func put(_ token: String) {
+        lock.lock()
+        value = token
+        lock.unlock()
+    }
+
+    func take() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = value
+        value = nil
+        return taken
     }
 }
 
@@ -30,7 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var countdownSeconds = 300
     private var digitLabels: [NSTextField] = []
     private var countdownLabel: NSTextField?
-    private var qrImageView: NSImageView?
+    /// 绑定码到期后的静默刷新是否正在进行，防止倒计时 tick 在网络慢时重复发起
+    private var bindTokenRefreshing = false
+    /// 刷新结果信箱：后台任务写入、倒计时 tick 在主线程取走（见 bindCountdownTick）
+    private let bindTokenMailbox = BindTokenMailbox()
     private var exitDigitFields: [NSTextField] = []
     private var exitCountdownLabel: NSTextField?
     /// 必须持有引用，否则 DispatchSourceSignal 会被提前释放、信号监听失效
@@ -211,8 +237,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(hintItem)
 
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "⚡️ 开始绑定：生成二维码给家长扫描", en: "⚡️ Start Binding (Show a QR Code for Your Parent to Scan)"),
-                action: #selector(showQr), keyEquivalent: "b"
+                title: Localization.string(zh: "⚡️ 开始绑定：显示本机绑定码", en: "⚡️ Start Binding: Show This Mac's Bind Code"),
+                action: #selector(showDeviceBindCode), keyEquivalent: "b"
             ))
             menu.addItem(NSMenuItem(
                 title: Localization.string(zh: "🔑 已有家长的绑定码？点此输入", en: "🔑 Have a Code From Your Parent? Enter It Here"),
@@ -429,14 +455,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 近实时拉取配置：一旦家长开启或撤销截图，立即更新常驻指示并通知孩子端。
     private func pollConfigForChildVisibility() async {
+        let boundBefore = client.config.bound
+        let invalidBefore = client.credentialsInvalid
         let before = client.config.screenshotEnabled
-        let changed = await client.refreshConfig()
-        guard changed else { return }
+        // 凭据失效时签名通道全断，config 轮询收不到任何信号（包括解绑）。register 不签名：
+        // 家长解绑后，后端会重新接受本机 secret（未绑定设备允许换钥），凭据在这里自动恢复，
+        // 随后回到常规配置轮询——不需要重启客户端。
+        if client.credentialsInvalid {
+            await client.register()
+        }
+        var changed = false
+        if !client.credentialsInvalid {
+            changed = await client.refreshConfig()
+        }
+        let boundChanged = client.config.bound != boundBefore
+        let credentialsChanged = client.credentialsInvalid != invalidBefore
+        guard changed || boundChanged || credentialsChanged else { return }
         let after = client.config.screenshotEnabled
         await MainActor.run {
             rebuildMenu()
             updateStatusItemAppearance()
             triggerImmediateCommandPollIfNeeded()
+            if boundChanged {
+                // 心跳/命令轮询的节奏依赖 bound，翻转后立即切换调度
+                scheduleTimers()
+            }
+            if boundChanged && !client.config.bound {
+                AuditLog.record("DEVICE_UNBOUND 家长已在仪表盘解除本设备的守护关系")
+                postLocalNotice(
+                    title: Localization.string(zh: "守护关系已解除", en: "Guardian binding removed"),
+                    body: Localization.string(
+                        zh: "家长已在仪表盘解绑本设备，守护采集已停止。可随时重新绑定。",
+                        en: "Your parent unbound this Mac on the dashboard; guardian reporting has stopped. You can re-bind at any time."
+                    )
+                )
+            }
             if after != before {
                 AuditLog.record("SCREENSHOT_TOGGLE state=\(after ? "ENABLED" : "DISABLED") source=remote")
                 postLocalNotice(
@@ -461,9 +514,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    @objc private func showQr() {
+    /// 客户端没有独立的 .icns，NSAlert 默认回落到系统通用可执行文件图标，观感像
+    /// "来路不明的程序"。绑定相关的关键弹窗统一用盾牌图标。
+    private func applyShieldIcon(to alert: NSAlert) {
+        if #available(macOS 11.0, *) {
+            if let image = NSImage(systemSymbolName: "shield", accessibilityDescription: "BigDaddy") {
+                image.isTemplate = true
+                alert.icon = image
+            }
+        }
+    }
+
+    @objc private func showDeviceBindCode() {
         guard checkAndRequestPermissions() else { return }
-        
+
         Task {
             await client.register()
             await MainActor.run {
@@ -472,52 +536,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 let alert = NSAlert()
                 alert.messageText = Localization.string(zh: "设备绑定验证", en: "Device Binding Verification")
                 alert.informativeText = Localization.string(
-                    zh: "请在家长端仪表盘输入下方的 6 位动态验证码，或者复制链接进行绑定。",
-                    en: "Please enter the 6-digit dynamic verification code below on the parent dashboard, or copy the link to bind."
+                    zh: "请家长登录仪表盘，输入下方的 6 位绑定码完成绑定。家长就在旁边时，可点击「在本机打开仪表盘」直接在这台电脑上操作。",
+                    en: "Ask your parent to sign in to the dashboard and enter the 6-digit bind code below. If your parent is nearby, click \"Open Dashboard on This Mac\" to finish binding right here."
                 )
-                
-                if #available(macOS 11.0, *) {
-                    if let image = NSImage(systemSymbolName: "shield", accessibilityDescription: "BigDaddy") {
-                        image.isTemplate = true
-                        alert.icon = image
-                    }
-                }
-                
-                let accessory = self.createAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
+                self.applyShieldIcon(to: alert)
+
+                let accessory = self.createBindCodeAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
                 alert.accessoryView = accessory
-                
+
+                alert.addButton(withTitle: Localization.string(zh: "在本机打开仪表盘", en: "Open Dashboard on This Mac"))
                 alert.addButton(withTitle: Localization.string(zh: "复制绑定信息", en: "Copy Binding Info"))
                 alert.addButton(withTitle: Localization.string(zh: "关闭", en: "Close"))
-                
+
                 // 初始化倒计时
                 self.countdownSeconds = 300
+                self.bindTokenRefreshing = false
                 self.updateCountdownLabelText()
-                
-                // 启动倒计时 Timer，使用 .common 模式
+
+                // runModal() 期间主运行循环跑在 modal panel 模式，GCD 主队列不排空，
+                // 之前 Timer(block:) 里再包一层 Task { @MainActor } 的写法在弹窗打开时
+                // 永远不会执行（表现为倒计时文本冻结在 05:00）。改用 selector 形式的
+                // Timer：由运行循环直接在主线程回调，配合 .common 模式（包含 modal
+                // panel 模式）在弹窗打开期间照常触发。
                 self.countdownTimer?.invalidate()
-                let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-                    Task { @MainActor [weak self] in
-                        self?.tickCountdown()
-                    }
-                }
+                let timer = Timer(
+                    timeInterval: 1.0, target: self, selector: #selector(self.bindCountdownTick),
+                    userInfo: nil, repeats: true
+                )
                 RunLoop.main.add(timer, forMode: .common)
                 self.countdownTimer = timer
-                
+
                 // 运行 Alert Modal
                 let response = alert.runModal()
-                
+
                 // Modal 结束，销毁计时器
                 self.countdownTimer?.invalidate()
                 self.countdownTimer = nil
-                
+
                 if response == .alertFirstButtonReturn {
-                    // 之前这里复制的是 bigdaddy:// 自定义协议链接，但项目里从未注册过这个协议的处理程序
-                    // （Info.plist 没有 CFBundleURLTypes，也没有 application(_:open:)），打开它没有任何反应。
-                    // 家长端从来只有网页仪表盘，也没有对应的接收方。改成直接复制人话说明 + 验证码。
+                    // 在本机默认浏览器打开 dashboard 绑定页（带指纹与当前绑定码，页面
+                    // 自动预填），家长在孩子电脑上登录确认即可，不需要两台电脑来回跑。
+                    NSWorkspace.shared.open(self.client.dashboardBindURL())
+                } else if response == .alertSecondButtonReturn {
                     let currentToken = self.digitLabels.map { $0.stringValue }.joined()
+                    let bindPage = self.client.dashboardBaseURL.appendingPathComponent("bind").absoluteString
                     let bindText = Localization.string(
-                        zh: "BigDaddy 绑定码：\(currentToken)（5 分钟内有效）。请把这条信息发给家长，家长在仪表盘输入绑定码即可完成绑定。",
-                        en: "BigDaddy bind code: \(currentToken) (valid for 5 minutes). Send this to your parent — they can finish binding by entering the code on the parent dashboard."
+                        zh: "BigDaddy 绑定码：\(currentToken)（5 分钟内有效）。请把这条信息发给家长：打开 \(bindPage) 输入绑定码即可完成绑定。",
+                        en: "BigDaddy bind code: \(currentToken) (valid for 5 minutes). Send this to your parent — open \(bindPage) and enter the code to finish binding."
                     )
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(bindText, forType: .string)
@@ -533,61 +598,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    private func createAccessoryView(fingerprint: String, initialToken: String) -> NSView {
-        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 380))
-        
+    private func createBindCodeAccessoryView(fingerprint: String, initialToken: String) -> NSView {
+        // NSAlert 按 accessoryView 的 frame 预留空间，外层必须是带明确 frame 的普通 NSView
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 100))
+
         let container = NSStackView()
         container.orientation = .vertical
         container.spacing = 10
         container.alignment = .centerX
         container.translatesAutoresizingMaskIntoConstraints = false
-        
+
         parentView.addSubview(container)
-        
+
         NSLayoutConstraint.activate([
             container.topAnchor.constraint(equalTo: parentView.topAnchor),
             container.bottomAnchor.constraint(equalTo: parentView.bottomAnchor),
             container.leadingAnchor.constraint(equalTo: parentView.leadingAnchor),
             container.trailingAnchor.constraint(equalTo: parentView.trailingAnchor)
         ])
-        
-        // 1. 展示二维码 (方式A)
-        let qrView = NSImageView()
-        qrView.image = client.generateBindQRCode()
-        qrView.imageScaling = .scaleProportionallyUpOrDown
-        qrView.translatesAutoresizingMaskIntoConstraints = false
-        qrView.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        qrView.heightAnchor.constraint(equalToConstant: 180).isActive = true
-        self.qrImageView = qrView
-        
-        let qrDescLabel = NSTextField()
-        qrDescLabel.isEditable = false
-        qrDescLabel.isSelectable = false
-        qrDescLabel.isBordered = false
-        qrDescLabel.drawsBackground = false
-        qrDescLabel.alignment = .center
-        qrDescLabel.font = NSFont.systemFont(ofSize: 11)
-        qrDescLabel.textColor = NSColor.secondaryLabelColor
-        qrDescLabel.stringValue = Localization.string(
-            zh: "家长扫描上述二维码完成绑定",
-            en: "Parent: scan the QR code above to bind"
-        )
-        
-        // 分割说明：或动态输入验证码
-        let codeDescLabel = NSTextField()
-        codeDescLabel.isEditable = false
-        codeDescLabel.isSelectable = false
-        codeDescLabel.isBordered = false
-        codeDescLabel.drawsBackground = false
-        codeDescLabel.alignment = .center
-        codeDescLabel.font = NSFont.boldSystemFont(ofSize: 11)
-        codeDescLabel.textColor = NSColor.labelColor
-        codeDescLabel.stringValue = Localization.string(
-            zh: "或在家长端输入 6 位验证码",
-            en: "Or enter the 6-digit code on the parent dashboard"
-        )
-        
-        // 2. 水平数字框的 StackView
+
+        // 1. 水平数字框的 StackView
         let digitsStack = NSStackView()
         digitsStack.orientation = .horizontal
         digitsStack.spacing = 8
@@ -635,7 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self.digitLabels.append(label)
         }
         
-        // 3. 倒计时文本框
+        // 2. 倒计时文本框
         let countdownField = NSTextField()
         countdownField.isEditable = false
         countdownField.isSelectable = false
@@ -645,8 +675,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         countdownField.font = NSFont.systemFont(ofSize: 11)
         countdownField.textColor = NSColor.secondaryLabelColor
         self.countdownLabel = countdownField
-        
-        // 4. 设备识别码文本框
+
+        // 3. 设备识别码文本框
         let displayId: String
         if fingerprint.count > 12 {
             let head = fingerprint.prefix(6)
@@ -669,35 +699,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             en: "Device ID: \(displayId)"
         )
         
-        container.addArrangedSubview(qrView)
-        container.addArrangedSubview(qrDescLabel)
-        container.addArrangedSubview(codeDescLabel)
         container.addArrangedSubview(digitsStack)
         container.addArrangedSubview(countdownField)
         container.addArrangedSubview(deviceIdField)
-        
+
         return parentView
     }
 
-    private func tickCountdown() {
+    /// 绑定弹窗的每秒 tick（selector 形式，modal 期间照常触发，见 showDeviceBindCode 注释）。
+    /// 归零后静默获取新绑定码并复位倒计时。
+    @objc private func bindCountdownTick() {
+        // 先取刷新结果信箱：后台网络任务把新绑定码放进来，由 tick 在主线程应用到界面
+        if let refreshed = bindTokenMailbox.take() {
+            bindTokenRefreshing = false
+            countdownSeconds = 300
+            updateDigitBoxes(with: refreshed)
+            updateCountdownLabelText()
+            return
+        }
         if countdownSeconds > 0 {
             countdownSeconds -= 1
             updateCountdownLabelText()
-        } else {
-            // 倒计时归零，静默获取新验证码
-            Task {
-                await refreshBindToken()
-            }
+            return
         }
-    }
-
-    private func refreshBindToken() async {
-        await client.register()
-        let token = client.bindToken ?? "000000"
-        await MainActor.run {
-            self.countdownSeconds = 300
-            self.updateDigitBoxes(with: token)
-            self.updateCountdownLabelText()
+        guard !bindTokenRefreshing else { return }
+        bindTokenRefreshing = true
+        countdownLabel?.stringValue = Localization.string(zh: "正在获取新的绑定码…", en: "Fetching a new bind code…")
+        // 主队列在 modal 期间不排空，网络结果不能用 Task { @MainActor } / DispatchQueue.main
+        // 送回界面。detached 任务只负责拿新码并写入信箱，应用到 UI 由下一次 tick 完成。
+        let mailbox = bindTokenMailbox
+        Task.detached { [client = self.client] in
+            await client.register()
+            mailbox.put(client.bindToken ?? "000000")
         }
     }
 
@@ -707,7 +740,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         for i in 0..<min(chars.count, digitLabels.count) {
             digitLabels[i].stringValue = String(chars[i])
         }
-        qrImageView?.image = client.generateBindQRCode()
     }
 
     @objc private func showBindCodeInput() {
@@ -724,7 +756,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             zh: "请在家长仪表盘获取 6 位绑定码",
             en: "Get the 6-digit bind code from the dashboard"
         )
-        
+        applyShieldIcon(to: alert)
+
+
         let inputField = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 28))
         inputField.placeholderString = "000000"
         inputField.alignment = .center
@@ -782,8 +816,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let seconds = countdownSeconds % 60
         let timeString = String(format: "%02d:%02d", minutes, seconds)
         countdownLabel?.stringValue = Localization.string(
-            zh: "验证码将在 \(timeString) 后自动更新",
-            en: "Verification code will auto-update in \(timeString)"
+            zh: "绑定码将在 \(timeString) 后自动更新",
+            en: "Bind code auto-updates in \(timeString)"
         )
     }
 
@@ -876,14 +910,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 初始化倒计时
         self.countdownSeconds = 300
         self.updateExitCountdownLabelText()
-        
-        // 启动倒计时 Timer
+
+        // 启动倒计时 Timer。必须用 selector 形式：runModal() 期间主队列不排空，
+        // Timer(block:) + Task { @MainActor } 的组合在弹窗打开时不会执行（详见
+        // showDeviceBindCode 里的说明），倒计时会一直冻结在 05:00。
         self.countdownTimer?.invalidate()
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.tickExitCountdown()
-            }
-        }
+        let timer = Timer(
+            timeInterval: 1.0, target: self, selector: #selector(exitCountdownTick),
+            userInfo: nil, repeats: true
+        )
         RunLoop.main.add(timer, forMode: .common)
         self.countdownTimer = timer
         
@@ -927,12 +962,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     private func createExitAccessoryView() -> NSView {
+        // NSAlert 按 accessoryView 的 frame 预留空间。之前直接返回一个零 frame、
+        // 纯 Auto Layout 的 NSStackView，弹窗按错误的高度排版，验证码输入框被
+        // 正文/按钮遮住一部分。与其他弹窗一致：外层用带明确 frame 的 NSView 撑开。
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 88))
+
         let container = NSStackView()
         container.orientation = .vertical
         container.spacing = 16
         container.alignment = .centerX
         container.wantsLayer = true
-        
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        parentView.addSubview(container)
+
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: parentView.topAnchor),
+            container.bottomAnchor.constraint(equalTo: parentView.bottomAnchor),
+            container.leadingAnchor.constraint(equalTo: parentView.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: parentView.trailingAnchor)
+        ])
+
+
         let digitsStack = NSStackView()
         digitsStack.orientation = .horizontal
         digitsStack.spacing = 8
@@ -989,14 +1040,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         
         container.addArrangedSubview(digitsStack)
         container.addArrangedSubview(countdownField)
-        
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.widthAnchor.constraint(equalToConstant: 320).isActive = true
-        
-        return container
+
+        return parentView
     }
 
-    private func tickExitCountdown() {
+    /// 退出弹窗的每秒 tick（selector 形式，modal 期间照常触发）
+    @objc private func exitCountdownTick() {
         if countdownSeconds > 0 {
             countdownSeconds -= 1
             updateExitCountdownLabelText()

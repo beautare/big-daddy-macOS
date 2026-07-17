@@ -1,6 +1,5 @@
 import AppKit
 import ApplicationServices
-import CoreImage
 import CryptoKit
 import Darwin
 import Foundation
@@ -84,6 +83,9 @@ final class BigDaddyClient {
     static var lastSharedInstance: BigDaddyClient?
 
     let baseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")!
+    /// 家长仪表盘地址：正式 .app 由打包脚本写入 Info.plist（BigDaddyDashboardBaseURL），
+    /// 裸二进制（swift run / Xcode 直接运行）退回本地 dashboard 开发端口。
+    let dashboardBaseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyDashboardBaseURL") as? String ?? "http://localhost:4000")!
     let identity: DeviceIdentity
     var config: ClientConfig
     var lastHeartbeatDescription = "not sent"
@@ -147,9 +149,20 @@ final class BigDaddyClient {
         if let data = try? await request(path: "/bigdaddy/client/register", method: "POST", body: body, signed: false),
            let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<DeviceResponse>.self, from: data) {
             self.bindToken = response.data.bindToken
+            let wasInvalid = self.credentialsInvalid
             self.credentialsInvalid = response.data.credentialsValid == false
-            if self.credentialsInvalid {
+            if self.credentialsInvalid && !wasInvalid {
                 NSLog("BigDaddy: device secret rejected by backend (device is bound); signed requests will fail until re-bind")
+            }
+            // register 不走设备签名，是验签通道失效时唯一可靠的绑定状态来源。只向
+            // "未绑定"方向修正：后端说已解绑就立即翻转本地状态（旧后端无 bound 字段时
+            // 退回用 boundAt 判断）；反向的"已绑定"要携带完整守护策略，交给签名的
+            // refreshConfig 拉取权威配置，这里不能凭空置 true。
+            let remoteBound = response.data.bound ?? (response.data.boundAt != nil)
+            if config.bound && !remoteBound {
+                config.bound = false
+                config.hasPendingCommand = false
+                ConfigStore.save(config)
             }
         }
     }
@@ -616,19 +629,17 @@ final class BigDaddyClient {
         return data
     }
 
-    func generateBindQRCode() -> NSImage? {
-        let content = "bigdaddy://bind?fingerprint=\(identity.fingerprint)&token=\(bindToken ?? "")"
-        guard let data = content.data(using: .utf8) else { return nil }
-        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
-        filter.setValue(data, forKey: "inputMessage")
-        filter.setValue("H", forKey: "inputCorrectionLevel")
-        guard let ciImage = filter.outputImage else { return nil }
-        let scale = CGAffineTransform(scaleX: 10, y: 10)
-        let scaledImage = ciImage.transformed(by: scale)
-        let rep = NSCIImageRep(ciImage: scaledImage)
-        let image = NSImage(size: rep.size)
-        image.addRepresentation(rep)
-        return image
+    /// 本机浏览器直达的 dashboard 绑定页：带上指纹与当前绑定码，/bind 页会自动预填，
+    /// 家长在孩子电脑上登录后直接确认即可，不需要在两台电脑之间来回跑。
+    func dashboardBindURL() -> URL {
+        var components = URLComponents(
+            url: dashboardBaseURL.appendingPathComponent("bind"), resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "fingerprint", value: identity.fingerprint),
+            URLQueryItem(name: "token", value: bindToken ?? "")
+        ]
+        return components.url ?? dashboardBaseURL
     }
 
     func bindWithCode(_ code: String) async throws -> Bool {
@@ -891,6 +902,7 @@ struct DeviceResponse: Codable {
     let boundAt: Date?
     let bindToken: String?
     let credentialsValid: Bool?
+    let bound: Bool?
 }
 
 struct Command: Codable {
