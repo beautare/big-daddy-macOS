@@ -63,6 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var signalSources: [DispatchSourceSignal] = []
     /// 凭据失效弹窗每次运行只弹一次（register 会在扫码绑定等多处重复调用），菜单警示项常驻
     private var credentialsAlertShown = false
+    /// 菜单打开触发的绑定状态同步做节流，避免频繁点开图标时打网络风暴
+    private var lastBindingSyncAt: Date = .distantPast
+    /// 绑定检测快轮询任务（展示绑定码/二维码后启动的一段高频探测），持有引用以便取消
+    private var bindDetectionTask: Task<Void, Never>?
     // 菜单里需要"打开前动态刷新"的只读展示项（心跳状态/下次截屏倒计时/当前配置摘要）
     private var heartbeatStatusMenuItem: NSMenuItem?
     private var nextScreenshotMenuItem: NSMenuItem?
@@ -319,9 +323,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    /// 用户点开菜单栏图标的那一刻，把心跳状态/倒计时/配置摘要刷新成最新值。
+    /// 用户点开菜单栏图标的那一刻，把心跳状态/倒计时/配置摘要刷新成最新值，
+    /// 并静默同步一次绑定状态——这是弥补"绑定/解绑在服务端完成、客户端需等下一轮
+    /// 60s 配置轮询才感知"的滞后的主要机制。节流到 5 秒，避免频繁点开时的网络风暴；
+    /// 不加"正在检查"占位项，本地同步在一秒内完成，状态变化后就地重建菜单即可。
     func menuWillOpen(_ menu: NSMenu) {
         refreshDynamicMenuItems()
+        syncBindingStateIfStale()
+    }
+
+    private func syncBindingStateIfStale() {
+        guard Date().timeIntervalSince(lastBindingSyncAt) > 5 else { return }
+        lastBindingSyncAt = Date()
+        // pollConfigForChildVisibility 已包含凭据失效兜底、解绑通知、bound 翻转后重排定时器，
+        // 复用它即可，菜单会在其内部的 rebuildMenu 中就地更新。
+        Task { [weak self] in await self?.pollConfigForChildVisibility() }
+    }
+
+    /// 展示绑定码/二维码后启动的一段高频探测：绑定在服务端完成（家长在仪表盘或本机输码），
+    /// 用它把"绑定成功"的反馈从最长 60s 压到约 3s。轮询用普通 async（弹窗已关闭，运行循环
+    /// 正常），检测到 bound=true 立即刷新配置、重建菜单并弹成功提示；最多探测 2 分钟。
+    private func startBindDetectionBurst() {
+        guard !client.config.bound else { return }
+        bindDetectionTask?.cancel()
+        bindDetectionTask = Task { [weak self] in
+            for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if self.client.credentialsInvalid {
+                    await self.client.register()
+                }
+                let changed = self.client.credentialsInvalid ? false : await self.client.refreshConfig()
+                if self.client.config.bound {
+                    await MainActor.run {
+                        self.scheduleTimers()
+                        self.rebuildMenu()
+                        self.updateStatusItemAppearance()
+                        self.postLocalNotice(
+                            title: Localization.string(zh: "绑定成功", en: "Binding successful"),
+                            body: Localization.string(
+                                zh: "本设备已与家长账户建立守护关系。",
+                                en: "This Mac is now linked to the parent account."
+                            )
+                        )
+                    }
+                    return
+                }
+                if changed {
+                    await MainActor.run { self.rebuildMenu() }
+                }
+            }
+        }
     }
 
     /// 让菜单栏图标反映当前"截图是否开启 / 是否正在截图 / 权限是否缺失"，作为孩子端常驻可见指示。
@@ -594,6 +646,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                         )
                     )
                 }
+                // 弹窗关闭、绑定码已就绪：无论家长在本机还是别处输码，都启动快检测，
+                // 让"绑定成功"近实时反馈（"关闭"按钮也启动，家长可能仍会去输码）
+                self.startBindDetectionBurst()
             }
         }
     }

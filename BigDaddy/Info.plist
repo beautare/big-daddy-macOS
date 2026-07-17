@@ -18,6 +18,8 @@
   <true/>
   <key>NSHumanReadableCopyright</key>
   <string>BigDaddy</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>BigDaddy 需要读取浏览器当前标签页地址，用于向家长如实展示访问记录。</string>
   <key>BigDaddyAPIBaseURL</key>
   <string>http://localhost:8009/api/v1</string>
   <key>BigDaddyDashboardBaseURL</key>

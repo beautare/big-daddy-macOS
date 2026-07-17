@@ -192,30 +192,8 @@ final class BigDaddyClient {
     /// 记录最近一次截图时间，随心跟上报
     private var lastScreenshotAt: Date?
 
-    /// 简单的客户端侧应用分类，口径与后端 AI 日报调度器的确定性分类保持一致
-    /// （LEARNING/CREATIVE/COMMUNICATION/ENTERTAINMENT/GAME/BROWSER/UNKNOWN）。
-    private func classifyAppType(appName: String) -> String {
-        let lower = appName.lowercased()
-        if lower.contains("chrome") || lower.contains("safari") || lower.contains("firefox") || lower.contains("edge") {
-            return "BROWSER"
-        }
-        if lower.contains("steam") || lower.contains("epic") || lower.contains("battle.net") {
-            return "GAME"
-        }
-        if lower.contains("code") || lower.contains("xcode") || lower.contains("terminal") || lower.contains("pages") || lower.contains("keynote") || lower.contains("numbers") {
-            return "LEARNING"
-        }
-        if lower.contains("photoshop") || lower.contains("procreate") || lower.contains("figma") || lower.contains("sketch") {
-            return "CREATIVE"
-        }
-        if lower.contains("discord") || lower.contains("slack") || lower.contains("wechat") || lower.contains("messages") || lower.contains("mail") {
-            return "COMMUNICATION"
-        }
-        if lower.contains("music") || lower.contains("tv") || lower.contains("netflix") || lower.contains("spotify") {
-            return "ENTERTAINMENT"
-        }
-        return appName.isEmpty ? "UNKNOWN" : "UNKNOWN"
-    }
+    // 客户端不再计算 appType：后端 AI 日报按 activeAppName 用自己更全的词表重新分类
+    // （见 BigDaddyService.classifyAppCategory），客户端这份既没人消费、词表又窄，已移除。
 
     /// 发送心跳。返回是否成功送达后端，供强杀/退出等需要"确认上报后才清理本地状态"的调用方判断。
     @discardableResult
@@ -231,7 +209,6 @@ final class BigDaddyClient {
             "lastHeartbeatAt": ISO8601DateFormatter().string(from: Date()),
             "activeAppName": activeApp,
             "activeWindowTitle": windowTitle,
-            "appType": classifyAppType(appName: activeApp),
             "activeUrl": activeUrl,
             "previousCrashAt": previousCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
@@ -382,11 +359,34 @@ final class BigDaddyClient {
         return averageDiff < 8.0
     }
 
+    // Chromium 系浏览器共用同一套 AppleScript 方言（active tab of first window），
+    // 按应用名匹配即可复用；Safari 用 current tab；Firefox 无 AppleScript URL 接口，返回空
+    // 由窗口标题兜底。注意：AppleScript 自动化是按目标应用逐个授权的 TCC 权限，且需要
+    // Info.plist 里的 NSAppleEventsUsageDescription 才能弹出授权（打包版），否则静默失败。
+    //
+    // 顺序很重要：用 contains 做子串匹配时必须"长的排前面"，否则 "Google Chrome" 会
+    // 抢先命中 "Google Chrome Canary"，导致对错误的应用发 AppleScript。
+    private static let chromiumBrowserNames = [
+        "Google Chrome Canary", "Google Chrome", "Chromium",
+        "Microsoft Edge", "Brave Browser", "Vivaldi", "Opera"
+    ]
+
     func getActiveBrowserUrl(appName: String) -> String {
         var scriptString = ""
-        if appName.contains("Google Chrome") || appName.contains("Chrome") {
+        if let chromium = BigDaddyClient.chromiumBrowserNames.first(where: { appName.contains($0) }) {
             scriptString = """
-            tell application "Google Chrome"
+            tell application "\(chromium)"
+                if (count of windows) > 0 then
+                    return URL of active tab of first window
+                end if
+            end tell
+            return ""
+            """
+        } else if appName == "Arc" {
+            // "Arc" 是常见英文词/前缀（"Archive Utility""Arcade"等系统应用都包含它），
+            // 子串匹配风险过高，单独用精确相等判断，不并入上面的 contains 名单。
+            scriptString = """
+            tell application "Arc"
                 if (count of windows) > 0 then
                     return URL of active tab of first window
                 end if
@@ -403,9 +403,10 @@ final class BigDaddyClient {
             return ""
             """
         } else {
+            // Firefox 等无脚本接口的浏览器：拿不到 URL，交由窗口标题反映页面
             return ""
         }
-        
+
         if let script = NSAppleScript(source: scriptString) {
             var error: NSDictionary?
             let result = script.executeAndReturnError(&error)
@@ -419,18 +420,37 @@ final class BigDaddyClient {
     func getActiveWindowTitle() -> String {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return "" }
         let pid = frontApp.processIdentifier
+        // 首选 CGWindowList 的 kCGWindowName：但该字段自 macOS 10.15 起仅对持有
+        // 屏幕录制权限的进程返回，未授权时恒为空——此时回落到 Accessibility API。
         let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
-        guard let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return "" }
-        for info in windowListInfo {
-            if let windowOwnerPID = info[kCGWindowOwnerPID as String] as? Int, windowOwnerPID == pid {
-                if let layer = info[kCGWindowLayer as String] as? Int, layer == 0 {
-                    if let title = info[kCGWindowName as String] as? String {
-                        return title
-                    }
+        if let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
+            for info in windowListInfo {
+                if let windowOwnerPID = info[kCGWindowOwnerPID as String] as? Int, windowOwnerPID == pid,
+                   let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
+                   let title = info[kCGWindowName as String] as? String, !title.isEmpty {
+                    return title
                 }
             }
         }
-        return ""
+        return accessibilityWindowTitle(pid: pid)
+    }
+
+    /// Accessibility 兜底：读焦点窗口的 AXTitle。需要辅助功能授权（同样受 dev 构建
+    /// 签名不稳定影响），但在已授权时能在屏幕录制权限缺失的情况下仍拿到标题。
+    private func accessibilityWindowTitle(pid: pid_t) -> String {
+        guard AXIsProcessTrusted() else { return "" }
+        let appElement = AXUIElementCreateApplication(pid)
+        var focusedWindow: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &focusedWindow) == .success,
+              let window = focusedWindow, CFGetTypeID(window) == AXUIElementGetTypeID() else { return "" }
+        // 按 API 契约这里恒为 AXUIElement，但这是无人值守的后台进程，每次心跳都会
+        // 走到这里——用 guard + 运行时类型校验而非强制转换，任何异常都优雅返回空，
+        // 不能因为一次意外的返回类型让整个客户端崩溃。
+        let axWindow = window as! AXUIElement
+        var titleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &titleValue) == .success,
+              let title = titleValue as? String else { return "" }
+        return title
     }
 
     func uploadScreenshot(imageData: Data, activeApp: String, windowTitle: String, activeUrl: String) async throws -> Data {
