@@ -88,6 +88,9 @@ final class BigDaddyClient {
     var config: ClientConfig
     var lastHeartbeatDescription = "not sent"
     var bindToken: String?
+    /// register 响应报告本机 secret 与后端存档不一致（设备已绑定、后端拒绝换钥）。
+    /// 此状态下所有签名接口都会验签失败，必须在 UI 上明确警示，引导解绑后重新绑定。
+    var credentialsInvalid = false
     private var previousCrashAt: Date?
 
     init() {
@@ -144,6 +147,10 @@ final class BigDaddyClient {
         if let data = try? await request(path: "/bigdaddy/client/register", method: "POST", body: body, signed: false),
            let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<DeviceResponse>.self, from: data) {
             self.bindToken = response.data.bindToken
+            self.credentialsInvalid = response.data.credentialsValid == false
+            if self.credentialsInvalid {
+                NSLog("BigDaddy: device secret rejected by backend (device is bound); signed requests will fail until re-bind")
+            }
         }
     }
 
@@ -883,6 +890,7 @@ struct DeviceResponse: Codable {
     let lastScreenshotAt: Date?
     let boundAt: Date?
     let bindToken: String?
+    let credentialsValid: Bool?
 }
 
 struct Command: Codable {
@@ -906,12 +914,28 @@ struct ScreenshotUploadResponse: Codable {
 enum IdentityStore {
     static func load() -> DeviceIdentity {
         print("BigDaddy: IdentityStore.load started")
+        #if DEBUG
+        // 开发构建每次 swift build / Xcode 运行的代码签名都不同，读不到上一个构建创建的
+        // Keychain 条目，会静默重造 secret；设备一旦绑定，重造即永久验签失败（后端拒绝
+        // 已绑定设备换钥）。DEBUG 构建改用 Application Support 下 0600 权限的文件持久化，
+        // 跨构建稳定；正式签名的 Release 构建仍走 Keychain，不受影响。
+        let fromFile = fileSecret()
+        let secret = fromFile ?? keychainValue(key: "deviceSecret") ?? generateSecret()
+        if fromFile == nil {
+            saveFileSecret(secret)
+        }
+        print("BigDaddy: debug file deviceSecret ready")
+        #else
         // 已存在的旧设备沿用 Keychain 里保存过的旧格式 secret（无论格式如何都继续可用，
         // 不做强制迁移）；只有全新安装/全新生成指纹时才会调用 generateSecret()。
-        let secret = keychainValue(key: "deviceSecret") ?? generateSecret()
-        print("BigDaddy: keychain deviceSecret loaded")
-        setKeychainValue(secret, key: "deviceSecret")
-        print("BigDaddy: keychain deviceSecret saved")
+        // 仅在新生成时写入：先删后加会把条目所有权反复转移给当前二进制，读到了就不该动它。
+        let stored = keychainValue(key: "deviceSecret")
+        let secret = stored ?? generateSecret()
+        if stored == nil {
+            setKeychainValue(secret, key: "deviceSecret")
+        }
+        print("BigDaddy: keychain deviceSecret ready")
+        #endif
         let platform = IOPlatformUUID.read() ?? Host.current().localizedName ?? "BigDaddyMac"
         print("BigDaddy: platform UUID read complete")
         let fingerprint = SHA256.hash(data: platform.data(using: .utf8)!).hex
@@ -933,6 +957,27 @@ enum IdentityStore {
         }
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
+
+    #if DEBUG
+    /// DEBUG 构建的 secret 文件：~/Library/Application Support/BigDaddy/device-secret（0600）
+    private static var secretFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BigDaddy/device-secret")
+    }
+
+    private static func fileSecret() -> String? {
+        guard let raw = try? String(contentsOf: secretFileURL, encoding: .utf8) else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func saveFileSecret(_ secret: String) {
+        try? FileManager.default.createDirectory(
+            at: secretFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? secret.data(using: .utf8)?.write(to: secretFileURL, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretFileURL.path)
+    }
+    #endif
 
     private static func keychainValue(key: String) -> String? {
         let query: [String: Any] = [

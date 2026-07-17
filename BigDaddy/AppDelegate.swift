@@ -35,6 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var exitCountdownLabel: NSTextField?
     /// 必须持有引用，否则 DispatchSourceSignal 会被提前释放、信号监听失效
     private var signalSources: [DispatchSourceSignal] = []
+    /// 凭据失效弹窗每次运行只弹一次（register 会在扫码绑定等多处重复调用），菜单警示项常驻
+    private var credentialsAlertShown = false
     // 菜单里需要"打开前动态刷新"的只读展示项（心跳状态/下次截屏倒计时/当前配置摘要）
     private var heartbeatStatusMenuItem: NSMenuItem?
     private var nextScreenshotMenuItem: NSMenuItem?
@@ -100,8 +102,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     scheduleTimers()
                 }
                 rebuildMenu()
+                presentCredentialsAlertIfNeeded()
             }
         }
+    }
+
+    /// 后端在 register 时报告本机 secret 与存档不一致（设备已绑定、拒绝换钥）。
+    /// 此状态下心跳/命令/截图上传全部验签失败、家长端显示离线，必须当面说清恢复路径。
+    private func presentCredentialsAlertIfNeeded() {
+        guard client.credentialsInvalid, !credentialsAlertShown else { return }
+        credentialsAlertShown = true
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = Localization.string(zh: "设备凭据失效", en: "Device Credentials Invalid")
+        alert.informativeText = Localization.string(
+            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长端会显示设备离线。\n\n恢复方法：请家长在仪表盘中解绑本设备，然后重启客户端并重新绑定。",
+            en: "This Mac's device key no longer matches the server record (usually after reinstalling or switching client builds). Guardian data cannot be reported and the dashboard will show this device as offline.\n\nTo recover: unbind this device on the parent dashboard, then restart the client and bind again."
+        )
+        alert.runModal()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -115,6 +133,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func rebuildMenu() {
         let menu = NSMenu()
         menu.delegate = self
+
+        // 凭据失效警示常驻菜单顶部：此状态下心跳/命令全部验签失败，设备在家长端
+        // 显示离线，必须引导解绑后重新绑定，而不是让守护无声失效
+        if client.credentialsInvalid {
+            let credentialItem = NSMenuItem(
+                title: Localization.string(
+                    zh: "⚠️ 设备凭据失效：请家长在仪表盘解绑后重新绑定",
+                    en: "⚠️ Device credentials invalid: unbind on dashboard, then re-bind"
+                ),
+                action: nil, keyEquivalent: ""
+            )
+            credentialItem.isEnabled = false
+            menu.addItem(credentialItem)
+            menu.addItem(.separator())
+        }
 
         if client.config.bound {
             let statusItem = NSMenuItem(
