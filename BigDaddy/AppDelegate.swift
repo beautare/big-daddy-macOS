@@ -722,17 +722,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             label.font = NSFont.boldSystemFont(ofSize: 18)
             label.textColor = NSColor.labelColor
             label.stringValue = String(chars[i])
-            
+
             label.translatesAutoresizingMaskIntoConstraints = false
             box.contentView?.addSubview(label)
-            
+
+            // 同一套"撑满而非居中"修复，与 exit 验证码方框保持一致，避免数字在方框内
+            // 因 intrinsic size 计算而被裁切/偏移。
             if let contentView = box.contentView {
                 NSLayoutConstraint.activate([
-                    label.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-                    label.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1)
+                    label.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                    label.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+                    label.topAnchor.constraint(equalTo: contentView.topAnchor),
+                    label.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
                 ])
             }
-            
+
             digitsStack.addArrangedSubview(box)
             self.digitLabels.append(label)
         }
@@ -838,10 +842,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         inputField.alignment = .center
         inputField.font = NSFont.monospacedSystemFont(ofSize: 18, weight: .bold)
         alert.accessoryView = inputField
-        
+
         alert.addButton(withTitle: Localization.string(zh: "确认绑定", en: "Confirm Bind"))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
-        
+
+        // 打开即可直接输入，不用先手动点一下输入框
+        alert.window.initialFirstResponder = inputField
+
         if alert.runModal() == .alertFirstButtonReturn {
             let code = inputField.stringValue.trimmingCharacters(in: .whitespaces)
             guard code.count == 6, code.allSatisfy({ $0.isNumber }) else {
@@ -980,7 +987,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         
         alert.addButton(withTitle: Localization.string(zh: "安全退出", en: "Secure Exit"))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
-        
+
+        // 打开弹窗即可直接输入，不用先点一下第一个格子才能开始打字
+        if let firstDigitField = self.exitDigitFields.first {
+            alert.window.initialFirstResponder = firstDigitField
+        }
+
         // 初始化倒计时
         self.countdownSeconds = 300
         self.updateExitCountdownLabelText()
@@ -1087,17 +1099,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             field.font = NSFont.boldSystemFont(ofSize: 22)
             field.textColor = NSColor.labelColor
             field.delegate = self
-            
+
             field.translatesAutoresizingMaskIntoConstraints = false
             box.contentView?.addSubview(field)
-            
+
+            // 之前用 centerX/centerY 定位：field 没有显式宽高，靠空字符串时几乎为零的
+            // intrinsic size 撑开，实际可点击/渲染区域只有框正中一小条，导致"点不中"
+            // 「输入的数字被遮挡」。改成四边撑满 contentView，整个方框都可点击，数字
+            // 也稳定居中显示，不再依赖会随内容变化的 intrinsic size。
             if let contentView = box.contentView {
                 NSLayoutConstraint.activate([
-                    field.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-                    field.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -1)
+                    field.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                    field.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+                    field.topAnchor.constraint(equalTo: contentView.topAnchor),
+                    field.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
                 ])
             }
-            
+
             digitsStack.addArrangedSubview(box)
             self.exitDigitFields.append(field)
         }

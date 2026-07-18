@@ -835,44 +835,27 @@ enum PendingQueue {
     }
 }
 
-/// 补发队列的加密密钥：与设备身份的 deviceSecret 分开、单独存一条 Keychain 记录，
+/// 补发队列的加密密钥：与设备身份的 deviceSecret 分开、单独存一份文件，
 /// 首次使用时生成一个真正随机的 256-bit 对称密钥并持久化，之后每次启动直接复用同一把
-/// 密钥，保证之前落盘的队列文件在下次读取时依然能解密。
+/// 密钥，保证之前落盘的队列文件在下次读取时依然能解密。不走 Keychain：这把密钥只保护
+/// 本地暂存、尚未补发的队列数据，不涉及跟后端的身份验签，文件持久化即可。
 enum PendingQueueCrypto {
-    private static let account = "pendingQueueKey"
+    private static var keyFileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/BigDaddy/pending-queue-key")
+    }
 
     static func loadOrCreateKey() -> SymmetricKey {
-        if let data = keychainData() {
+        if let data = try? Data(contentsOf: keyFileURL), data.count == 32 {
             return SymmetricKey(data: data)
         }
         let newKey = SymmetricKey(size: .bits256)
-        setKeychainData(newKey.withUnsafeBytes { Data($0) })
+        let data = newKey.withUnsafeBytes { Data($0) }
+        try? FileManager.default.createDirectory(
+            at: keyFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: keyFileURL, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFileURL.path)
         return newKey
-    }
-
-    private static func keychainData() -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "BigDaddy",
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return data
-    }
-
-    private static func setKeychainData(_ value: Data) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "BigDaddy",
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(query as CFDictionary)
-        var attributes = query
-        attributes[kSecValueData as String] = value
-        SecItemAdd(attributes as CFDictionary, nil)
     }
 }
 
@@ -986,28 +969,18 @@ struct ScreenshotUploadResponse: Codable {
 enum IdentityStore {
     static func load() -> DeviceIdentity {
         print("BigDaddy: IdentityStore.load started")
-        #if DEBUG
-        // 开发构建每次 swift build / Xcode 运行的代码签名都不同，读不到上一个构建创建的
-        // Keychain 条目，会静默重造 secret；设备一旦绑定，重造即永久验签失败（后端拒绝
-        // 已绑定设备换钥）。DEBUG 构建改用 Application Support 下 0600 权限的文件持久化，
-        // 跨构建稳定；正式签名的 Release 构建仍走 Keychain，不受影响。
-        let fromFile = fileSecret()
-        let secret = fromFile ?? keychainValue(key: "deviceSecret") ?? generateSecret()
-        if fromFile == nil {
+        // 不再依赖 Keychain 持久化：开发构建每次 swift build / Xcode 运行的代码签名都不同，
+        // 读不到上一个构建创建的 Keychain 条目会静默重造 secret；设备一旦绑定，重造即永久
+        // 验签失败（后端拒绝已绑定设备换钥）。改用 Application Support 下 0600 权限的文件
+        // 持久化，跨构建、跨签名都稳定。
+        let secret: String
+        if let fromFile = fileSecret() {
+            secret = fromFile
+        } else {
+            secret = generateSecret()
             saveFileSecret(secret)
         }
-        print("BigDaddy: debug file deviceSecret ready")
-        #else
-        // 已存在的旧设备沿用 Keychain 里保存过的旧格式 secret（无论格式如何都继续可用，
-        // 不做强制迁移）；只有全新安装/全新生成指纹时才会调用 generateSecret()。
-        // 仅在新生成时写入：先删后加会把条目所有权反复转移给当前二进制，读到了就不该动它。
-        let stored = keychainValue(key: "deviceSecret")
-        let secret = stored ?? generateSecret()
-        if stored == nil {
-            setKeychainValue(secret, key: "deviceSecret")
-        }
-        print("BigDaddy: keychain deviceSecret ready")
-        #endif
+        print("BigDaddy: deviceSecret ready")
         let platform = IOPlatformUUID.read() ?? Host.current().localizedName ?? "BigDaddyMac"
         print("BigDaddy: platform UUID read complete")
         let fingerprint = SHA256.hash(data: platform.data(using: .utf8)!).hex
@@ -1017,7 +990,7 @@ enum IdentityStore {
     }
 
     /// 生成密码学安全的 32 字节随机 deviceSecret（用 SecRandomCopyBytes，而不是拼接
-    /// 两个 UUID 字符串这种可预测格式），十六进制编码后作为 String 存入 Keychain，
+    /// 两个 UUID 字符串这种可预测格式），十六进制编码后作为 String 存入文件，
     /// 与现有消费方（SHA256 取 secretHash、HMAC 签名）完全兼容，无需改动下游逻辑。
     private static func generateSecret() -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -1030,8 +1003,6 @@ enum IdentityStore {
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    #if DEBUG
-    /// DEBUG 构建的 secret 文件：~/Library/Application Support/BigDaddy/device-secret（0600）
     private static var secretFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/device-secret")
@@ -1048,32 +1019,6 @@ enum IdentityStore {
             at: secretFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? secret.data(using: .utf8)?.write(to: secretFileURL, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretFileURL.path)
-    }
-    #endif
-
-    private static func keychainValue(key: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "BigDaddy",
-            kSecAttrAccount as String: key,
-            kSecReturnData as String: true
-        ]
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    private static func setKeychainValue(_ value: String, key: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "BigDaddy",
-            kSecAttrAccount as String: key
-        ]
-        SecItemDelete(query as CFDictionary)
-        var attributes = query
-        attributes[kSecValueData as String] = value.data(using: .utf8)
-        SecItemAdd(attributes as CFDictionary, nil)
     }
 }
 
