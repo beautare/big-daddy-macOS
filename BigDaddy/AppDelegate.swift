@@ -17,9 +17,11 @@ enum Localization {
     }
 }
 
-/// modal 弹窗（NSAlert.runModal）期间主队列不排空，后台任务的结果不能用
-/// Task { @MainActor } / DispatchQueue.main 送回界面；改为写入这个带锁的信箱，
-/// 由 selector 计时器的 tick（modal 期间照常触发）在主线程取走并应用。
+/// 绑定码弹窗的 runModal 是从主 actor 任务内部调起的，这种弹窗期间主队列不排空
+/// （并非所有 modal 都如此——从菜单动作直接调起的弹窗主队列照常排空，机制见
+/// showDeviceBindCode 注释），后台任务的结果不能用 Task { @MainActor } /
+/// DispatchQueue.main 送回界面；改为写入这个带锁的信箱，由 selector 计时器的
+/// tick（modal 期间照常触发）在主线程取走并应用。
 /// 必须放在 AppDelegate 外部：嵌套类型会继承 @MainActor 隔离，后台任务就没法写入了。
 final class BindTokenMailbox: @unchecked Sendable {
     private let lock = NSLock()
@@ -67,10 +69,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var lastBindingSyncAt: Date = .distantPast
     /// 绑定检测快轮询任务（展示绑定码/二维码后启动的一段高频探测），持有引用以便取消
     private var bindDetectionTask: Task<Void, Never>?
-    // 菜单里需要"打开前动态刷新"的只读展示项（心跳状态/下次截屏倒计时/当前配置摘要）
-    private var heartbeatStatusMenuItem: NSMenuItem?
-    private var nextScreenshotMenuItem: NSMenuItem?
-    private var configSummaryMenuItem: NSMenuItem?
     // startingUpdater: true 后立即开始按 SUScheduledCheckInterval 后台检查；
     // 是否自动检查由 Sparkle 首次运行时弹出的系统对话框询问用户（Info.plist 未设置
     // SUEnableAutomaticChecks，交由 Sparkle 自行询问并记住用户的选择）。
@@ -187,7 +185,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             statusItem.isEnabled = false
             menu.addItem(statusItem)
 
-            // 常驻可见提示：截图开启时，孩子在菜单里一眼可见"家长可远程截屏"
+            // 常驻可见提示：截图是否开启直接关系孩子的隐私，必须留在一级菜单，
+            // 不能收进"关于"窗口里——不能让这条信息需要"多点一步"才看得到。
             let screenshotStateItem = NSMenuItem(
                 title: client.config.screenshotEnabled
                     ? Localization.string(zh: "📸 截图已开启：家长可远程截屏（本机会记录）",
@@ -197,33 +196,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             )
             screenshotStateItem.isEnabled = false
             menu.addItem(screenshotStateItem)
-
-            // 运行状态：最近一次心跳送达时间，孩子/家长一眼可见守护是否还在正常运作
-            let heartbeatItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            heartbeatItem.isEnabled = false
-            menu.addItem(heartbeatItem)
-            self.heartbeatStatusMenuItem = heartbeatItem
-
-            // 下一次截屏倒计时（仅截图开启时有意义）
-            if client.config.screenshotEnabled {
-                let countdownItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-                countdownItem.isEnabled = false
-                menu.addItem(countdownItem)
-                self.nextScreenshotMenuItem = countdownItem
-            } else {
-                self.nextScreenshotMenuItem = nil
-            }
-
-            // 当前配置只读展示：修改集中在家长 Dashboard，这里只做展示
-            let configSummaryItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            configSummaryItem.isEnabled = false
-            menu.addItem(configSummaryItem)
-            self.configSummaryMenuItem = configSummaryItem
-
-            menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"),
-                action: #selector(sendScreenshotNow), keyEquivalent: "s"
-            ))
             menu.addItem(.separator())
         } else {
             let statusItem = NSMenuItem(
@@ -240,42 +212,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             hintItem.isEnabled = false
             menu.addItem(hintItem)
 
+            // 之前拆成"显示本机绑定码"和"输入家长给的码"两条平行菜单项，两者都叫"绑定"，
+            // 孩子分不清该点哪个。改成一条入口，点开后再用弹窗把两种方式说清楚。
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "⚡️ 开始绑定：显示本机绑定码", en: "⚡️ Start Binding: Show This Mac's Bind Code"),
-                action: #selector(showDeviceBindCode), keyEquivalent: "b"
-            ))
-            menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "🔑 已有家长的绑定码？点此输入", en: "🔑 Have a Code From Your Parent? Enter It Here"),
-                action: #selector(showBindCodeInput), keyEquivalent: ""
+                title: Localization.string(zh: "⚡️ 绑定本设备…", en: "⚡️ Bind This Mac…"),
+                action: #selector(showBindEntry), keyEquivalent: "b"
             ))
             menu.addItem(.separator())
-            self.heartbeatStatusMenuItem = nil
-            self.nextScreenshotMenuItem = nil
-            self.configSummaryMenuItem = nil
         }
 
-        // 知情透明：任何状态下孩子都能查看"守护说明"和导出"本机守护记录"
+        // 版本/配置摘要/心跳/截图倒计时/守护说明/导出记录/检查更新——这些都是次要或
+        // 只读信息，收进"关于 BigDaddy"里，一级菜单只留状态和最关键的操作。
         menu.addItem(NSMenuItem(
-            title: Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"),
-            action: #selector(showTransparencyInfo), keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
-            title: Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"),
-            action: #selector(exportAuditLog), keyEquivalent: ""
-        ))
-        menu.addItem(.separator())
-
-        let version = AppVersion.current
-        let versionItem = NSMenuItem(
-            title: Localization.string(zh: "版本 \(version)", en: "Version \(version)"),
-            action: nil, keyEquivalent: ""
-        )
-        versionItem.isEnabled = false
-        menu.addItem(versionItem)
-
-        menu.addItem(NSMenuItem(
-            title: Localization.string(zh: "检查更新…", en: "Check for Updates…"),
-            action: #selector(checkForUpdates), keyEquivalent: ""
+            title: Localization.string(zh: "关于 BigDaddy…", en: "About BigDaddy…"),
+            action: #selector(showAboutWindow), keyEquivalent: ""
         ))
         menu.addItem(.separator())
 
@@ -285,51 +235,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         ))
         statusItem?.menu = menu
         updateStatusItemAppearance()
-        refreshDynamicMenuItems()
     }
 
-    /// 打开菜单前刷新一次动态项，确保心跳状态/倒计时/配置摘要是"打开那一刻"的真实值，
-    /// 而不需要靠后台不断重建整个菜单来维持新鲜度。
-    private func refreshDynamicMenuItems() {
-        heartbeatStatusMenuItem?.title = Localization.string(
-            zh: "最近心跳: \(client.lastHeartbeatDescription)",
-            en: "Last heartbeat: \(client.lastHeartbeatDescription)"
-        )
+    /// 用户点开菜单栏图标的那一刻，静默同步一次绑定状态——这是弥补"绑定/解绑在
+    /// 服务端完成、客户端需等下一轮 60s 配置轮询才感知"的滞后的主要机制。节流到
+    /// 5 秒，避免频繁点开时的网络风暴；不加"正在检查"占位项，本地同步在一秒内
+    /// 完成，状态变化后就地重建菜单即可。
+    func menuWillOpen(_ menu: NSMenu) {
+        syncBindingStateIfStale()
+    }
 
-        if let item = nextScreenshotMenuItem {
-            if let fireDate = screenshotTimer?.fireDate {
+    /// "关于"窗口：把版本、当前配置摘要、心跳、截图倒计时等只读信息，以及守护说明/
+    /// 导出记录/检查更新三个次要操作集中在一处，而不是平铺成一堆一级菜单项。
+    @objc private func showAboutWindow() {
+        let alert = NSAlert()
+        alert.messageText = "BigDaddy"
+        applyShieldIcon(to: alert)
+
+        var lines: [String] = []
+        if client.config.bound {
+            lines.append(Localization.string(zh: "状态：已受保护", en: "Status: Protected"))
+            lines.append(client.config.screenshotEnabled
+                ? Localization.string(zh: "截图：已开启（家长可远程截屏）", en: "Screenshots: ON (parent can capture)")
+                : Localization.string(zh: "截图：未开启", en: "Screenshots: OFF"))
+            lines.append(Localization.string(
+                zh: "最近心跳：\(client.lastHeartbeatDescription)",
+                en: "Last heartbeat: \(client.lastHeartbeatDescription)"
+            ))
+            if client.config.screenshotEnabled, let fireDate = screenshotTimer?.fireDate {
                 let remaining = max(0, Int(fireDate.timeIntervalSinceNow))
-                let mm = remaining / 60
-                let ss = remaining % 60
-                item.title = Localization.string(
-                    zh: String(format: "下次截屏: %02d:%02d 后", mm, ss),
-                    en: String(format: "Next screenshot in %02d:%02d", mm, ss)
-                )
-            } else {
-                item.title = Localization.string(zh: "下次截屏: 未安排", en: "Next screenshot: not scheduled")
+                lines.append(Localization.string(
+                    zh: String(format: "下次截屏：%02d:%02d 后", remaining / 60, remaining % 60),
+                    en: String(format: "Next screenshot in %02d:%02d", remaining / 60, remaining % 60)
+                ))
             }
-        }
-
-        if let item = configSummaryMenuItem {
             let channels = client.config.notificationChannels
             let hasChannel = !(channels.email ?? "").isEmpty || !(channels.telegramChatId ?? "").isEmpty
             let channelDesc = hasChannel
                 ? Localization.string(zh: "已配置", en: "configured")
                 : Localization.string(zh: "未配置", en: "not configured")
-            item.title = Localization.string(
-                zh: "当前配置: 截屏间隔 \(client.config.screenshotIntervalMins) 分钟 · 通知渠道\(channelDesc)",
+            lines.append(Localization.string(
+                zh: "当前配置：截屏间隔 \(client.config.screenshotIntervalMins) 分钟 · 通知渠道\(channelDesc)",
                 en: "Config: every \(client.config.screenshotIntervalMins) min · channel \(channelDesc)"
-            )
+            ))
+        } else {
+            lines.append(Localization.string(zh: "状态：尚未绑定家长账号", en: "Status: Unbound"))
+        }
+        lines.append(Localization.string(zh: "版本 \(AppVersion.current)", en: "Version \(AppVersion.current)"))
+        alert.informativeText = lines.joined(separator: "\n")
+
+        // 按钮与动作一一对应放进同一个数组，用响应值减去起始偏移量做下标，不用再对着
+        // .alertFirstButtonReturn/.alertSecondButtonReturn 数按钮是第几个——截图测试
+        // 这一项是否出现全看 showsTestScreenshot，硬编码序号很容易在两条分支间踩坑。
+        var actions: [(title: String, handler: () -> Void)] = []
+        if client.config.bound && client.config.screenshotEnabled {
+            actions.append((Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"), sendScreenshotNow))
+        }
+        actions.append((Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"), showTransparencyInfo))
+        actions.append((Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"), exportAuditLog))
+        actions.append((Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates))
+        for action in actions {
+            alert.addButton(withTitle: action.title)
+        }
+        alert.addButton(withTitle: Localization.string(zh: "关闭", en: "Close"))
+
+        let response = alert.runModal()
+        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        if index >= 0 && index < actions.count {
+            actions[index].handler()
         }
     }
 
-    /// 用户点开菜单栏图标的那一刻，把心跳状态/倒计时/配置摘要刷新成最新值，
-    /// 并静默同步一次绑定状态——这是弥补"绑定/解绑在服务端完成、客户端需等下一轮
-    /// 60s 配置轮询才感知"的滞后的主要机制。节流到 5 秒，避免频繁点开时的网络风暴；
-    /// 不加"正在检查"占位项，本地同步在一秒内完成，状态变化后就地重建菜单即可。
-    func menuWillOpen(_ menu: NSMenu) {
-        refreshDynamicMenuItems()
-        syncBindingStateIfStale()
+    /// 未绑定态的合并入口：先问清楚"哪种方式"，再分派到对应的原有弹窗，
+    /// 避免两条并列菜单项都叫"绑定"、孩子分不清该点哪个。
+    @objc private func showBindEntry() {
+        let alert = NSAlert()
+        alert.messageText = Localization.string(zh: "绑定本设备", en: "Bind This Mac")
+        alert.informativeText = Localization.string(
+            zh: "选择一种方式完成绑定：",
+            en: "Choose how you'd like to bind:"
+        )
+        applyShieldIcon(to: alert)
+        alert.addButton(withTitle: Localization.string(
+            zh: "在本机显示绑定码，让家长输入", en: "Show a code here for my parent to enter"
+        ))
+        alert.addButton(withTitle: Localization.string(
+            zh: "输入家长已经给我的绑定码", en: "Enter a code my parent already gave me"
+        ))
+        alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: showDeviceBindCode()
+        case .alertSecondButtonReturn: showBindCodeInput()
+        default: break
+        }
     }
 
     private func syncBindingStateIfStale() {
@@ -432,12 +431,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     // 跟踪 IDLE/RESUME 状态转换
     private var wasIdle = false
 
+    /// `Timer.scheduledTimer(withTimeInterval:repeats:block:)` 只把计时器加入当前
+    /// RunLoop 的 `.default` 模式。任何 NSAlert.runModal() 打开期间，RunLoop 会切到
+    /// `.modalPanel` 模式，`.default` 模式的计时器完全不会触发——心跳/命令轮询/配置
+    /// 刷新/定时截图会在弹窗开着的这段时间里全部静默暂停，弹窗一关才恢复，表现为
+    /// 家长端看到的心跳"断断续续"。改用手动创建 Timer 并加入 `.common` 模式（涵盖
+    /// default 与 modalPanel），弹窗打开时这些后台任务也能正常触发。
+    /// 注：计时器体里的 Task { @MainActor } 在"从主 actor 任务里调起的弹窗"（目前
+    /// 只有未绑定态的绑定码弹窗）期间会延后到弹窗关闭才执行；安全退出/关于等直接
+    /// 从菜单动作调起的弹窗期间照常执行（实测结论见 showDeviceBindCode 注释）——
+    /// 已绑定设备会出现的弹窗都属于后者，心跳在这些弹窗打开期间不会中断。
+    private func scheduleCommonModeTimer(interval: TimeInterval, repeats: Bool, block: @escaping @Sendable (Timer) -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: repeats, block: block)
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
+    }
+
     private func scheduleTimers() {
         screenshotTimer?.invalidate()
 
         // 定时截图（由后端 screenshotEnabled 控制，调度本身照常）
-        screenshotTimer = Timer.scheduledTimer(
-            withTimeInterval: TimeInterval(client.config.screenshotIntervalMins * 60),
+        screenshotTimer = scheduleCommonModeTimer(
+            interval: TimeInterval(client.config.screenshotIntervalMins * 60),
             repeats: true
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.performScheduledScreenshot() }
@@ -448,7 +463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         // 定期拉取配置，使家长在后端的开启/撤销近实时生效，并让状态变化对孩子端可见
         configTimer?.invalidate()
-        configTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        configTimer = scheduleCommonModeTimer(interval: 60, repeats: true) { [weak self] _ in
             Task { [weak self] in await self?.pollConfigForChildVisibility() }
         }
     }
@@ -461,7 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let interval: TimeInterval = wasIdle
             ? TimeInterval(client.config.heartbeatIdleSeconds)
             : TimeInterval(client.config.bound ? client.config.heartbeatActiveSeconds : max(client.config.heartbeatActiveSeconds, 300))
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+        heartbeatTimer = scheduleCommonModeTimer(interval: interval, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let previouslyIdle = self.wasIdle
@@ -485,7 +500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         commandTimer?.invalidate()
         guard client.config.bound else { return }
         let interval: TimeInterval = wasIdle ? 300 : 30
-        commandTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+        commandTimer = scheduleCommonModeTimer(interval: interval, repeats: false) { [weak self] _ in
             guard let self else { return }
             Task {
                 await self.client.pollCommands()
@@ -605,11 +620,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 self.bindTokenRefreshing = false
                 self.updateCountdownLabelText()
 
-                // runModal() 期间主运行循环跑在 modal panel 模式，GCD 主队列不排空，
-                // 之前 Timer(block:) 里再包一层 Task { @MainActor } 的写法在弹窗打开时
-                // 永远不会执行（表现为倒计时文本冻结在 05:00）。改用 selector 形式的
-                // Timer：由运行循环直接在主线程回调，配合 .common 模式（包含 modal
-                // panel 模式）在弹窗打开期间照常触发。
+                // 本弹窗的 runModal() 是从主 actor 任务内部调起的（Task → MainActor.run），
+                // 外层 dispatch 块在弹窗关闭前不会返回，嵌套运行循环无法再入排空主队列——
+                // 这种弹窗期间 Task { @MainActor } / DispatchQueue.main 一律不执行（实测
+                // 验证；从菜单动作直接调起的弹窗如安全退出则不受此限），之前 Timer(block:)
+                // 里包 Task { @MainActor } 的写法因此冻结在 05:00。selector 形式的 Timer
+                // 由运行循环直接回调、不经过主队列，配合 .common 模式（包含 modal panel
+                // 模式）在弹窗打开期间照常触发。
                 self.countdownTimer?.invalidate()
                 let timer = Timer(
                     timeInterval: 1.0, target: self, selector: #selector(self.bindCountdownTick),
@@ -780,8 +797,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard !bindTokenRefreshing else { return }
         bindTokenRefreshing = true
         countdownLabel?.stringValue = Localization.string(zh: "正在获取新的绑定码…", en: "Fetching a new bind code…")
-        // 主队列在 modal 期间不排空，网络结果不能用 Task { @MainActor } / DispatchQueue.main
-        // 送回界面。detached 任务只负责拿新码并写入信箱，应用到 UI 由下一次 tick 完成。
+        // 本弹窗 modal 期间主队列不排空（runModal 从主 actor 任务调起，见
+        // showDeviceBindCode 注释），网络结果不能用 Task { @MainActor } /
+        // DispatchQueue.main 送回界面。detached 任务只负责拿新码并写入信箱，
+        // 应用到 UI 由下一次 tick 完成。
         let mailbox = bindTokenMailbox
         Task.detached { [client = self.client] in
             await client.register()
@@ -966,9 +985,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         self.countdownSeconds = 300
         self.updateExitCountdownLabelText()
 
-        // 启动倒计时 Timer。必须用 selector 形式：runModal() 期间主队列不排空，
-        // Timer(block:) + Task { @MainActor } 的组合在弹窗打开时不会执行（详见
-        // showDeviceBindCode 里的说明），倒计时会一直冻结在 05:00。
+        // 启动倒计时 Timer。selector 形式 + .common 模式：由运行循环直接回调、
+        // 不依赖主队列排空，无论弹窗从哪种上下文调起都照常走秒（机制详见
+        // showDeviceBindCode 里的说明）。
         self.countdownTimer?.invalidate()
         let timer = Timer(
             timeInterval: 1.0, target: self, selector: #selector(exitCountdownTick),
@@ -1177,14 +1196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     private func checkScreenRecordingPermission() -> Bool {
-        if CGPreflightScreenCaptureAccess() {
-            return true
-        }
-        // 尝试以 1x1 像素做真实截屏校验，绕过 ad-hoc / 无 bundle ID 导致的 preflight 错误
-        if CGDisplayCreateImage(CGMainDisplayID(), rect: CGRect(x: 0, y: 0, width: 1, height: 1)) != nil {
-            return true
-        }
-        return false
+        client.hasScreenRecordingAccess()
     }
 
     private func createPermissionCheckerView(hasAccessibility: Bool, hasScreenCapture: Bool) -> NSView {

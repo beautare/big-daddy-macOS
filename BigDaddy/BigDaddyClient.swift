@@ -4,6 +4,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import Network
+import ScreenCaptureKit
 import Security
 
 enum EventType: String, Codable {
@@ -110,6 +111,16 @@ final class BigDaddyClient {
         config.screenshotEnabled
     }
 
+    /// 屏幕录制权限的唯一判定入口，只信 `CGPreflightScreenCaptureAccess()`。
+    /// 曾经在这里（以及绑定流程的权限自检里）用"CGDisplayCreateImage 1x1 截屏是否
+    /// 非空"做兜底，但实测该调用在没有权限的进程里也返回非空——10.15 起无权限时
+    /// 系统只是把窗口内容替换成壁纸合成图，并不失败（该 API 在 macOS 15 已被废除，
+    /// 仅因部署目标是 macOS 12 才还能编译）。兜底恒真等于永远报"有权限"，反而掩盖
+    /// 真实缺权：菜单栏的缺权警示永远不亮、心跳里的 screenRecordingGranted 恒为 true。
+    func hasScreenRecordingAccess() -> Bool {
+        CGPreflightScreenCaptureAccess()
+    }
+
     var isIdle: Bool {
         // 之前只看 .mouseMoved，只打字不动鼠标会被误判为空闲。改用 kCGAnyInputEventType
         // （rawValue ~0，即 CGEventSourceSecondsSinceLastInputEvent 的语义）覆盖键盘/
@@ -213,7 +224,7 @@ final class BigDaddyClient {
             "previousCrashAt": previousCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
             "metadata": [
-                "screenRecordingGranted": CGPreflightScreenCaptureAccess(),
+                "screenRecordingGranted": hasScreenRecordingAccess(),
                 "accessibilityGranted": AXIsProcessTrustedWithOptions(nil)
             ]
         ]
@@ -512,6 +523,35 @@ final class BigDaddyClient {
         return data
     }
 
+    /// 抓取主显示器一帧画面。macOS 14+ 走 ScreenCaptureKit（`CGDisplayCreateImage`
+    /// 已在 macOS 15 被废除，目前仅靠向后兼容仍能运行，随时可能被移除）；更早的系统
+    /// 保留旧路径——SCK 的单帧截图 API `SCScreenshotManager` 本身要求 macOS 14。
+    /// 分辨率按显示器点数（1x）抓取即可：下游会压到 compressMaxWidth（默认 1280）以内，
+    /// 原生像素抓取只是白白放大中间图。
+    private func captureMainDisplayImage() async -> CGImage? {
+        if #available(macOS 14.0, *) {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
+                        ?? content.displays.first else {
+                    NSLog("BigDaddy: ScreenCaptureKit returned no displays.")
+                    return nil
+                }
+                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let configuration = SCStreamConfiguration()
+                configuration.width = display.width
+                configuration.height = display.height
+                configuration.showsCursor = false
+                return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+            } catch {
+                NSLog("BigDaddy: ScreenCaptureKit capture failed: \(error.localizedDescription)")
+                return nil
+            }
+        } else {
+            return CGDisplayCreateImage(CGMainDisplayID())
+        }
+    }
+
     /// 返回是否真正完成了一次截图上传尝试（用于命令回执：截图被禁用/无权限/上传失败
     /// 都不应该回执 SUCCEEDED，此前命令通道无条件回执成功，是一种"假成功"）。
     @discardableResult
@@ -526,7 +566,7 @@ final class BigDaddyClient {
             CGRequestScreenCaptureAccess()
             return false
         }
-        guard let image = CGDisplayCreateImage(CGMainDisplayID()) else { return false }
+        guard let image = await captureMainDisplayImage() else { return false }
 
         if reason != "command" && isImageSimilarToLast(cgImage: image) {
             NSLog("BigDaddy: Screenshot is similar to the last one, skip sending.")

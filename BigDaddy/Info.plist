@@ -18,6 +18,11 @@
   <true/>
   <key>NSHumanReadableCopyright</key>
   <string>BigDaddy</string>
+  <!-- 纯后台守护进程，没有可见窗口；不加这个开关的话 App Nap 会在系统判定"不活跃"
+       时降低/延迟本 App 的 Timer 触发频率和网络请求节奏，导致心跳/命令轮询在孩子
+       没有操作电脑时变得断断续续。 -->
+  <key>NSAppSleepDisabled</key>
+  <true/>
   <key>NSAppleEventsUsageDescription</key>
   <string>BigDaddy 需要读取浏览器当前标签页地址，用于向家长如实展示访问记录。</string>
   <key>BigDaddyAPIBaseURL</key>
