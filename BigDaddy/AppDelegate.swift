@@ -87,8 +87,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         print("BigDaddy: runtime prepared")
         client.startNetworkMonitoring()
         print("BigDaddy: network monitoring started")
+        #if !DEBUG
+        // DEBUG（Xcode 直接运行 / swift build）的可执行文件不在任何 .app bundle 里，
+        // 没有 Info.plist，Sparkle 找不到 SUFeedURL/SUPublicEDKey 必然启动失败、弹出
+        // "Unable to Check For Updates"。只有 scripts/package.sh 打包出的 Release .app
+        // 才带 Info.plist，这里跳过 DEBUG 下的自动初始化，避免每次启动都弹一次失败框；
+        // 用户在"关于"窗口手动点"检查更新…"时仍会走到 checkForUpdates() 触发同一个
+        // lazy var，DEBUG 下点了照样会看到这个框（预期内，因为手动点击就是想验证结果）。
         _ = updaterController // 触发 lazy 初始化，启动 Sparkle 后台更新检查
         print("BigDaddy: Sparkle updater started")
+        #else
+        print("BigDaddy: Sparkle updater skipped in DEBUG build")
+        #endif
         LaunchAgentInstaller.installIfNeeded()
         print("BigDaddy: launch agent checked")
         // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
