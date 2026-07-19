@@ -121,6 +121,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 刷新结果信箱：后台任务写入、倒计时 tick 在主线程取走（见 bindCountdownTick）
     private let bindTokenMailbox = BindTokenMailbox()
     private var exitDigitFields: [NSTextField] = []
+    /// 与 exitDigitFields 一一对应，记录每格"最后一次合法数字输入"，用于在用户
+    /// 输入非数字字符时把格子还原回原值（见 controlTextDidChange）。
+    private var exitDigitPreviousValues: [String] = []
     private var exitCountdownLabel: NSTextField?
     /// 必须持有引用，否则 DispatchSourceSignal 会被提前释放、信号监听失效
     private var signalSources: [DispatchSourceSignal] = []
@@ -1157,7 +1160,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         digitsStack.alignment = .centerY
         
         self.exitDigitFields.removeAll()
-        
+        self.exitDigitPreviousValues = Array(repeating: "", count: 6)
+
         for _ in 0..<6 {
             let box = NSBox()
             box.boxType = .custom
@@ -1244,51 +1248,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         )
     }
 
+    /// 只负责"往前打字"：合法数字就取用、跳到下一格；非数字字符一律当作无效按键
+    /// 拒绝掉、还原成这格之前的值，绝不在这里做任何跳格/清空判断。
+    ///
+    /// 之前的版本靠"过滤后文本是否为空"来判断要不要跳回上一格，但这个信号有歧义：
+    /// 本格已有数字（比如"3"）时，makeFirstResponder 会让整格文本被选中；这时哪怕
+    /// 只是输入一个非数字字符（比如字母），选中内容也会被替换掉，过滤后同样是空——
+    /// 于是被误判成"用户按了删除"，不但把这格清空，还连锁跳到上一格、重复消耗后续
+    /// 按键，实际表现就是"打几个非数字字符，前面输的数字全没了"。真正的删除已经
+    /// 完全交给下面的 doCommandBy: 处理（那里能拿到"这次按键就是退格"这个确切信号，
+    /// 不需要靠猜），这里就不用再兼顾删除语义。
     func controlTextDidChange(_ obj: Notification) {
-        guard let textField = obj.object as? NSTextField else { return }
-        
-        var text = textField.stringValue
-        if text.count > 1 {
-            text = String(text.prefix(1))
-            textField.stringValue = text
+        guard let textField = obj.object as? NSTextField,
+              let index = exitDigitFields.firstIndex(of: textField) else { return }
+
+        let digitsOnly = textField.stringValue.filter { $0.isNumber }
+        guard let lastDigit = digitsOnly.last else {
+            // 非数字字符：不是合法输入，也不可能是删除（删除已经在 doCommandBy: 里
+            // 整个接管，走不到这里）。原样恢复，等于无视这次无效按键，光标留在原格。
+            textField.stringValue = index < exitDigitPreviousValues.count ? exitDigitPreviousValues[index] : ""
+            return
         }
-        
-        let filtered = text.filter { $0.isNumber }
-        if filtered != text {
-            textField.stringValue = filtered
-            text = filtered
-        }
-        
-        if text.count == 1 {
-            if let index = exitDigitFields.firstIndex(of: textField) {
-                if index < 5 {
-                    textField.window?.makeFirstResponder(exitDigitFields[index + 1])
-                }
-            }
-        } else if text.isEmpty {
-            if let index = exitDigitFields.firstIndex(of: textField) {
-                if index > 0 {
-                    textField.window?.makeFirstResponder(exitDigitFields[index - 1])
-                }
-            }
+        let newValue = String(lastDigit)
+        textField.stringValue = newValue
+        if index < exitDigitPreviousValues.count { exitDigitPreviousValues[index] = newValue }
+        if index < 5 {
+            textField.window?.makeFirstResponder(exitDigitFields[index + 1])
         }
     }
 
-    /// 退格键在"格子本身已经是空"的情况下不会触发 controlTextDidChange（文本压根没变），
-    /// 之前只处理了"删掉本格数字后跳到上一格"，没处理"本格已空、继续按删除键"——
-    /// 输完几位后光标自动停在下一个空格子上，这时按删除键完全没反应，必须先用鼠标点回
-    /// 上一格才能改。这里改用 doCommandBySelector 直接拦截 deleteBackward: 命令，
-    /// 跳到上一格并清空它，让退格键能一格一格连续往回删。
+    /// 退格键的删除/跳格逻辑完全在这里处理，不依赖 controlTextDidChange 事后猜测：
+    /// 本格有数字就先清空本格（光标留在原地，标准验证码退格体验——不会一下跳穿
+    /// 好几格）；本格已空则跳到上一格并清空它，从而实现"一次退格删一位"的连续删除。
+    /// 返回 true 表示自己已处理，阻止 AppKit 再走一遍默认删除（避免重复触发
+    /// controlTextDidChange，也让"删除"和"打字"两条路径完全不交叉）。
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard commandSelector == #selector(NSResponder.deleteBackward(_:)),
               let field = control as? NSTextField,
-              field.stringValue.isEmpty,
-              let index = exitDigitFields.firstIndex(of: field),
-              index > 0 else {
+              let index = exitDigitFields.firstIndex(of: field) else {
             return false
         }
+        if !field.stringValue.isEmpty {
+            field.stringValue = ""
+            if index < exitDigitPreviousValues.count { exitDigitPreviousValues[index] = "" }
+            return true
+        }
+        guard index > 0 else { return true }
         let previous = exitDigitFields[index - 1]
         previous.stringValue = ""
+        if index - 1 < exitDigitPreviousValues.count { exitDigitPreviousValues[index - 1] = "" }
         field.window?.makeFirstResponder(previous)
         return true
     }
