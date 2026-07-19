@@ -276,15 +276,15 @@ final class BigDaddyClient {
     func sendHeartbeat(event: EventType) async -> Bool {
         let version = AppVersion.current
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
-        // getActiveBrowserUrl 靠 NSAppleScript 给目标浏览器发 Apple Event 并同步等回复，
-        // 没有超时保护；目标浏览器卡顿/无响应时能一直等下去。这两个调用之前直接摆在
+        // activeWindowInfo 浏览器场景下靠 NSAppleScript 给目标浏览器发 Apple Event 并同步
+        // 等回复，没有超时保护；目标浏览器卡顿/无响应时能一直等下去。这个调用之前直接摆在
         // sendHeartbeat 开头、第一个 await 之前——而 sendHeartbeat 的调用方全部是
         // Task { @MainActor in ... } 或主队列的信号处理器，函数体在第一次挂起前跟调用方
         // 同线程执行，等于每次心跳都可能拿主线程去顶浏览器的 Apple Event 超时，
-        // 表现为整个客户端（含菜单栏图标）间歇性卡住。挪进 Task.detached 让它们跑在
+        // 表现为整个客户端（含菜单栏图标）间歇性卡住。挪进 Task.detached 让它跑在
         // 后台线程，主线程不再被这个不受控的阻塞调用拖住。
         let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
-            (self.getActiveWindowTitle(), self.getActiveBrowserUrl(appName: activeApp))
+            self.activeWindowInfo()
         }.value
         // 先取走计数并清零，即便这次心跳发送失败被塞进 PendingQueue 重试，这个区间的
         // 切换次数也已经落进这份 body 里，不会因为重试而重复计数或者丢失。
@@ -459,16 +459,21 @@ final class BigDaddyClient {
         "Microsoft Edge", "Brave Browser", "Vivaldi", "Opera"
     ]
 
-    /// 生成向指定浏览器查询"当前标签页某个属性"的 AppleScript，非受支持的浏览器返回 nil。
-    /// URL 与标题在不同浏览器里的属性名不同：Chromium 系是 `URL of active tab` /
-    /// `title of active tab`，Safari 是 `URL of current tab` / `name of current tab`，
-    /// 用参数把这个差异抽出来，URL 和标题两个取数入口共用同一套浏览器识别逻辑。
-    private func browserTabQueryScript(appName: String, chromiumProperty: String, safariProperty: String) -> String? {
+    /// 标题和 URL 在同一个 AppleScript 往返里一起拿，中间用这个几乎不可能出现在真实
+    /// 标题/URL 里的不可见字符拼接，回来后再拆开——避免对同一个浏览器发两次独立的
+    /// Apple Event（各自都是一次完整的 tell-application 往返）。
+    private static let browserFieldSeparator = "\u{2063}"
+
+    /// 生成向指定浏览器一次性查询"当前标签页标题 + URL"的 AppleScript，非受支持的
+    /// 浏览器返回 nil。属性名在不同浏览器里不同：Chromium 系是 `title`/`URL` of
+    /// active tab，Safari 是 `name`/`URL` of current tab。
+    private func browserTabCombinedScript(appName: String) -> String? {
+        let sep = BigDaddyClient.browserFieldSeparator
         if let chromium = BigDaddyClient.chromiumBrowserNames.first(where: { appName.contains($0) }) {
             return """
             tell application "\(chromium)"
                 if (count of windows) > 0 then
-                    return \(chromiumProperty) of active tab of first window
+                    return (title of active tab of first window) & "\(sep)" & (URL of active tab of first window)
                 end if
             end tell
             return ""
@@ -479,7 +484,7 @@ final class BigDaddyClient {
             return """
             tell application "Arc"
                 if (count of windows) > 0 then
-                    return \(chromiumProperty) of active tab of first window
+                    return (title of active tab of first window) & "\(sep)" & (URL of active tab of first window)
                 end if
             end tell
             return ""
@@ -488,7 +493,7 @@ final class BigDaddyClient {
             return """
             tell application "Safari"
                 if (count of windows) > 0 then
-                    return \(safariProperty) of current tab of first window
+                    return (name of current tab of first window) & "\(sep)" & (URL of current tab of first window)
                 end if
             end tell
             return ""
@@ -509,44 +514,44 @@ final class BigDaddyClient {
         return ""
     }
 
-    func getActiveBrowserUrl(appName: String) -> String {
-        guard let script = browserTabQueryScript(appName: appName, chromiumProperty: "URL", safariProperty: "URL") else { return "" }
-        return runAppleScript(script)
+    /// 浏览器场景下的标题 + URL，一次 AppleScript 往返拿全；非浏览器或脚本失败返回 nil，
+    /// 交由调用方回退到 CGWindowList/Accessibility（那两条路只有标题，没有 URL）。
+    private func browserTabInfo(appName: String) -> (title: String, url: String)? {
+        guard let script = browserTabCombinedScript(appName: appName) else { return nil }
+        let raw = runAppleScript(script)
+        guard !raw.isEmpty else { return nil }
+        let parts = raw.components(separatedBy: BigDaddyClient.browserFieldSeparator)
+        guard parts.count == 2 else { return nil }
+        return (title: parts[0], url: parts[1])
     }
 
-    /// 主流浏览器当前标签页标题：走 AppleScript 自动化拿，不依赖屏幕录制/辅助功能权限。
-    /// 这是 getActiveWindowTitle 对浏览器的首选路径——见那里的注释说明为什么。
-    func getActiveBrowserTabTitle(appName: String) -> String {
-        guard let script = browserTabQueryScript(appName: appName, chromiumProperty: "title", safariProperty: "name") else { return "" }
-        return runAppleScript(script)
-    }
-
-    func getActiveWindowTitle() -> String {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return "" }
+    /// 一次心跳/截图需要的"活动窗口标题 + 浏览器 URL"。浏览器优先走上面的合并 AppleScript
+    /// 查询：下面的 CGWindowList(kCGWindowName) 与 Accessibility 两条路都需要屏幕录制或
+    /// 辅助功能授权，dev 构建签名不稳定时经常两者都拿不到，导致标题恒为空；而 AppleScript
+    /// 自动化是另一套按目标应用逐个授权的 TCC 权限，用它能在缺屏幕录制权限时仍抓到主流
+    /// 浏览器的当前页面标题（顺带把 URL 也拿到，不需要再发一次 Apple Event）。
+    func activeWindowInfo() -> (title: String, url: String) {
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return ("", "") }
         let appName = frontApp.localizedName ?? ""
-        // 浏览器优先走 AppleScript 拿标签页标题：下面的 CGWindowList(kCGWindowName) 与
-        // Accessibility 两条路都需要屏幕录制或辅助功能授权，dev 构建签名不稳定时经常
-        // 两者都拿不到，导致标题恒为空。而 AppleScript 自动化是另一套按目标应用逐个
-        // 授权的 TCC 权限，已经被 URL 采集用上（能拿到 URL 即证明其可用），用同一条路
-        // 取标签页标题，就能在缺屏幕录制权限时仍抓到主流浏览器的当前页面标题。
-        let browserTitle = getActiveBrowserTabTitle(appName: appName)
-        if !browserTitle.isEmpty { return browserTitle }
+        if let info = browserTabInfo(appName: appName) {
+            return info
+        }
 
         let pid = frontApp.processIdentifier
         // 非浏览器 / AppleScript 失败：首选 CGWindowList 的 kCGWindowName，但该字段自
         // macOS 10.15 起仅对持有屏幕录制权限的进程返回，未授权时恒为空——此时回落到
-        // Accessibility API。
+        // Accessibility API。这两条路都没有 URL。
         let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
         if let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
             for info in windowListInfo {
                 if let windowOwnerPID = info[kCGWindowOwnerPID as String] as? Int, windowOwnerPID == pid,
                    let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                    let title = info[kCGWindowName as String] as? String, !title.isEmpty {
-                    return title
+                    return (title, "")
                 }
             }
         }
-        return accessibilityWindowTitle(pid: pid)
+        return (accessibilityWindowTitle(pid: pid), "")
     }
 
     /// Accessibility 兜底：读焦点窗口的 AXTitle。需要辅助功能授权（同样受 dev 构建
@@ -693,7 +698,7 @@ final class BigDaddyClient {
         // 不依赖"这里执行时已经离开主线程"这种由 ScreenCaptureKit 内部调度决定、
         // 未来系统版本随时可能变化的隐式假设。
         let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
-            (self.getActiveWindowTitle(), self.getActiveBrowserUrl(appName: activeApp))
+            self.activeWindowInfo()
         }.value
 
         do {
