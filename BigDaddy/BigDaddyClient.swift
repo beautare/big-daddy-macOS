@@ -119,6 +119,8 @@ final class BigDaddyClient {
     private var previousCrashAt: Date?
     private let switchCounter = SwitchCounter()
     private var switchObserver: NSObjectProtocol?
+    /// 切换 App 后"即时上报"的防抖任务：把快速连切合并成一次发送
+    private var switchHeartbeatWork: DispatchWorkItem?
 
     init() {
         self.identity = IdentityStore.load()
@@ -164,17 +166,31 @@ final class BigDaddyClient {
         startActivitySwitchTracking()
     }
 
-    /// 前台应用切换计数：用来估算孩子在两次心跳之间的操作切换频率，辅助家长
-    /// 判断专注度。只跟踪"切到另一个 App"，不涉及同一 App 内切窗口/切标签页
-    /// （那需要给每个运行中的 App 挂 AXObserver，覆盖面还不完整，暂不做）。
+    /// 前台应用切换跟踪：每次切到另一个 App 时 ① 计数（喂给 dashboard「简报」的切换
+    /// 频率图）② 安排一次即时上报，让本次切换近实时在家长端出现一条记录。只跟踪"切到
+    /// 另一个 App"，不涉及同一 App 内切窗口/切标签页（那需要给每个运行中的 App 挂
+    /// AXObserver，覆盖面还不完整，暂不做）。
     private func startActivitySwitchTracking() {
         guard switchObserver == nil else { return }
-        let counter = switchCounter
         switchObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
-        ) { _ in
-            counter.increment()
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.switchCounter.increment()
+            self.scheduleSwitchHeartbeat()
         }
+    }
+
+    /// 切换 App 触发的即时上报，带一个防抖窗口：快速 alt-tab 连切时只在切换停下来后
+    /// 发一次，把一串连切合并成一条上报（该次心跳的 switchCount 会如实带上这串的次数）。
+    /// 既让"切换后近实时出现记录"成立，又不至于每激活一次就打一个请求造成请求风暴。
+    private func scheduleSwitchHeartbeat() {
+        switchHeartbeatWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { await self?.sendHeartbeat(event: .heartbeat) }
+        }
+        switchHeartbeatWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
     /// 非破坏性读取：调用方据此判断"上次是否异常终止"，不清空状态。
@@ -432,13 +448,16 @@ final class BigDaddyClient {
         "Microsoft Edge", "Brave Browser", "Vivaldi", "Opera"
     ]
 
-    func getActiveBrowserUrl(appName: String) -> String {
-        var scriptString = ""
+    /// 生成向指定浏览器查询"当前标签页某个属性"的 AppleScript，非受支持的浏览器返回 nil。
+    /// URL 与标题在不同浏览器里的属性名不同：Chromium 系是 `URL of active tab` /
+    /// `title of active tab`，Safari 是 `URL of current tab` / `name of current tab`，
+    /// 用参数把这个差异抽出来，URL 和标题两个取数入口共用同一套浏览器识别逻辑。
+    private func browserTabQueryScript(appName: String, chromiumProperty: String, safariProperty: String) -> String? {
         if let chromium = BigDaddyClient.chromiumBrowserNames.first(where: { appName.contains($0) }) {
-            scriptString = """
+            return """
             tell application "\(chromium)"
                 if (count of windows) > 0 then
-                    return URL of active tab of first window
+                    return \(chromiumProperty) of active tab of first window
                 end if
             end tell
             return ""
@@ -446,29 +465,30 @@ final class BigDaddyClient {
         } else if appName == "Arc" {
             // "Arc" 是常见英文词/前缀（"Archive Utility""Arcade"等系统应用都包含它），
             // 子串匹配风险过高，单独用精确相等判断，不并入上面的 contains 名单。
-            scriptString = """
+            return """
             tell application "Arc"
                 if (count of windows) > 0 then
-                    return URL of active tab of first window
+                    return \(chromiumProperty) of active tab of first window
                 end if
             end tell
             return ""
             """
         } else if appName.contains("Safari") {
-            scriptString = """
+            return """
             tell application "Safari"
                 if (count of windows) > 0 then
-                    return URL of current tab of first window
+                    return \(safariProperty) of current tab of first window
                 end if
             end tell
             return ""
             """
-        } else {
-            // Firefox 等无脚本接口的浏览器：拿不到 URL，交由窗口标题反映页面
-            return ""
         }
+        // Firefox 等无脚本接口的浏览器：拿不到，交由窗口标题兜底
+        return nil
+    }
 
-        if let script = NSAppleScript(source: scriptString) {
+    private func runAppleScript(_ source: String) -> String {
+        if let script = NSAppleScript(source: source) {
             var error: NSDictionary?
             let result = script.executeAndReturnError(&error)
             if error == nil {
@@ -478,11 +498,33 @@ final class BigDaddyClient {
         return ""
     }
 
+    func getActiveBrowserUrl(appName: String) -> String {
+        guard let script = browserTabQueryScript(appName: appName, chromiumProperty: "URL", safariProperty: "URL") else { return "" }
+        return runAppleScript(script)
+    }
+
+    /// 主流浏览器当前标签页标题：走 AppleScript 自动化拿，不依赖屏幕录制/辅助功能权限。
+    /// 这是 getActiveWindowTitle 对浏览器的首选路径——见那里的注释说明为什么。
+    func getActiveBrowserTabTitle(appName: String) -> String {
+        guard let script = browserTabQueryScript(appName: appName, chromiumProperty: "title", safariProperty: "name") else { return "" }
+        return runAppleScript(script)
+    }
+
     func getActiveWindowTitle() -> String {
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return "" }
+        let appName = frontApp.localizedName ?? ""
+        // 浏览器优先走 AppleScript 拿标签页标题：下面的 CGWindowList(kCGWindowName) 与
+        // Accessibility 两条路都需要屏幕录制或辅助功能授权，dev 构建签名不稳定时经常
+        // 两者都拿不到，导致标题恒为空。而 AppleScript 自动化是另一套按目标应用逐个
+        // 授权的 TCC 权限，已经被 URL 采集用上（能拿到 URL 即证明其可用），用同一条路
+        // 取标签页标题，就能在缺屏幕录制权限时仍抓到主流浏览器的当前页面标题。
+        let browserTitle = getActiveBrowserTabTitle(appName: appName)
+        if !browserTitle.isEmpty { return browserTitle }
+
         let pid = frontApp.processIdentifier
-        // 首选 CGWindowList 的 kCGWindowName：但该字段自 macOS 10.15 起仅对持有
-        // 屏幕录制权限的进程返回，未授权时恒为空——此时回落到 Accessibility API。
+        // 非浏览器 / AppleScript 失败：首选 CGWindowList 的 kCGWindowName，但该字段自
+        // macOS 10.15 起仅对持有屏幕录制权限的进程返回，未授权时恒为空——此时回落到
+        // Accessibility API。
         let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
         if let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
             for info in windowListInfo {
