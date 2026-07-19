@@ -173,10 +173,18 @@ final class BigDaddyClient {
     /// AXObserver，覆盖面还不完整，暂不做）。
     private func startActivitySwitchTracking() {
         guard switchObserver == nil else { return }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
         switchObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
             guard let self else { return }
+            // 弹任何 NSAlert（绑定码/关于/凭据失效/退出密码……）都要求 BigDaddy 自己短暂
+            // 变成 active app（key window 的前提），不过滤的话孩子每次跟客户端自身界面
+            // 交互都会被误记成"切换到了 BigDaddy"，污染 switchCount 和审计日志。
+            if let activated = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+               activated.processIdentifier == ownPID {
+                return
+            }
             self.switchCounter.increment()
             self.scheduleSwitchHeartbeat()
         }
