@@ -916,8 +916,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.addButton(withTitle: Localization.string(zh: "确认绑定", en: "Confirm Bind"))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
 
-        // 打开即可直接输入，不用先手动点一下输入框
-        alert.window.initialFirstResponder = inputField
+        // 打开即可直接输入，不用先手动点一下输入框。同 quitWithPassword 里的说明：
+        // initialFirstResponder 会被 NSAlert 自己的展示逻辑覆盖，改成在模态运行循环里
+        // 异步抢一次焦点。
+        DispatchQueue.main.async {
+            alert.window.makeFirstResponder(inputField)
+        }
 
         if alert.runModal() == .alertFirstButtonReturn {
             let code = inputField.stringValue.trimmingCharacters(in: .whitespaces)
@@ -1058,11 +1062,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.addButton(withTitle: Localization.string(zh: "安全退出", en: "Secure Exit"))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
 
-        // 打开弹窗即可直接输入，不用先点一下第一个格子才能开始打字
-        if let firstDigitField = self.exitDigitFields.first {
-            alert.window.initialFirstResponder = firstDigitField
-        }
-
         // 初始化倒计时
         self.countdownSeconds = 300
         self.updateExitCountdownLabelText()
@@ -1077,16 +1076,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         )
         RunLoop.main.add(timer, forMode: .common)
         self.countdownTimer = timer
-        
+
+        // 打开弹窗即可直接输入，不用先点一下第一个格子才能开始打字。
+        // 之前用 alert.window.initialFirstResponder 设置，但 NSAlert 展示时会自己
+        // 决定初始 first responder（一般落在默认按钮上，便于回车直接触发），会覆盖
+        // 这个设置，实测不生效。改成在 runModal() 即将进入的模态运行循环里异步抢一次
+        // 焦点——主队列的 async 任务在 modal panel 模式下照常会被处理，这是让 NSAlert
+        // accessory view 里的控件拿到初始焦点的通用做法。
+        if let firstDigitField = self.exitDigitFields.first {
+            DispatchQueue.main.async {
+                alert.window.makeFirstResponder(firstDigitField)
+            }
+        }
+
         // 运行 Alert Modal
         let response = alert.runModal()
-        
+
         // Modal 结束，释放计时器
         self.countdownTimer?.invalidate()
         self.countdownTimer = nil
-        
+
         guard response == .alertFirstButtonReturn else { return }
-        
+
         let code = self.exitDigitFields.map { $0.stringValue }.joined()
         if code.count < 6 {
             let errorAlert = NSAlert()
@@ -1261,6 +1272,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 }
             }
         }
+    }
+
+    /// 退格键在"格子本身已经是空"的情况下不会触发 controlTextDidChange（文本压根没变），
+    /// 之前只处理了"删掉本格数字后跳到上一格"，没处理"本格已空、继续按删除键"——
+    /// 输完几位后光标自动停在下一个空格子上，这时按删除键完全没反应，必须先用鼠标点回
+    /// 上一格才能改。这里改用 doCommandBySelector 直接拦截 deleteBackward: 命令，
+    /// 跳到上一格并清空它，让退格键能一格一格连续往回删。
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard commandSelector == #selector(NSResponder.deleteBackward(_:)),
+              let field = control as? NSTextField,
+              field.stringValue.isEmpty,
+              let index = exitDigitFields.firstIndex(of: field),
+              index > 0 else {
+            return false
+        }
+        let previous = exitDigitFields[index - 1]
+        previous.stringValue = ""
+        field.window?.makeFirstResponder(previous)
+        return true
     }
 
     /// C 的裸 signal() 处理器里不允许做内存分配、发起网络请求或创建 Swift Task
