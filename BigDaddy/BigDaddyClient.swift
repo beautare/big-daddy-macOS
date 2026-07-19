@@ -80,6 +80,28 @@ struct ClientConfig: Codable, Equatable {
     }
 }
 
+/// 两次心跳之间的应用切换次数计数器：NSWorkspace 的切换通知在主线程回调递增，
+/// sendHeartbeat 在（可能是后台的）Task 里读取并清零，用锁避免读写竞争。
+final class SwitchCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    /// 取走当前计数并清零，计数从这一刻起重新累积到下一次心跳
+    func takeAndReset() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = count
+        count = 0
+        return value
+    }
+}
+
 final class BigDaddyClient {
     static var lastSharedInstance: BigDaddyClient?
 
@@ -95,6 +117,8 @@ final class BigDaddyClient {
     /// 此状态下所有签名接口都会验签失败，必须在 UI 上明确警示，引导解绑后重新绑定。
     var credentialsInvalid = false
     private var previousCrashAt: Date?
+    private let switchCounter = SwitchCounter()
+    private var switchObserver: NSObjectProtocol?
 
     init() {
         self.identity = IdentityStore.load()
@@ -137,6 +161,20 @@ final class BigDaddyClient {
         }
         try? FileManager.default.createDirectory(at: lock.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
+        startActivitySwitchTracking()
+    }
+
+    /// 前台应用切换计数：用来估算孩子在两次心跳之间的操作切换频率，辅助家长
+    /// 判断专注度。只跟踪"切到另一个 App"，不涉及同一 App 内切窗口/切标签页
+    /// （那需要给每个运行中的 App 挂 AXObserver，覆盖面还不完整，暂不做）。
+    private func startActivitySwitchTracking() {
+        guard switchObserver == nil else { return }
+        let counter = switchCounter
+        switchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
+        ) { _ in
+            counter.increment()
+        }
     }
 
     /// 非破坏性读取：调用方据此判断"上次是否异常终止"，不清空状态。
@@ -211,8 +249,19 @@ final class BigDaddyClient {
     func sendHeartbeat(event: EventType) async -> Bool {
         let version = AppVersion.current
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
-        let windowTitle = getActiveWindowTitle()
-        let activeUrl = getActiveBrowserUrl(appName: activeApp)
+        // getActiveBrowserUrl 靠 NSAppleScript 给目标浏览器发 Apple Event 并同步等回复，
+        // 没有超时保护；目标浏览器卡顿/无响应时能一直等下去。这两个调用之前直接摆在
+        // sendHeartbeat 开头、第一个 await 之前——而 sendHeartbeat 的调用方全部是
+        // Task { @MainActor in ... } 或主队列的信号处理器，函数体在第一次挂起前跟调用方
+        // 同线程执行，等于每次心跳都可能拿主线程去顶浏览器的 Apple Event 超时，
+        // 表现为整个客户端（含菜单栏图标）间歇性卡住。挪进 Task.detached 让它们跑在
+        // 后台线程，主线程不再被这个不受控的阻塞调用拖住。
+        let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
+            (self.getActiveWindowTitle(), self.getActiveBrowserUrl(appName: activeApp))
+        }.value
+        // 先取走计数并清零，即便这次心跳发送失败被塞进 PendingQueue 重试，这个区间的
+        // 切换次数也已经落进这份 body 里，不会因为重试而重复计数或者丢失。
+        let switchCount = switchCounter.takeAndReset()
 
         var body: [String: Any] = [
             "appVersion": version,
@@ -221,6 +270,7 @@ final class BigDaddyClient {
             "activeAppName": activeApp,
             "activeWindowTitle": windowTitle,
             "activeUrl": activeUrl,
+            "switchCount": switchCount,
             "previousCrashAt": previousCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
             "metadata": [
@@ -586,8 +636,12 @@ final class BigDaddyClient {
         let jpeg = compressToTargetSize(rep, startQuality: config.compressQuality)
 
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
-        let windowTitle = getActiveWindowTitle()
-        let activeUrl = getActiveBrowserUrl(appName: activeApp)
+        // 同 sendHeartbeat：把可能阻塞的 AppleScript/AX 调用放进 Task.detached，
+        // 不依赖"这里执行时已经离开主线程"这种由 ScreenCaptureKit 内部调度决定、
+        // 未来系统版本随时可能变化的隐式假设。
+        let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
+            (self.getActiveWindowTitle(), self.getActiveBrowserUrl(appName: activeApp))
+        }.value
 
         do {
             let responseData = try await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)

@@ -17,6 +17,67 @@ enum Localization {
     }
 }
 
+/// 自绘的盾牌图标：轮廓内部是 2×2 棋盘格，替代系统 SF Symbol 的纯轮廓 shield，
+/// 用于菜单栏未截图状态和各处弹窗图标。系统 SF Symbols 里没有棋盘格盾牌这个图形，
+/// 用 Bezier 路径手绘 + 裁剪填充实现，可以在任意尺寸下重新栅格化，不依赖位图资源。
+enum ShieldIcon {
+    private static let aspectRatio: CGFloat = 400.0 / 340.0 // 高/宽
+
+    static func image(pointSize: CGFloat) -> NSImage {
+        let size = NSSize(width: pointSize, height: pointSize * aspectRatio)
+        let image = NSImage(size: size)
+        image.lockFocus()
+
+        let inset = pointSize * 0.06
+        let rect = NSRect(origin: .zero, size: size).insetBy(dx: inset, dy: inset)
+        let shield = path(in: rect)
+
+        NSGraphicsContext.saveGraphicsState()
+        shield.addClip()
+        let gridCount = 2
+        let cellW = rect.width / CGFloat(gridCount)
+        let cellH = rect.height / CGFloat(gridCount)
+        NSColor.black.setFill()
+        for row in 0..<gridCount {
+            for col in 0..<gridCount where (row + col) % 2 == 0 {
+                NSRect(x: rect.minX + CGFloat(col) * cellW, y: rect.minY + CGFloat(row) * cellH,
+                       width: cellW, height: cellH).fill()
+            }
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSColor.black.setStroke()
+        shield.lineWidth = pointSize * 0.09
+        shield.stroke()
+
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
+    }
+
+    private static func path(in rect: NSRect) -> NSBezierPath {
+        let w = rect.width, h = rect.height
+        let x0 = rect.minX, y0 = rect.minY
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: x0 + 0.16 * w, y: y0 + 1.0 * h))
+        path.line(to: NSPoint(x: x0 + 0.84 * w, y: y0 + 1.0 * h))
+        path.curve(to: NSPoint(x: x0 + 1.0 * w, y: y0 + 0.68 * h),
+                   controlPoint1: NSPoint(x: x0 + 0.96 * w, y: y0 + 1.0 * h),
+                   controlPoint2: NSPoint(x: x0 + 1.0 * w, y: y0 + 0.86 * h))
+        path.curve(to: NSPoint(x: x0 + 0.5 * w, y: y0),
+                   controlPoint1: NSPoint(x: x0 + 1.0 * w, y: y0 + 0.32 * h),
+                   controlPoint2: NSPoint(x: x0 + 0.85 * w, y: y0 + 0.12 * h))
+        path.curve(to: NSPoint(x: x0, y: y0 + 0.68 * h),
+                   controlPoint1: NSPoint(x: x0 + 0.15 * w, y: y0 + 0.12 * h),
+                   controlPoint2: NSPoint(x: x0, y: y0 + 0.32 * h))
+        path.curve(to: NSPoint(x: x0 + 0.16 * w, y: y0 + 1.0 * h),
+                   controlPoint1: NSPoint(x: x0, y: y0 + 0.86 * h),
+                   controlPoint2: NSPoint(x: x0 + 0.04 * w, y: y0 + 1.0 * h))
+        path.close()
+        return path
+    }
+}
+
 /// 绑定码弹窗的 runModal 是从主 actor 任务内部调起的，这种弹窗期间主队列不排空
 /// （并非所有 modal 都如此——从菜单动作直接调起的弹窗主队列照常排空，机制见
 /// showDeviceBindCode 注释），后台任务的结果不能用 Task { @MainActor } /
@@ -393,20 +454,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let on = client.config.screenshotEnabled
         let missingPermission = on && !checkScreenRecordingPermission()
         if #available(macOS 11.0, *) {
-            let symbol: String
             let desc: String
+            let image: NSImage?
             if capturing {
-                symbol = "camera"; desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
+                image = NSImage(systemSymbolName: "camera", accessibilityDescription: nil)
+                desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
             } else if missingPermission {
-                symbol = "exclamationmark.triangle"
+                image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
                 desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限", en: "BigDaddy screenshots on but missing system permission")
             } else if on {
-                symbol = "eye"; desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
+                image = NSImage(systemSymbolName: "eye", accessibilityDescription: nil)
+                desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
             } else {
-                symbol = "shield"; desc = "BigDaddy"
+                image = ShieldIcon.image(pointSize: 16)
+                desc = "BigDaddy"
             }
-            if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: desc) {
+            if let image {
                 image.isTemplate = true
+                image.accessibilityDescription = desc
                 button.image = image
                 button.title = ""
                 return
@@ -594,12 +659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 客户端没有独立的 .icns，NSAlert 默认回落到系统通用可执行文件图标，观感像
     /// "来路不明的程序"。绑定相关的关键弹窗统一用盾牌图标。
     private func applyShieldIcon(to alert: NSAlert) {
-        if #available(macOS 11.0, *) {
-            if let image = NSImage(systemSymbolName: "shield", accessibilityDescription: "BigDaddy") {
-                image.isTemplate = true
-                alert.icon = image
-            }
-        }
+        alert.icon = ShieldIcon.image(pointSize: 64)
     }
 
     @objc private func showDeviceBindCode() {
