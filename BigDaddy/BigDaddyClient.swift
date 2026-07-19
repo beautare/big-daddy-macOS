@@ -16,6 +16,7 @@ enum EventType: String, Codable {
     case forceKill = "FORCE_KILL"
     case configUpdated = "CONFIG_UPDATED"
     case commandAck = "COMMAND_ACK"
+    case appSwitch = "APP_SWITCH"
 }
 
 struct DeviceIdentity {
@@ -187,7 +188,9 @@ final class BigDaddyClient {
     private func scheduleSwitchHeartbeat() {
         switchHeartbeatWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            Task { await self?.sendHeartbeat(event: .heartbeat) }
+            // 用 APP_SWITCH 事件而非 HEARTBEAT，让家长在审计日志里能把"切换应用"与
+            // 周期性心跳区分开；后端 deriveStatus 仍把它当活跃信号（→ ONLINE）。
+            Task { await self?.sendHeartbeat(event: .appSwitch) }
         }
         switchHeartbeatWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
