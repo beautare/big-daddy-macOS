@@ -4,6 +4,8 @@
 <dict>
   <key>CFBundleExecutable</key>
   <string>BigDaddy</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>vip.bigdaddy.monitor</string>
   <key>CFBundleName</key>
