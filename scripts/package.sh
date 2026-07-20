@@ -45,7 +45,7 @@ BUILD_NUMBER=$(git -C "${ROOT_DIR}" rev-list --count HEAD 2>/dev/null || echo "1
 echo "Building BigDaddy version ${VERSION} (Build ${BUILD_NUMBER}, arch=${ARCH})..."
 
 rm -rf "${BUILD_DIR}" "${DIST_DIR}"
-mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources" "${DIST_DIR}"
+mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources" "${APP_DIR}/Contents/Frameworks" "${DIST_DIR}"
 
 swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}"
 BIN_DIR=$(swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}" --show-bin-path)
@@ -55,6 +55,19 @@ cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
 # 应用图标（由 scripts/generate_appicon.swift 生成后提交进仓库）
 cp "${ROOT_DIR}/BigDaddy/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 
+# 嵌入 Sparkle.framework（动态框架必须放在 Contents/Frameworks/ 下，@rpath 才能找到）
+SPARKLE_FW="${BIN_DIR}/Sparkle.framework"
+if [[ -d "${SPARKLE_FW}" ]]; then
+  cp -R "${SPARKLE_FW}" "${APP_DIR}/Contents/Frameworks/"
+else
+  echo "ERROR: Sparkle.framework not found at ${SPARKLE_FW}" >&2
+  exit 1
+fi
+
+# 修正 rpath：SPM 构建的二进制默认 rpath 指向构建目录，
+# 独立 .app 需要指向 Contents/Frameworks/
+install_name_tool -add_rpath @executable_path/../Frameworks "${APP_DIR}/Contents/MacOS/BigDaddy" 2>/dev/null || true
+
 # 临时向打包的 Info.plist 写入版本号、构建号和生产 API 地址，代码库中的源文件保持不变
 # （源文件里的 localhost:8009 只用于本地 `swift run` 开发调试）
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "${APP_DIR}/Contents/Info.plist"
@@ -62,9 +75,12 @@ cp "${ROOT_DIR}/BigDaddy/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.ic
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAPIBaseURL ${BIGDADDY_API_BASE_URL:-https://proxy-ko.bigdaddy.mom/api/v1}" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyDashboardBaseURL ${BIGDADDY_DASHBOARD_BASE_URL:-https://dashboard.bigdaddy.mom}" "${APP_DIR}/Contents/Info.plist"
 
+# 签名顺序：先签内嵌的 framework（含其内部 XPC Services），再签外层 app bundle
 if [[ "${CODESIGN_IDENTITY}" == "-" ]]; then
+  codesign --force --deep --sign "-" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
   codesign --force --sign "-" "${APP_DIR}"
 else
+  codesign --force --deep --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
   codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" --entitlements "${ROOT_DIR}/entitlements.plist" "${APP_DIR}"
 fi
 
