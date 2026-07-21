@@ -104,7 +104,7 @@ final class BindTokenMailbox: @unchecked Sendable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, @MainActor SPUStandardUserDriverDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
@@ -133,11 +133,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var lastBindingSyncAt: Date = .distantPast
     /// 绑定检测快轮询任务（展示绑定码/二维码后启动的一段高频探测），持有引用以便取消
     private var bindDetectionTask: Task<Void, Never>?
-    // startingUpdater: true 后立即开始按 SUScheduledCheckInterval 后台检查；
-    // 是否自动检查由 Sparkle 首次运行时弹出的系统对话框询问用户（Info.plist 未设置
-    // SUEnableAutomaticChecks，交由 Sparkle 自行询问并记住用户的选择）。
+    /// 后台静默发现并下载完成的更新是否已就绪：SPUStandardUserDriverDelegate 在后台
+    /// 检查命中新版本时置位（见 standardUserDriverWillHandleShowingUpdate），驱动"关于"
+    /// 面板里额外冒出的高亮"立即安装"按钮；本身不弹任何窗口。
+    private var updateReadyToInstall = false
+    /// "关于"窗口（自绘 NSWindow，见 showAboutWindow）当前是否已打开，再次点击菜单项时
+    /// 先关掉旧的再重建，避免残留一个数据已过期的旧窗口。
+    private weak var aboutWindow: NSWindow?
+    /// 与"关于"窗口里按钮的 tag 一一对应，点击时按下标取出对应动作执行（见 aboutActionTapped）。
+    private var aboutWindowActions: [() -> Void] = []
+    // startingUpdater: true 后立即开始按 SUScheduledCheckInterval（Info.plist，当前 1 天）
+    // 后台检查；SUEnableAutomaticChecks/SUAutomaticallyUpdate 已在 Info.plist 里直接置为
+    // true，跳过 Sparkle 首次运行询问用户的对话框，检查与静默下载都无条件自动进行。
+    // userDriverDelegate 指向 self：实现 SPUStandardUserDriverDelegate 的"gentle reminders"
+    // 接口（standardUserDriverShouldHandleShowingScheduledUpdate 等），让后台发现/下载
+    // 更新的过程完全不弹窗，只在 standardUserDriverWillHandleShowingUpdate 里记录"已就绪"
+    // 状态；用户手动点"检查更新…"时不受此限，Sparkle 保证照常展示标准安装流程。
     private lazy var updaterController = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: self
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -256,18 +269,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             )
             statusItem.isEnabled = false
             menu.addItem(statusItem)
-
-            // 常驻可见提示：截图是否开启直接关系孩子的隐私，必须留在一级菜单，
-            // 不能收进"关于"窗口里——不能让这条信息需要"多点一步"才看得到。
-            let screenshotStateItem = NSMenuItem(
-                title: client.config.screenshotEnabled
-                    ? Localization.string(zh: "📸 截图已开启：家长可远程截屏（本机会记录）",
-                                          en: "📸 Screenshots ON: parent can capture (logged on this Mac)")
-                    : Localization.string(zh: "截图: 未开启", en: "Screenshots: OFF"),
-                action: nil, keyEquivalent: ""
-            )
-            screenshotStateItem.isEnabled = false
-            menu.addItem(screenshotStateItem)
             menu.addItem(.separator())
         } else {
             let statusItem = NSMenuItem(
@@ -318,64 +319,211 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// "关于"窗口：把版本、当前配置摘要、心跳、截图倒计时等只读信息，以及守护说明/
-    /// 导出记录/检查更新三个次要操作集中在一处，而不是平铺成一堆一级菜单项。
+    /// 导出记录/检查更新等次要操作集中在一处，而不是平铺成一堆一级菜单项。
+    ///
+    /// 改用普通 NSWindow 而不是 NSAlert：NSAlert 的图标+标题是钉死在左上角的固定布局
+    /// 区块，就算把 icon 换成透明占位图、messageText 清空，那块区域仍然会保留原本的
+    /// 高度，在 LOGO 上方留出一截无法消除的空白（无公开 API 能改这个内部布局）。换成
+    /// 自己的窗口后，LOGO/标题/信息行/按钮全部在同一个 NSStackView 里从上到下排列，
+    /// 没有任何隐藏的保留区域，居中和间距完全由 createAboutContentView 决定。
     @objc private func showAboutWindow() {
-        let alert = NSAlert()
-        alert.messageText = "BigDaddy"
-        applyShieldIcon(to: alert)
+        aboutWindow?.close()
 
-        var lines: [String] = []
+        var actions: [(title: String, handler: () -> Void, prominent: Bool)] = []
+        if client.config.bound && client.config.screenshotEnabled {
+            actions.append((Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"), sendScreenshotNow, false))
+        }
+        actions.append((Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"), showTransparencyInfo, false))
+        actions.append((Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"), exportAuditLog, false))
+        // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字），
+        // 点击复用 checkForUpdates()——文件已经下载好，Sparkle 会直接跳到"安装并重启"确认。
+        if updateReadyToInstall {
+            actions.append((Localization.string(zh: "发现新版本，点击安装", en: "Update Ready — Click to Install"), checkForUpdates, true))
+        }
+        actions.append((Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates, false))
+        actions.append((Localization.string(zh: "关闭", en: "Close"), {}, false))
+        aboutWindowActions = actions.map { $0.handler }
+
+        let contentView = createAboutContentView(actions: actions)
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: contentView.frame.size),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "BigDaddy"
+        window.isReleasedWhenClosed = false
+        window.contentView = contentView
+        window.center()
+        aboutWindow = window
+
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    /// "关于"窗口按钮的统一响应入口：tag 是按钮在 actions 数组里的下标，关掉窗口后
+    /// 再执行对应动作，动作里如果又要弹别的窗口/弹窗，不会跟已关闭的"关于"窗口打架。
+    @objc private func aboutActionTapped(_ sender: NSButton) {
+        let index = sender.tag
+        sender.window?.close()
+        if index >= 0 && index < aboutWindowActions.count {
+            aboutWindowActions[index]()
+        }
+    }
+
+    /// "关于"窗口的内容视图：LOGO、标题、只读信息行、按钮全部放进同一个纵向 NSStackView，
+    /// 顶部 LOGO/标题靠 alignment = .centerX 在整个宽度内水平居中，信息行/按钮撑满宽度、
+    /// label:value 两栏纵向对齐。信息行只在对应信息"当下有意义"时才出现——截图未开启
+    /// 就不提截屏间隔，没配置通知渠道就不提通知渠道，而不是展示一个此刻无意义的占位值。
+    private func createAboutContentView(actions: [(title: String, handler: () -> Void, prominent: Bool)]) -> NSView {
+        let width: CGFloat = Localization.isChinese ? 300 : 340
+        let labelWidth: CGFloat = Localization.isChinese ? 76 : 132
+        let rowHeight: CGFloat = 20
+        let edgePadding: CGFloat = 24
+
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .centerX
+        container.spacing = 10
+        container.edgeInsets = NSEdgeInsets(top: edgePadding, left: edgePadding, bottom: edgePadding, right: edgePadding)
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let logoImage = ShieldIcon.image(pointSize: 46)
+        let logo = NSImageView()
+        logo.image = logoImage
+        logo.imageScaling = .scaleProportionallyUpOrDown
+        logo.contentTintColor = .labelColor // 模板图随浅/深色模式自适应
+        logo.translatesAutoresizingMaskIntoConstraints = false
+        logo.widthAnchor.constraint(equalToConstant: logoImage.size.width).isActive = true
+        logo.heightAnchor.constraint(equalToConstant: logoImage.size.height).isActive = true
+
+        let titleLabel = NSTextField(labelWithString: "BigDaddy")
+        titleLabel.font = NSFont.boldSystemFont(ofSize: 20)
+        titleLabel.textColor = .labelColor
+        titleLabel.alignment = .center
+
+        container.addArrangedSubview(logo)
+        container.addArrangedSubview(titleLabel)
+        container.setCustomSpacing(18, after: titleLabel)
+
+        for (label, value) in aboutInfoRows() {
+            container.addArrangedSubview(makeInfoRow(label: label, value: value, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
+        }
+        if let lastRow = container.arrangedSubviews.last {
+            container.setCustomSpacing(20, after: lastRow)
+        }
+
+        for (index, action) in actions.enumerated() {
+            let button = NSButton(title: action.title, target: self, action: #selector(aboutActionTapped(_:)))
+            button.tag = index
+            button.bezelStyle = .rounded
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.widthAnchor.constraint(equalToConstant: width).isActive = true
+            if action.prominent {
+                // 蓝底白字：普通按钮手动设 bezelColor 只染背景、标题仍是黑色（浅色模式下
+                // 对比度不足），这里显式给白色 attributedTitle 配 systemBlue 底色，且不
+                // 随系统强调色变化（controlAccentColor 可能被用户改成浅色导致看不清）。
+                button.bezelColor = .systemBlue
+                button.attributedTitle = NSAttributedString(
+                    string: action.title,
+                    attributes: [
+                        .foregroundColor: NSColor.white,
+                        .font: button.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+                    ]
+                )
+            }
+            container.addArrangedSubview(button)
+        }
+        // 最后一个按钮固定是"关闭"：Esc 键直接关闭面板，不需要挨个数按钮再点。
+        (container.arrangedSubviews.last as? NSButton)?.keyEquivalent = "\u{1b}"
+
+        let fittingHeight = container.fittingSize.height
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: width + edgePadding * 2, height: fittingHeight))
+        parentView.addSubview(container)
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: parentView.topAnchor),
+            container.bottomAnchor.constraint(equalTo: parentView.bottomAnchor),
+            container.leadingAnchor.constraint(equalTo: parentView.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: parentView.trailingAnchor)
+        ])
+        return parentView
+    }
+
+    /// "关于"面板只读信息行的数据源：每一行只在对应信息"当下有意义"时才加入。
+    private func aboutInfoRows() -> [(String, String)] {
+        var rows: [(String, String)] = []
         if client.config.bound {
-            lines.append(Localization.string(zh: "状态：已受保护", en: "Status: Protected"))
-            lines.append(client.config.screenshotEnabled
-                ? Localization.string(zh: "截图：已开启（家长可远程截屏）", en: "Screenshots: ON (parent can capture)")
-                : Localization.string(zh: "截图：未开启", en: "Screenshots: OFF"))
-            lines.append(Localization.string(
-                zh: "最近心跳：\(client.lastHeartbeatDescription)",
-                en: "Last heartbeat: \(client.lastHeartbeatDescription)"
+            rows.append((Localization.string(zh: "状态", en: "Status"),
+                         Localization.string(zh: "已受保护", en: "Protected")))
+            rows.append((
+                Localization.string(zh: "截图", en: "Screenshots"),
+                client.config.screenshotEnabled
+                    ? Localization.string(zh: "已开启（家长可远程截屏）", en: "ON (parent can capture)")
+                    : Localization.string(zh: "未开启", en: "OFF")
             ))
-            if client.config.screenshotEnabled, let fireDate = screenshotTimer?.fireDate {
-                let remaining = max(0, Int(fireDate.timeIntervalSinceNow))
-                lines.append(Localization.string(
-                    zh: String(format: "下次截屏：%02d:%02d 后", remaining / 60, remaining % 60),
-                    en: String(format: "Next screenshot in %02d:%02d", remaining / 60, remaining % 60)
+            rows.append((Localization.string(zh: "最近心跳", en: "Last heartbeat"), client.lastHeartbeatDescription))
+            if client.config.screenshotEnabled {
+                if let fireDate = screenshotTimer?.fireDate {
+                    let remaining = max(0, Int(fireDate.timeIntervalSinceNow))
+                    rows.append((
+                        Localization.string(zh: "下次截屏", en: "Next screenshot"),
+                        String(format: Localization.string(zh: "%02d:%02d 后", en: "in %02d:%02d"),
+                               remaining / 60, remaining % 60)
+                    ))
+                }
+                rows.append((
+                    Localization.string(zh: "截屏间隔", en: "Interval"),
+                    Localization.string(zh: "\(client.config.screenshotIntervalMins) 分钟",
+                                        en: "\(client.config.screenshotIntervalMins) min")
                 ))
             }
             let channels = client.config.notificationChannels
-            let hasChannel = !(channels.email ?? "").isEmpty || !(channels.telegramChatId ?? "").isEmpty
-            let channelDesc = hasChannel
-                ? Localization.string(zh: "已配置", en: "configured")
-                : Localization.string(zh: "未配置", en: "not configured")
-            lines.append(Localization.string(
-                zh: "当前配置：截屏间隔 \(client.config.screenshotIntervalMins) 分钟 · 通知渠道\(channelDesc)",
-                en: "Config: every \(client.config.screenshotIntervalMins) min · channel \(channelDesc)"
-            ))
+            var channelNames: [String] = []
+            if !(channels.email ?? "").isEmpty { channelNames.append(Localization.string(zh: "邮件", en: "Email")) }
+            if !(channels.telegramChatId ?? "").isEmpty { channelNames.append("Telegram") }
+            if !(channels.whatsappPhone ?? "").isEmpty { channelNames.append("WhatsApp") }
+            if !channelNames.isEmpty {
+                rows.append((
+                    Localization.string(zh: "通知渠道", en: "Notify via"),
+                    channelNames.joined(separator: Localization.string(zh: "、", en: ", "))
+                ))
+            }
         } else {
-            lines.append(Localization.string(zh: "状态：尚未绑定家长账号", en: "Status: Unbound"))
+            rows.append((Localization.string(zh: "状态", en: "Status"),
+                         Localization.string(zh: "尚未绑定家长账号", en: "Unbound")))
         }
-        lines.append(Localization.string(zh: "版本 \(AppVersion.current)", en: "Version \(AppVersion.current)"))
-        alert.informativeText = lines.joined(separator: "\n")
+        rows.append((Localization.string(zh: "版本", en: "Version"), AppVersion.current))
+        return rows
+    }
 
-        // 按钮与动作一一对应放进同一个数组，用响应值减去起始偏移量做下标，不用再对着
-        // .alertFirstButtonReturn/.alertSecondButtonReturn 数按钮是第几个——截图测试
-        // 这一项是否出现全看 showsTestScreenshot，硬编码序号很容易在两条分支间踩坑。
-        var actions: [(title: String, handler: () -> Void)] = []
-        if client.config.bound && client.config.screenshotEnabled {
-            actions.append((Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"), sendScreenshotNow))
-        }
-        actions.append((Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"), showTransparencyInfo))
-        actions.append((Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"), exportAuditLog))
-        actions.append((Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates))
-        for action in actions {
-            alert.addButton(withTitle: action.title)
-        }
-        alert.addButton(withTitle: Localization.string(zh: "关闭", en: "Close"))
+    /// 单条 label:value 信息行：label 固定宽度右对齐、value 左对齐，靠固定 label 宽度
+    /// 让多行的冒号/数值纵向对齐成两栏。
+    private func makeInfoRow(label: String, value: String, width: CGFloat, labelWidth: CGFloat, rowHeight: CGFloat) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
+        row.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
 
-        let response = alert.runModal()
-        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-        if index >= 0 && index < actions.count {
-            actions[index].handler()
-        }
+        let labelField = NSTextField(labelWithString: label)
+        labelField.font = NSFont.systemFont(ofSize: 12)
+        labelField.textColor = .secondaryLabelColor
+        labelField.alignment = .right
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        labelField.widthAnchor.constraint(equalToConstant: labelWidth).isActive = true
+
+        let valueField = NSTextField(labelWithString: value)
+        valueField.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        valueField.textColor = .labelColor
+        valueField.alignment = .left
+        valueField.lineBreakMode = .byTruncatingTail
+        valueField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        row.addArrangedSubview(labelField)
+        row.addArrangedSubview(valueField)
+        return row
     }
 
     /// 未绑定态的合并入口：先问清楚"哪种方式"，再分派到对应的原有弹窗，
@@ -1013,6 +1161,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     @objc private func checkForUpdates() {
         updaterController.checkForUpdates(nil)
+    }
+
+    // MARK: - SPUStandardUserDriverDelegate（后台静默更新的 gentle reminders）
+
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    /// 后台/计划内检查发现新版本时，是否交给 Sparkle 标准界面弹窗展示——返回 false，
+    /// 改由下面的 standardUserDriverWillHandleShowingUpdate 自行处理（也就是什么都不弹）。
+    /// 这个开关只对后台触发的检查生效，用户手动点"检查更新…"永远走标准弹窗（Sparkle 保证，
+    /// 见该方法文档：This method is not called for user-initiated update checks）。
+    func standardUserDriverShouldHandleShowingScheduledUpdate(
+        _ update: SUAppcastItem, andInImmediateFocus immediateFocus: Bool
+    ) -> Bool {
+        false
+    }
+
+    /// 上面返回 false 后，Sparkle 在这里告知"这次不由它弹窗"：下载完成（.downloaded）
+    /// 或已开始静默安装（.installing）时置位 updateReadyToInstall，下次打开"关于"面板
+    /// 就会多出一个高亮的"发现新版本，点击安装"按钮；点击后复用 checkForUpdates()，
+    /// 因为文件已经下载好，Sparkle 会直接跳到"安装并重启"确认，不会重新下载。
+    func standardUserDriverWillHandleShowingUpdate(
+        _ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem, state: SPUUserUpdateState
+    ) {
+        guard !handleShowingUpdate else { return }
+        if state.stage == .downloaded || state.stage == .installing {
+            updateReadyToInstall = true
+        }
     }
 
     /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停

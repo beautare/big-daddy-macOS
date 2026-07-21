@@ -37,5 +37,12 @@
   <string>+LI1alzpb3qC3FratMxA0qd+C4cDw4ElhV0NPh1U/+4=</string>
   <key>SUScheduledCheckInterval</key>
   <integer>86400</integer>
+  <!-- 显式声明这两项，跳过 Sparkle 首次运行时"是否自动检查更新"的系统询问对话框，
+       后台按 SUScheduledCheckInterval 无条件检查并静默下载；是否弹窗展示由
+       AppDelegate 里的 SPUStandardUserDriverDelegate（gentle reminders）接管。 -->
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+  <key>SUAutomaticallyUpdate</key>
+  <true/>
 </dict>
 </plist>
