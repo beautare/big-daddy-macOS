@@ -672,7 +672,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             await client.register()
             await MainActor.run {
                 let fingerprint = client.identity.fingerprint
-                let initialToken = client.bindToken ?? "000000"
+                guard let initialToken = client.bindToken else {
+                    let errorAlert = NSAlert()
+                    errorAlert.alertStyle = .warning
+                    errorAlert.messageText = Localization.string(zh: "无法获取绑定码", en: "Cannot get bind code")
+                    errorAlert.informativeText = Localization.string(
+                        zh: "请检查网络连接后重试。",
+                        en: "Please check your network connection and try again."
+                    )
+                    self.applyShieldIcon(to: errorAlert)
+                    errorAlert.runModal()
+                    return
+                }
                 let alert = NSAlert()
                 alert.messageText = Localization.string(zh: "设备绑定验证", en: "Device Binding Verification")
                 alert.informativeText = Localization.string(
@@ -767,6 +778,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         digitsStack.orientation = .horizontal
         digitsStack.spacing = 8
         digitsStack.alignment = .centerY
+        digitsStack.distribution = .fill
+        // 不让 digitsStack 被 container 拉满宽度，保持内容固有尺寸居中
+        digitsStack.setHuggingPriority(.required, for: .horizontal)
         
         self.digitLabels.removeAll()
         
@@ -881,7 +895,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let mailbox = bindTokenMailbox
         Task.detached { [client = self.client] in
             await client.register()
-            mailbox.put(client.bindToken ?? "000000")
+            if let token = client.bindToken {
+                mailbox.put(token)
+            }
         }
     }
 
