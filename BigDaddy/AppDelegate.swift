@@ -893,10 +893,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // DispatchQueue.main 送回界面。detached 任务只负责拿新码并写入信箱，
         // 应用到 UI 由下一次 tick 完成。
         let mailbox = bindTokenMailbox
+        let oldToken = self.client.bindToken
         Task.detached { [client = self.client] in
             await client.register()
-            if let token = client.bindToken {
+            let newToken = client.bindToken
+            // 只有 token 真正发生变化才视为刷新成功；register 失败时 bindToken 不会被清空，
+            // 仍保持旧值，此时不应把过期的旧 token 当作新 token 重新展示。
+            // 刷新失败时也需要写入 mailbox（空字符串），否则 bindTokenRefreshing 永远为 true，
+            // UI 倒计时卡死。
+            if let token = newToken, token != oldToken {
                 mailbox.put(token)
+            } else {
+                // 刷新失败：写空串让 tick 解除 refreshing 状态并复位倒计时，
+                // 界面保留旧的 token 显示（虽然可能已过期，但优于卡死）
+                mailbox.put(oldToken ?? "")
             }
         }
     }
@@ -1343,9 +1353,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         client.hasScreenRecordingAccess()
     }
 
-    private func createPermissionCheckerView(hasAccessibility: Bool, hasScreenCapture: Bool) -> NSView {
+    private func createPermissionCheckerView(hasAccessibility: Bool) -> NSView {
         // 创建具有明确 frame 的普通 NSView 作为最外层容器，撑开 NSAlert 的 accessoryView 空间
-        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 120))
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 60))
         
         let container = NSStackView()
         container.orientation = .vertical
@@ -1375,18 +1385,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             action: #selector(openAccessibilitySettings)
         )
         container.addArrangedSubview(accRow)
-        
-        // 屏幕录制行
-        let screenRow = createPermissionRow(
-            title: Localization.string(zh: "屏幕录制权限", en: "Screen Recording Permission"),
-            description: Localization.string(
-                zh: "用于定时捕捉屏幕图像以上报至网页控制端",
-                en: "Periodically capture screenshots for parental dashboard"
-            ),
-            isGranted: hasScreenCapture,
-            action: #selector(openScreenRecordingSettings)
-        )
-        container.addArrangedSubview(screenRow)
         
         return parentView
     }
@@ -1451,20 +1449,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     private func checkAndRequestPermissions() -> Bool {
         let hasAccessibility = AXIsProcessTrustedWithOptions(nil)
-        let hasScreenCapture = checkScreenRecordingPermission()
         
-        if hasAccessibility && hasScreenCapture {
+        if hasAccessibility {
             return true
         }
         
         let alert = NSAlert()
-        alert.messageText = Localization.string(zh: "需要系统权限", en: "System Permissions Required")
+        alert.messageText = Localization.string(zh: "需要系统辅助功能权限", en: "Accessibility Permission Required")
         alert.informativeText = Localization.string(
-            zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要以下权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
-            en: "To protect your child, BigDaddy needs the following permissions. Click 'Authorize' to grant access in System Settings, then click 'I've enabled, continue'."
+            zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要辅助功能权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
+            en: "To protect your child, BigDaddy needs Accessibility permission. Click 'Authorize' to grant access in System Settings, then click 'I've enabled, continue'."
         )
         
-        let accessory = createPermissionCheckerView(hasAccessibility: hasAccessibility, hasScreenCapture: hasScreenCapture)
+        let accessory = createPermissionCheckerView(hasAccessibility: hasAccessibility)
         alert.accessoryView = accessory
         
         alert.addButton(withTitle: Localization.string(zh: "我已开启，继续绑定", en: "I've enabled, continue"))
@@ -1472,24 +1469,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
-            let hasAccessibilityNow = AXIsProcessTrustedWithOptions(nil)
-            let hasScreenCaptureNow = checkScreenRecordingPermission()
-            
-            if hasAccessibilityNow && !hasScreenCaptureNow {
-                let restartAlert = NSAlert()
-                restartAlert.messageText = Localization.string(zh: "需要重启应用生效", en: "Restart Required")
-                restartAlert.informativeText = Localization.string(
-                    zh: "如果您已在系统设置中允许了屏幕录制权限，请点击“重启应用”使其生效；否则请点击“返回”先去授权。",
-                    en: "If you have enabled screen recording in System Settings, click 'Restart App' to apply it; otherwise click 'Back' to authorize first."
-                )
-                restartAlert.addButton(withTitle: Localization.string(zh: "重启应用", en: "Restart App"))
-                restartAlert.addButton(withTitle: Localization.string(zh: "返回", en: "Back"))
-                
-                if restartAlert.runModal() == .alertFirstButtonReturn {
-                    restartApplication()
-                }
-            }
-            
             // 家长配置好后点击“继续”，递归刷新自检状态
             return checkAndRequestPermissions()
         }
