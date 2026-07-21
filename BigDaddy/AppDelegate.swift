@@ -179,9 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         scheduleTimers()
         print("BigDaddy: timers scheduled")
         Task {
-            print("BigDaddy: async task background register started")
-            await client.register()
-            print("BigDaddy: async task background config refresh started")
+            print("BigDaddy: async task background started")
             let configChanged = await client.refreshConfig()
             print("BigDaddy: async task background heartbeat sending started")
             // 本次启动永远是 START 事件；如果检测到上次异常终止，通过
