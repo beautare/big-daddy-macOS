@@ -426,6 +426,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 }
                 let changed = self.client.credentialsInvalid ? false : await self.client.refreshConfig()
                 if self.client.config.bound {
+                    // 绑定成功：立即发送一次心跳，让后端即时感知设备上线
+                    await self.client.sendHeartbeat(event: .start)
                     await MainActor.run {
                         self.scheduleTimers()
                         self.rebuildMenu()
@@ -955,6 +957,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let success = try await client.bindWithCode(code)
                     if success {
                         _ = try await client.refreshConfig()
+                        // 绑定成功：立即发送一次心跳，让后端即时感知设备上线
+                        await client.sendHeartbeat(event: .start)
                         rebuildMenu()
                         scheduleTimers()
                         await MainActor.run {
