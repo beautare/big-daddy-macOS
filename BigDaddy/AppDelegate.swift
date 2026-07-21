@@ -104,7 +104,7 @@ final class BindTokenMailbox: @unchecked Sendable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, @MainActor SPUStandardUserDriverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, SPUStandardUserDriverDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
@@ -1164,14 +1164,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     // MARK: - SPUStandardUserDriverDelegate（后台静默更新的 gentle reminders）
+    //
+    // Sparkle 从任意线程回调这几个方法，协议要求因此是 nonisolated；AppDelegate 整体是
+    // @MainActor，nonisolated 方法不能直接读写 @MainActor 隔离的存储属性，需要状态变更的
+    // 那个方法用 Task { @MainActor in } 跳回主线程再赋值（见 standardUserDriverWillHandleShowingUpdate）。
+    // （这里不用 Swift 较新版本才支持的"隔离一致性"写法 `@MainActor SPUStandardUserDriverDelegate`，
+    // 是因为 CI 的工具链版本还不认识这个语法，会直接编译失败——nonisolated + Task 跳转是
+    // 更通用、旧工具链也能编译的做法。）
 
-    var supportsGentleScheduledUpdateReminders: Bool { true }
+    nonisolated var supportsGentleScheduledUpdateReminders: Bool { true }
 
     /// 后台/计划内检查发现新版本时，是否交给 Sparkle 标准界面弹窗展示——返回 false，
     /// 改由下面的 standardUserDriverWillHandleShowingUpdate 自行处理（也就是什么都不弹）。
     /// 这个开关只对后台触发的检查生效，用户手动点"检查更新…"永远走标准弹窗（Sparkle 保证，
     /// 见该方法文档：This method is not called for user-initiated update checks）。
-    func standardUserDriverShouldHandleShowingScheduledUpdate(
+    nonisolated func standardUserDriverShouldHandleShowingScheduledUpdate(
         _ update: SUAppcastItem, andInImmediateFocus immediateFocus: Bool
     ) -> Bool {
         false
@@ -1181,12 +1188,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 或已开始静默安装（.installing）时置位 updateReadyToInstall，下次打开"关于"面板
     /// 就会多出一个高亮的"发现新版本，点击安装"按钮；点击后复用 checkForUpdates()，
     /// 因为文件已经下载好，Sparkle 会直接跳到"安装并重启"确认，不会重新下载。
-    func standardUserDriverWillHandleShowingUpdate(
+    nonisolated func standardUserDriverWillHandleShowingUpdate(
         _ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem, state: SPUUserUpdateState
     ) {
         guard !handleShowingUpdate else { return }
-        if state.stage == .downloaded || state.stage == .installing {
-            updateReadyToInstall = true
+        guard state.stage == .downloaded || state.stage == .installing else { return }
+        Task { @MainActor in
+            self.updateReadyToInstall = true
         }
     }
 
