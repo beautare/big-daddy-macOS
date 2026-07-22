@@ -92,13 +92,36 @@ ln -s /Applications "${STAGING_DIR}/Applications"
 
 DMG_PATH="${DIST_DIR}/BigDaddy-v${VERSION}${DMG_SUFFIX}.dmg"
 
-hdiutil create \
-  -srcfolder "${STAGING_DIR}" \
-  -volname "${VOLNAME}" \
-  -fs HFS+ \
-  -fsargs "-c c=64,a=16,e=16" \
-  -format UDZO \
-  "${DMG_PATH}"
+# hdiutil create 在 CI 上偶发 "Resource busy"：codesign 刚签完名的 .app 会被 Spotlight
+# (mds/mdworker) 短暂加锁索引，hdiutil 这时候去读同一批文件就会撞上——纯时序竞争，不是
+# 确定性 bug，重试几次通常就能过。universal 架构因为要同时打包 arm64+x86_64、体积更大、
+# 拷贝签名耗时更长，撞上这个窗口的概率也更高，实测确认过重试有效。
+hdiutil_create_with_retry() {
+  local max_attempts=5
+  local delay=5
+  local attempt=1
+  while true; do
+    rm -f "${DMG_PATH}" # 失败的尝试可能留下部分写入的文件，重试前清掉避免 "File exists"
+    if hdiutil create \
+      -srcfolder "${STAGING_DIR}" \
+      -volname "${VOLNAME}" \
+      -fs HFS+ \
+      -fsargs "-c c=64,a=16,e=16" \
+      -format UDZO \
+      "${DMG_PATH}"; then
+      return 0
+    fi
+    if (( attempt >= max_attempts )); then
+      echo "hdiutil create failed after ${max_attempts} attempts" >&2
+      return 1
+    fi
+    echo "hdiutil create failed (attempt ${attempt}/${max_attempts}), retrying in ${delay}s..." >&2
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+  done
+}
+
+hdiutil_create_with_retry
 
 if [[ "${CODESIGN_IDENTITY}" != "-" ]]; then
   codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${DMG_PATH}"
