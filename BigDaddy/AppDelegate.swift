@@ -706,7 +706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let previouslyIdle = self.wasIdle
-                let isIdle = await self.client.isIdle
+                let isIdle = self.client.isIdle
                 if !isIdle && previouslyIdle {
                     // 从 IDLE 恢复 → 立即发送 RESUME 并拉取最新配置，恢复正常节奏
                     await self.client.sendHeartbeat(event: .resume)
@@ -1114,7 +1114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 do {
                     let success = try await client.bindWithCode(code)
                     if success {
-                        _ = try await client.refreshConfig()
+                        _ = await client.refreshConfig()
                         // 绑定成功：立即发送一次心跳，让后端即时感知设备上线
                         await client.sendHeartbeat(event: .start)
                         rebuildMenu()
