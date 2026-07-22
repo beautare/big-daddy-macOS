@@ -712,8 +712,10 @@ final class BigDaddyClient {
             // 未送达时也要如实记录，避免家长/孩子都以为已经发出去了。
             if let decoded = try? JSONDecoder.bigDaddy.decode(ApiResponse<ScreenshotUploadResponse>.self, from: responseData),
                decoded.data.delivered == false {
-                AuditLog.record("SCREENSHOT_NOT_DELIVERED reason=\(decoded.data.reason ?? "UNKNOWN")")
-                NSLog("BigDaddy: Screenshot uploaded but not delivered to any channel: \(decoded.data.reason ?? "unknown")")
+                let email = decoded.data.emailStatus ?? "UNKNOWN"
+                let telegram = decoded.data.telegramStatus ?? "UNKNOWN"
+                AuditLog.record("SCREENSHOT_NOT_DELIVERED reason=\(decoded.data.reason ?? "UNKNOWN") emailStatus=\(email) telegramStatus=\(telegram)")
+                NSLog("BigDaddy: Screenshot uploaded but not delivered to any channel: \(decoded.data.reason ?? "unknown") (email=\(email), telegram=\(telegram))")
             }
             // 即时可见：广播截图事件，UI 层据此闪烁菜单栏图标并弹出本机通知
             await MainActor.run {
