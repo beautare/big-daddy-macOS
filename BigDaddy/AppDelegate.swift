@@ -104,7 +104,7 @@ final class BindTokenMailbox: @unchecked Sendable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, SPUStandardUserDriverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, NSWindowDelegate, SPUStandardUserDriverDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
@@ -148,6 +148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private weak var aboutWindow: NSWindow?
     /// 与"关于"窗口里按钮的 tag 一一对应，点击时按下标取出对应动作执行（见 aboutActionTapped）。
     private var aboutWindowActions: [() -> Void] = []
+    /// "关于"窗口里"下次截屏"行的剩余时间字段，每秒被 aboutCountdownTimer 刷新；仅在
+    /// 渲染了该行（截图已开启）时非空，窗口关闭时清空（见 windowWillClose）。
+    private weak var aboutCountdownField: NSTextField?
+    /// 驱动上面字段每秒倒计时的定时器，只在"关于"窗口开着期间存活。
+    private var aboutCountdownTimer: Timer?
     // startingUpdater: true 后立即开始按 SUScheduledCheckInterval（Info.plist，当前 1 天）
     // 后台检查；SUEnableAutomaticChecks/SUAutomaticallyUpdate 已在 Info.plist 里直接置为
     // true，跳过 Sparkle 首次运行询问用户的对话框，检查与静默下载都无条件自动进行。
@@ -326,7 +331,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// "关于"窗口：把版本、当前配置摘要、心跳、截图倒计时等只读信息，以及守护说明/
-    /// 导出记录/检查更新等次要操作集中在一处，而不是平铺成一堆一级菜单项。
+    /// 检查更新等次要操作集中在一处，而不是平铺成一堆一级菜单项（"导出本机守护记录"
+    /// 嵌在"守护说明与采集内容"弹窗里，不在这里单独占一个按钮，避免两处重复入口）。
     ///
     /// 改用普通 NSWindow 而不是 NSAlert：NSAlert 的图标+标题是钉死在左上角的固定布局
     /// 区块，就算把 icon 换成透明占位图、messageText 清空，那块区域仍然会保留原本的
@@ -339,17 +345,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         var actions: [(title: String, handler: () -> Void, prominent: Bool)] = []
         // 家长已远程开启截图，但本机系统的屏幕录制权限还没给——配置了但实际不生效，
         // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。用 ⚠️ 前缀而不是蓝底：蓝色已经被
-        // "发现新版本"占用，两种"建议点一下"的含义不该共用同一个颜色语言。点击复用
-        // 已经写好的 openScreenRecordingSettings（先触发系统原生授权弹窗，若已经拒绝过
-        // 一次、系统不会再弹，则直接跳到系统设置里的屏幕录制页面）。
+        // "发现新版本"占用，两种"建议点一下"的含义不该共用同一个颜色语言。点击进入
+        // "打开系统设置 → 引导重启"的流程（屏幕录制权限必须重启 App 才生效，见
+        // promptGrantScreenRecordingThenRestart）。
         if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
-            actions.append((Localization.string(zh: "⚠️ 前往系统设置开启屏幕录制权限", en: "⚠️ Grant Screen Recording Permission…"), openScreenRecordingSettings, false))
+            actions.append((Localization.string(zh: "⚠️ 前往系统设置开启屏幕录制权限", en: "⚠️ Grant Screen Recording Permission…"), promptGrantScreenRecordingThenRestart, false))
         }
-        if client.config.bound && client.config.screenshotEnabled {
-            actions.append((Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"), sendScreenshotNow, false))
-        }
+        // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
+        // （见 createAboutContentView 的 .nextScreenshot 分支）。
         actions.append((Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"), showTransparencyInfo, false))
-        actions.append((Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"), exportAuditLog, false))
+        // 注：“导出本机守护记录”不再单独占一个按钮——“守护说明与采集内容”弹窗里已有
+        // 同样的导出入口，避免重复。
         // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字），
         // 点击复用 checkForUpdates()——文件已经下载好，Sparkle 会直接跳到"安装并重启"确认。
         if updateReadyToInstall {
@@ -370,10 +376,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         window.isReleasedWhenClosed = false
         window.contentView = contentView
         window.center()
+        window.delegate = self // windowWillClose 里停掉倒计时定时器，见下
         aboutWindow = window
+
+        // 窗口开着时每秒刷新"下次截屏"的倒计时；aboutCountdownField 只有在确实渲染了
+        // 该行（截图已开启）时才非空，为空则 tick 里什么都不做。
+        startAboutCountdownTimerIfNeeded()
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    /// NSWindowDelegate：关闭"关于"窗口时停掉每秒倒计时定时器并清掉字段引用，避免定时器
+    /// 在窗口消失后继续空转、也避免持有已销毁视图的悬垂引用。
+    func windowWillClose(_ notification: Notification) {
+        guard (notification.object as? NSWindow) === aboutWindow else { return }
+        aboutCountdownTimer?.invalidate()
+        aboutCountdownTimer = nil
+        aboutCountdownField = nil
+    }
+
+    /// 只在"关于"窗口里渲染了"下次截屏"行（aboutCountdownField 非空）时才起定时器。
+    private func startAboutCountdownTimerIfNeeded() {
+        aboutCountdownTimer?.invalidate()
+        aboutCountdownTimer = nil
+        guard aboutCountdownField != nil else { return }
+        aboutCountdownTimer = scheduleCommonModeTimer(interval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.aboutCountdownField?.stringValue = self?.nextScreenshotRemainingText() ?? ""
+            }
+        }
+    }
+
+    /// "下次截屏"剩余时间文案：直接读 screenshotTimer.fireDate，这也是定时截图真正的
+    /// 触发时刻——归零的那一刻 screenshotTimer（repeats:true）会触发 performScheduledScreenshot
+    /// 并把 fireDate 自动前移一个间隔，所以下一次 tick 会自然显示重新开始的倒计时。
+    private func nextScreenshotRemainingText() -> String {
+        guard let fireDate = screenshotTimer?.fireDate else {
+            return Localization.string(zh: "--:--", en: "--:--")
+        }
+        let remaining = max(0, Int(fireDate.timeIntervalSinceNow))
+        return String(format: Localization.string(zh: "%02d:%02d 后", en: "in %02d:%02d"),
+                      remaining / 60, remaining % 60)
+    }
+
+    /// "关于"窗口里"测试截图"按钮的响应：不关闭窗口（方便连续测试、观察倒计时），
+    /// 直接走手动截图路径（reason: manual，已不受相似度去重影响，见 captureAndSendScreenshot）。
+    @objc private func aboutTestScreenshotTapped() {
+        sendScreenshotNow()
     }
 
     /// "关于"窗口按钮的统一响应入口：tag 是按钮在 actions 数组里的下标，关掉窗口后
@@ -421,8 +471,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         container.addArrangedSubview(titleLabel)
         container.setCustomSpacing(18, after: titleLabel)
 
-        for (label, value) in aboutInfoRows() {
-            container.addArrangedSubview(makeInfoRow(label: label, value: value, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
+        aboutCountdownField = nil // 每次重建窗口都重置，只有真的渲染了倒计时行才会被赋值
+        for row in aboutInfoRows() {
+            switch row {
+            case let .text(label, value):
+                container.addArrangedSubview(makeInfoRow(label: label, value: value, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
+            case let .nextScreenshot(initialValue):
+                container.addArrangedSubview(makeNextScreenshotRow(initialValue: initialValue, width: width, labelWidth: labelWidth))
+            }
         }
         if let lastRow = container.arrangedSubviews.last {
             container.setCustomSpacing(20, after: lastRow)
@@ -464,32 +520,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         return parentView
     }
 
+    /// "关于"面板的信息行：普通的 label:value，或特殊的"下次截屏"行（带实时倒计时 +
+    /// 行内"测试截图"按钮），后者由 createAboutContentView 单独渲染。
+    private enum AboutInfoRow {
+        case text(label: String, value: String)
+        case nextScreenshot(initialValue: String)
+    }
+
     /// "关于"面板只读信息行的数据源：每一行只在对应信息"当下有意义"时才加入。
-    private func aboutInfoRows() -> [(String, String)] {
-        var rows: [(String, String)] = []
+    private func aboutInfoRows() -> [AboutInfoRow] {
+        var rows: [AboutInfoRow] = []
         if client.config.bound {
-            rows.append((Localization.string(zh: "状态", en: "Status"),
-                         Localization.string(zh: "已受保护", en: "Protected")))
-            rows.append((
-                Localization.string(zh: "截图", en: "Screenshots"),
-                client.config.screenshotEnabled
+            rows.append(.text(label: Localization.string(zh: "状态", en: "Status"),
+                              value: Localization.string(zh: "已受保护", en: "Protected")))
+            rows.append(.text(
+                label: Localization.string(zh: "截图", en: "Screenshots"),
+                value: client.config.screenshotEnabled
                     ? Localization.string(zh: "已开启（家长可远程截屏）", en: "ON (parent can capture)")
                     : Localization.string(zh: "未开启", en: "OFF")
             ))
-            rows.append((Localization.string(zh: "最近心跳", en: "Last heartbeat"), client.lastHeartbeatDescription))
+            rows.append(.text(label: Localization.string(zh: "最近心跳", en: "Last heartbeat"), value: client.lastHeartbeatDescription))
             if client.config.screenshotEnabled {
-                if let fireDate = screenshotTimer?.fireDate {
-                    let remaining = max(0, Int(fireDate.timeIntervalSinceNow))
-                    rows.append((
-                        Localization.string(zh: "下次截屏", en: "Next screenshot"),
-                        String(format: Localization.string(zh: "%02d:%02d 后", en: "in %02d:%02d"),
-                               remaining / 60, remaining % 60)
-                    ))
-                }
-                rows.append((
-                    Localization.string(zh: "截屏间隔", en: "Interval"),
-                    Localization.string(zh: "\(client.config.screenshotIntervalMins) 分钟",
-                                        en: "\(client.config.screenshotIntervalMins) min")
+                // 截图开启时始终渲染"下次截屏"行——它同时承载实时倒计时和"测试截图"按钮；
+                // 拿不到 fireDate（理论上不该发生）时退回 --:--，但按钮照常可用。
+                rows.append(.nextScreenshot(initialValue: nextScreenshotRemainingText()))
+                rows.append(.text(
+                    label: Localization.string(zh: "截屏间隔", en: "Interval"),
+                    value: Localization.string(zh: "\(client.config.screenshotIntervalMins) 分钟",
+                                               en: "\(client.config.screenshotIntervalMins) min")
                 ))
             }
             let channels = client.config.notificationChannels
@@ -505,16 +563,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             }
             if !(channels.whatsappPhone ?? "").isEmpty { channelNames.append("WhatsApp") }
             if !channelNames.isEmpty {
-                rows.append((
-                    Localization.string(zh: "通知渠道", en: "Notify via"),
-                    channelNames.joined(separator: Localization.string(zh: "、", en: ", "))
+                rows.append(.text(
+                    label: Localization.string(zh: "通知渠道", en: "Notify via"),
+                    value: channelNames.joined(separator: Localization.string(zh: "、", en: ", "))
                 ))
             }
         } else {
-            rows.append((Localization.string(zh: "状态", en: "Status"),
-                         Localization.string(zh: "尚未绑定家长账号", en: "Unbound")))
+            rows.append(.text(label: Localization.string(zh: "状态", en: "Status"),
+                              value: Localization.string(zh: "尚未绑定家长账号", en: "Unbound")))
         }
-        rows.append((Localization.string(zh: "版本", en: "Version"), AppVersion.current))
+        rows.append(.text(label: Localization.string(zh: "版本", en: "Version"), value: AppVersion.current))
         return rows
     }
 
@@ -545,6 +603,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         row.addArrangedSubview(labelField)
         row.addArrangedSubview(valueField)
+        return row
+    }
+
+    /// "下次截屏"行：与普通信息行同样是 label 右对齐 + value 左对齐，但 value 会被
+    /// aboutCountdownTimer 每秒刷新成实时倒计时，并在最右侧多一个小号"测试截图"按钮
+    /// （点击不关闭窗口，方便连续测试和观察倒计时）。行高比普通行大一点以容纳按钮。
+    private func makeNextScreenshotRow(initialValue: String, width: CGFloat, labelWidth: CGFloat) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
+        row.heightAnchor.constraint(equalToConstant: 26).isActive = true
+
+        let labelField = NSTextField(labelWithString: Localization.string(zh: "下次截屏", en: "Next screenshot"))
+        labelField.font = NSFont.systemFont(ofSize: 12)
+        labelField.textColor = .secondaryLabelColor
+        labelField.alignment = .right
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        labelField.widthAnchor.constraint(equalToConstant: labelWidth).isActive = true
+
+        let valueField = NSTextField(labelWithString: initialValue)
+        valueField.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        valueField.textColor = .labelColor
+        valueField.alignment = .left
+        valueField.lineBreakMode = .byTruncatingTail
+        valueField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        aboutCountdownField = valueField // 交给 aboutCountdownTimer 每秒刷新
+
+        let testButton = NSButton(
+            title: Localization.string(zh: "测试截图", en: "Test"),
+            target: self, action: #selector(aboutTestScreenshotTapped)
+        )
+        testButton.bezelStyle = .rounded
+        testButton.controlSize = .small
+        testButton.font = NSFont.systemFont(ofSize: 11)
+        testButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        row.addArrangedSubview(labelField)
+        row.addArrangedSubview(valueField)
+        row.addArrangedSubview(testButton)
         return row
     }
 
@@ -1743,6 +1843,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         CGRequestScreenCaptureAccess()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// "关于"面板里⚠️权限按钮的处理：打开系统设置的屏幕录制页，并引导用户在开启后重启。
+    ///
+    /// 为什么必须重启：屏幕录制是 macOS 里少数"授权后必须重启 App 才生效"的 TCC 权限。
+    /// 运行中的进程里 CGPreflightScreenCaptureAccess() 的结果被进程级缓存——启动时若为
+    /// "无权限"，之后哪怕用户在系统设置里勾了授权，本进程仍一直读到旧的 false，既检测
+    /// 不到（菜单栏图标不会从 ⚠️ 变 👁️），实际也截不了图。所以这里不做（也无法做到的）
+    /// 实时检测，而是直接引导重启：重启后是全新进程，会正确读到已授予的权限。
+    /// （不会误杀守护：LaunchAgent 未设 KeepAlive，靠 restartApplication 显式重新拉起，
+    /// 不会产生双实例；重启是家长授权动作触发、从"关于"面板发起，不是孩子在规避监护。）
+    @objc private func promptGrantScreenRecordingThenRestart() {
+        openScreenRecordingSettings()
+
+        let alert = NSAlert()
+        alert.messageText = Localization.string(zh: "开启后需重启 BigDaddy 生效", en: "Restart Required After Enabling")
+        alert.informativeText = Localization.string(
+            zh: "请在刚打开的系统设置「隐私与安全性 → 屏幕录制」里，打开 BigDaddy 的开关。\n\n由于 macOS 的限制，屏幕录制权限必须重启 BigDaddy 后才会生效。开启开关后，请点击「立即重启」。",
+            en: "In the System Settings window that just opened (Privacy & Security → Screen Recording), turn on the switch for BigDaddy.\n\nBecause of a macOS restriction, Screen Recording permission only takes effect after BigDaddy restarts. Once you've enabled it, click Restart Now."
+        )
+        applyShieldIcon(to: alert)
+        alert.addButton(withTitle: Localization.string(zh: "立即重启", en: "Restart Now"))
+        alert.addButton(withTitle: Localization.string(zh: "稍后", en: "Later"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            restartApplication()
         }
     }
 }

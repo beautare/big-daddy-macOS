@@ -681,7 +681,11 @@ final class BigDaddyClient {
         }
         guard let image = await captureMainDisplayImage() else { return false }
 
-        if reason != "command" && isImageSimilarToLast(cgImage: image) {
+        // 相似度去重只对"定时截图"有意义——静态屏幕下每隔几分钟发一张几乎一样的图纯属
+        // 噪音。手动测试（manual）和家长下发的命令（command）都是一次明确的"现在就给我
+        // 一张"的请求，必须无条件发送：之前 manual 也走去重，导致静态屏幕下点"测试截图"
+        // 悄无声息、什么都没发，被误判成功能坏了。
+        if reason == "scheduled" && isImageSimilarToLast(cgImage: image) {
             NSLog("BigDaddy: Screenshot is similar to the last one, skip sending.")
             return false
         }

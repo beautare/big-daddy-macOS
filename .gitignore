@@ -4,3 +4,4 @@ dist/*
 build/*
 **/xcuserdata/
 *.xcuserstate
+.swiftpm/xcode/package.xcworkspace/xcuserdata/fangdajiang.xcuserdatad/UserInterfaceState.xcuserstate
