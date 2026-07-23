@@ -111,6 +111,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var heartbeatTimer: Timer?
     private var commandTimer: Timer?
     private var configTimer: Timer?
+    /// 屏幕录制权限的授予/撤回都发生在系统设置里，没有公开的变更通知 API 可订阅，只能
+    /// 轮询；这个定时器让菜单栏图标（⚠️ ⇄ 👁️）在用户刚授权/撤权后近乎实时地跟上，
+    /// 不用等到下一次远端配置轮询（60 秒）。见 refreshIconIfPermissionChanged。
+    private var permissionPollTimer: Timer?
+    /// 上一次观测到的屏幕录制权限状态，nil 表示"还没观测过"或"截图关闭、不关心"。
+    private var lastKnownScreenRecordingPermission: Bool?
     private var screenshotFlashTimer: Timer?
     private var countdownTimer: Timer?
     private var countdownSeconds = 300
@@ -181,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
         updateStatusItemAppearance()
         print("BigDaddy: StatusItem appearance set")
+        schedulePermissionPollTimer()
         // 监听"实际发生截图"事件，触发孩子端即时可见提示
         NotificationCenter.default.addObserver(
             self, selector: #selector(onScreenshotSent),
@@ -330,6 +337,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         aboutWindow?.close()
 
         var actions: [(title: String, handler: () -> Void, prominent: Bool)] = []
+        // 家长已远程开启截图，但本机系统的屏幕录制权限还没给——配置了但实际不生效，
+        // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。用 ⚠️ 前缀而不是蓝底：蓝色已经被
+        // "发现新版本"占用，两种"建议点一下"的含义不该共用同一个颜色语言。点击复用
+        // 已经写好的 openScreenRecordingSettings（先触发系统原生授权弹窗，若已经拒绝过
+        // 一次、系统不会再弹，则直接跳到系统设置里的屏幕录制页面）。
+        if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
+            actions.append((Localization.string(zh: "⚠️ 前往系统设置开启屏幕录制权限", en: "⚠️ Grant Screen Recording Permission…"), openScreenRecordingSettings, false))
+        }
         if client.config.bound && client.config.screenshotEnabled {
             actions.append((Localization.string(zh: "立即测试截图命令", en: "Test Screenshot Command"), sendScreenshotNow, false))
         }
@@ -639,6 +654,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         button.title = capturing ? "BD●REC" : (missingPermission ? "BD⚠" : (on ? "BD●" : "BD"))
     }
 
+    /// 启动一次即常驻运行，不随 screenshotEnabled 开关本身启停——判断"要不要关心权限"
+    /// 这件事放在 tick 内部（截图关闭时直接跳过，见 refreshIconIfPermissionChanged），
+    /// 定时器本身不用在每次开关翻转时重新启停，逻辑更简单，也不会有"刚好错过开关那一刻
+    /// 没跟着启停"的边界情况。
+    private func schedulePermissionPollTimer() {
+        permissionPollTimer?.invalidate()
+        permissionPollTimer = scheduleCommonModeTimer(interval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshIconIfPermissionChanged()
+            }
+        }
+    }
+
+    /// 屏幕录制权限只在截图开启时才有意义（关闭时图标固定是盾牌，跟权限无关），所以
+    /// 截图关闭时直接跳过查询——CGPreflightScreenCaptureAccess() 是一次到 tccd 的本地
+    /// IPC，虽然开销很小，但没必要每 2 秒都问一次用不上的问题。只在结果真的变化时才
+    /// 重绘图标，避免每次 tick 都无谓刷新。
+    ///
+    /// 注意：这里只处理"权限被授予/撤回"这一种变化——"家长在后台关闭了截图"这件事
+    /// 走的是另一条已有路径（远端配置轮询 pollConfigForChildVisibility，最长 60 秒
+    /// 或者绑定/心跳等事件触发时更快），本身就会调用 updateStatusItemAppearance()
+    /// 落回盾牌图标，不需要在这里重复处理。
+    private func refreshIconIfPermissionChanged() {
+        guard client.config.screenshotEnabled else {
+            lastKnownScreenRecordingPermission = nil
+            return
+        }
+        let current = checkScreenRecordingPermission()
+        guard current != lastKnownScreenRecordingPermission else { return }
+        lastKnownScreenRecordingPermission = current
+        updateStatusItemAppearance()
+    }
+
     /// 每次实际发生截图时被调用：图标短暂切到"相机"态，并推送本机通知，确保孩子端即时可见。
     @objc private func onScreenshotSent() {
         updateStatusItemAppearance(capturing: true)
@@ -792,13 +840,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             }
             if after != before {
                 AuditLog.record("SCREENSHOT_TOGGLE state=\(after ? "ENABLED" : "DISABLED") source=remote")
+                // 家长刚打开截图这一刻，如果本机恰好还没给屏幕录制权限，顺带在这条已有的
+                // 通知里提一句——这个触发点本来就只在开关真正翻转时响一次，不需要为
+                // "缺权限"这件事单独引入一套一次性提醒的状态跟踪。
+                let missingPermission = after && !checkScreenRecordingPermission()
                 postLocalNotice(
                     title: after
                         ? Localization.string(zh: "家长已开启截图", en: "Parent turned screenshots ON")
                         : Localization.string(zh: "家长已关闭截图", en: "Parent turned screenshots OFF"),
                     body: after
-                        ? Localization.string(zh: "家长现在可以远程截屏，本机会持续记录每一次截图。",
-                                              en: "Your parent can now capture screenshots; every capture is logged on this Mac.")
+                        ? (missingPermission
+                            ? Localization.string(
+                                zh: "家长现在可以远程截屏，但本机还没有屏幕录制权限，截图暂时不会生效。请点击菜单栏「关于 BigDaddy…」里的授权按钮完成设置。",
+                                en: "Your parent can now capture screenshots, but this Mac hasn't granted Screen Recording permission yet, so captures won't work. Open “About BigDaddy…” from the menu bar and tap the permission button to finish setup."
+                              )
+                            : Localization.string(zh: "家长现在可以远程截屏，本机会持续记录每一次截图。",
+                                                  en: "Your parent can now capture screenshots; every capture is logged on this Mac."))
                         : Localization.string(zh: "截图功能已停止。",
                                               en: "Screenshot capture has been turned off.")
                 )
