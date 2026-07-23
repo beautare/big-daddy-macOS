@@ -479,8 +479,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             }
             let channels = client.config.notificationChannels
             var channelNames: [String] = []
-            if !(channels.email ?? "").isEmpty { channelNames.append(Localization.string(zh: "邮件", en: "Email")) }
-            if !(channels.telegramChatId ?? "").isEmpty { channelNames.append("Telegram") }
+            // emailEnabled/telegramEnabled 缺省（nil）按已启用处理，只有家长显式关闭
+            // 开关（false）时才不算——语义与后端 processScreenshotUpload 的转发门禁一致，
+            // 避免"地址还在、开关已关"时这里仍然显示成"正在转发"。
+            if !(channels.email ?? "").isEmpty && channels.emailEnabled != false {
+                channelNames.append(Localization.string(zh: "邮件", en: "Email"))
+            }
+            if !(channels.telegramChatId ?? "").isEmpty && channels.telegramEnabled != false {
+                channelNames.append("Telegram")
+            }
             if !(channels.whatsappPhone ?? "").isEmpty { channelNames.append("WhatsApp") }
             if !channelNames.isEmpty {
                 rows.append((

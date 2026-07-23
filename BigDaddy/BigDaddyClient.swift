@@ -34,8 +34,12 @@ enum AppVersion {
 /// 通知渠道配置（后端转发截图，不存储图片）
 struct NotificationChannels: Codable, Equatable {
     var email: String?
+    // 独立于"是否已配置"的第二道开关：地址/凭据决定渠道有没有可用目标，这两个
+    // 字段决定当前要不要真的用它。缺省（nil）按已启用处理，语义与后端一致。
+    var emailEnabled: Bool?
     var telegramBotToken: String?
     var telegramChatId: String?
+    var telegramEnabled: Bool?
     var whatsappPhone: String?
 }
 
