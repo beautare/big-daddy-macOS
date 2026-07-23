@@ -117,6 +117,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var permissionPollTimer: Timer?
     /// 上一次观测到的屏幕录制权限状态，nil 表示"还没观测过"或"截图关闭、不关心"。
     private var lastKnownScreenRecordingPermission: Bool?
+    /// 自动路径（定时/命令）因缺权限静默失败时，是否已经提醒过用户"可能需要重启"——
+    /// 避免同一段"截图开着但缺权限"的连续期间里，每次失败都弹一遍通知。截图开关每次
+    /// 翻转（见 pollConfigForChildVisibility）都会复位，让下一段新的"开着但缺权限"
+    /// 期间还能再提醒一次。
+    private var missingPermissionNoticeShown = false
     private var screenshotFlashTimer: Timer?
     private var countdownTimer: Timer?
     private var countdownSeconds = 300
@@ -197,6 +202,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         NotificationCenter.default.addObserver(
             self, selector: #selector(onScreenshotSent),
             name: BigDaddyClient.screenshotSentNotification, object: nil
+        )
+        // 监听"自动路径因缺权限静默放弃截图"事件，节流一次性提醒用户去"关于"重启
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(onScreenshotMissingPermission),
+            name: BigDaddyClient.screenshotMissingPermissionNotification, object: nil
         )
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
@@ -344,22 +354,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         var actions: [(title: String, handler: () -> Void, prominent: Bool)] = []
         // 家长已远程开启截图，但本机系统的屏幕录制权限还没给——配置了但实际不生效，
-        // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。用 ⚠️ 前缀而不是蓝底：蓝色已经被
-        // "发现新版本"占用，两种"建议点一下"的含义不该共用同一个颜色语言。点击进入
-        // "打开系统设置 → 引导重启"的流程（屏幕录制权限必须重启 App 才生效，见
-        // promptGrantScreenRecordingThenRestart）。
+        // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。拆成两个独立按钮而不是一个"打开设置
+        // 顺带问要不要重启"的合并流程：我们没法从代码里区分用户"还没去授权"还是"已经
+        // 授权了、只差重启"（同一个进程级缓存问题），与其让一个按钮猜错、给已经去过
+        // 设置的用户又重新弹一次系统设置，不如把两个诚实、各司其职的动作都摆出来。
+        // ⚠️ 前缀而不是蓝底：蓝色已经被"发现新版本"占用，两种"建议点一下"的含义
+        // 不该共用同一个颜色语言。
         if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
-            actions.append((Localization.string(zh: "⚠️ 前往系统设置开启屏幕录制权限", en: "⚠️ Grant Screen Recording Permission…"), promptGrantScreenRecordingThenRestart, false))
+            actions.append((Localization.string(zh: "⚠️ 前往设置授权", en: "⚠️ Open Settings"), openScreenRecordingSettings, false))
+            actions.append((Localization.string(zh: "已授权？重启客户端", en: "Granted? Restart App"), promptRestartForScreenRecording, false))
         }
         // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
         // （见 createAboutContentView 的 .nextScreenshot 分支）。
-        actions.append((Localization.string(zh: "守护说明与采集内容", en: "About This Guardian & What It Collects"), showTransparencyInfo, false))
-        // 注：“导出本机守护记录”不再单独占一个按钮——“守护说明与采集内容”弹窗里已有
-        // 同样的导出入口，避免重复。
+        actions.append((Localization.string(zh: "守护说明", en: "Guardian Info"), showTransparencyInfo, false))
+        // 注：“导出本机守护记录”不再单独占一个按钮——“守护说明”弹窗里已有同样的
+        // 导出入口，避免重复。
         // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字），
         // 点击复用 checkForUpdates()——文件已经下载好，Sparkle 会直接跳到"安装并重启"确认。
         if updateReadyToInstall {
-            actions.append((Localization.string(zh: "发现新版本，点击安装", en: "Update Ready — Click to Install"), checkForUpdates, true))
+            actions.append((Localization.string(zh: "发现新版本", en: "Update Ready"), checkForUpdates, true))
         }
         actions.append((Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates, false))
         actions.append((Localization.string(zh: "关闭", en: "Close"), {}, false))
@@ -801,6 +814,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         )
     }
 
+    /// 定时/命令截图因缺屏幕录制权限静默失败时被调用。节流成"同一段缺权限期间只提醒
+    /// 一次"（见 missingPermissionNoticeShown），避免定时器每隔几分钟就因为同一个没解决
+    /// 的问题反复弹通知骚扰用户；这段"期间"由截图开关的每一次翻转重新界定（见
+    /// pollConfigForChildVisibility 里 after != before 分支对这个 flag 的复位）。
+    @objc private func onScreenshotMissingPermission() {
+        guard !missingPermissionNoticeShown else { return }
+        missingPermissionNoticeShown = true
+        postLocalNotice(
+            title: Localization.string(zh: "截图仍未生效", en: "Screenshots still not working"),
+            body: Localization.string(
+                zh: "本机还没有屏幕录制权限。如果你已经在系统设置里开启了，请打开菜单栏「关于 BigDaddy…」，点击「已授权？重启客户端」使其生效。",
+                en: "This Mac hasn't granted Screen Recording permission yet. If you've already enabled it in System Settings, open “About BigDaddy…” from the menu bar and tap “Granted? Restart App” to apply it."
+            )
+        )
+    }
+
     /// 本机通知（无需额外权限），用于把"发生了什么"即时告知使用本机的孩子。
     private func postLocalNotice(title: String, body: String) {
         let notice = NSUserNotification()
@@ -965,9 +994,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             }
             if after != before {
                 AuditLog.record("SCREENSHOT_TOGGLE state=\(after ? "ENABLED" : "DISABLED") source=remote")
+                // 每次开关翻转都界定了一段新的"截图开着"时间段，把缺权限提醒的节流状态
+                // 也一并复位——避免上一段时间已经提醒过，这段新的却因为 flag 还是 true
+                // 而永远不再提醒（见 onScreenshotMissingPermission）。
+                missingPermissionNoticeShown = false
                 // 家长刚打开截图这一刻，如果本机恰好还没给屏幕录制权限，顺带在这条已有的
-                // 通知里提一句——这个触发点本来就只在开关真正翻转时响一次，不需要为
-                // "缺权限"这件事单独引入一套一次性提醒的状态跟踪。
+                // 通知里提一句——这个触发点本来就只在开关真正翻转时响一次一次性的，不需要
+                // 额外节流。跟 onScreenshotMissingPermission 是两条独立的提醒：这条只在
+                // "刚打开开关"那一刻可能触发，那条是"开着但一直缺权限"期间、自动截图
+                // 每次静默失败都可能触发（但被 missingPermissionNoticeShown 节流成一次）。
                 let missingPermission = after && !checkScreenRecordingPermission()
                 postLocalNotice(
                     title: after
@@ -976,8 +1011,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     body: after
                         ? (missingPermission
                             ? Localization.string(
-                                zh: "家长现在可以远程截屏，但本机还没有屏幕录制权限，截图暂时不会生效。请点击菜单栏「关于 BigDaddy…」里的授权按钮完成设置。",
-                                en: "Your parent can now capture screenshots, but this Mac hasn't granted Screen Recording permission yet, so captures won't work. Open “About BigDaddy…” from the menu bar and tap the permission button to finish setup."
+                                zh: "家长现在可以远程截屏，但本机还没有屏幕录制权限，截图暂时不会生效。请点击菜单栏「关于 BigDaddy…」里的「⚠️ 前往设置授权」完成设置。",
+                                en: "Your parent can now capture screenshots, but this Mac hasn't granted Screen Recording permission yet, so captures won't work. Open “About BigDaddy…” from the menu bar and tap “⚠️ Open Settings” to finish setup."
                               )
                             : Localization.string(zh: "家长现在可以远程截屏，本机会持续记录每一次截图。",
                                                   en: "Your parent can now capture screenshots; every capture is logged on this Mac."))
@@ -1871,23 +1906,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    /// "关于"面板里⚠️权限按钮的处理：打开系统设置的屏幕录制页，并引导用户在开启后重启。
+    /// "关于"面板里"已授权？重启客户端"按钮的处理：只负责问一句"确定要重启吗"然后重启，
+    /// 不再像之前那样顺带重新打开一次系统设置——如果用户是通过定时截图弹出的系统原生
+    /// 提示去设置里授权的，点这里就不该被重新拉回设置页一次，那样很莫名其妙。
     ///
     /// 为什么必须重启：屏幕录制是 macOS 里少数"授权后必须重启 App 才生效"的 TCC 权限。
     /// 运行中的进程里 CGPreflightScreenCaptureAccess() 的结果被进程级缓存——启动时若为
     /// "无权限"，之后哪怕用户在系统设置里勾了授权，本进程仍一直读到旧的 false，既检测
-    /// 不到（菜单栏图标不会从 ⚠️ 变 👁️），实际也截不了图。所以这里不做（也无法做到的）
-    /// 实时检测，而是直接引导重启：重启后是全新进程，会正确读到已授予的权限。
+    /// 不到（菜单栏图标不会从 ⚠️ 变 👁️），实际也截不了图。我们没法从代码里判断用户到底
+    /// 有没有真的去授权过，所以这个按钮和"前往设置授权"按钮平级并列，让用户自己判断
+    /// 该点哪个，而不是猜错了给用户来一套没预期到的流程。
     /// （不会误杀守护：LaunchAgent 未设 KeepAlive，靠 restartApplication 显式重新拉起，
     /// 不会产生双实例；重启是家长授权动作触发、从"关于"面板发起，不是孩子在规避监护。）
-    @objc private func promptGrantScreenRecordingThenRestart() {
-        openScreenRecordingSettings()
-
+    @objc private func promptRestartForScreenRecording() {
         let alert = NSAlert()
-        alert.messageText = Localization.string(zh: "开启后需重启 BigDaddy 生效", en: "Restart Required After Enabling")
+        alert.messageText = Localization.string(zh: "重启后屏幕录制权限才会生效", en: "Restart to Apply Screen Recording Permission")
         alert.informativeText = Localization.string(
-            zh: "请在刚打开的系统设置「隐私与安全性 → 屏幕录制」里，打开 BigDaddy 的开关。\n\n由于 macOS 的限制，屏幕录制权限必须重启 BigDaddy 后才会生效。开启开关后，请点击「立即重启」。",
-            en: "In the System Settings window that just opened (Privacy & Security → Screen Recording), turn on the switch for BigDaddy.\n\nBecause of a macOS restriction, Screen Recording permission only takes effect after BigDaddy restarts. Once you've enabled it, click Restart Now."
+            zh: "如果你已经在系统设置「隐私与安全性 → 屏幕录制」里开启了 BigDaddy 的开关，点击「立即重启」即可生效；如果还没开启，请先点「⚠️ 前往设置授权」。",
+            en: "If you've already turned on the switch for BigDaddy in System Settings (Privacy & Security → Screen Recording), click Restart Now to apply it. If not yet, use “⚠️ Open Settings” first."
         )
         applyShieldIcon(to: alert)
         alert.addButton(withTitle: Localization.string(zh: "立即重启", en: "Restart Now"))

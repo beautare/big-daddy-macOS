@@ -618,6 +618,10 @@ final class BigDaddyClient {
 
     /// 截图实际发生时广播，供 UI 层给孩子端即时可见提示
     static let screenshotSentNotification = Notification.Name("BigDaddyScreenshotSent")
+    /// 自动路径（定时/家长下发命令）因缺屏幕录制权限而静默放弃截图时广播。手动测试
+    /// （关于面板里点"测试截图"）不广播这个——用户当时就看着"关于"面板，⚠️ 按钮本身
+    /// 已经是最直接的提示，不需要再额外弹一条本机通知重复同一件事。
+    static let screenshotMissingPermissionNotification = Notification.Name("BigDaddyScreenshotMissingPermission")
 
     /// 把截图按"最大宽度"等比缩小到严格的目标像素尺寸，只缩不放。
     ///
@@ -727,6 +731,14 @@ final class BigDaddyClient {
         }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
+            // 手动测试（关于面板里点"测试截图"）时用户本来就正看着"关于"窗口，⚠️ 按钮
+            // 已经是最直接的提示，不用再广播；只有自动路径（定时/命令）静默失败时才广播，
+            // 让 UI 层决定要不要用一条节流过的本机通知主动提醒用户（见 AppDelegate）。
+            if reason != "manual" {
+                await MainActor.run {
+                    NotificationCenter.default.post(name: BigDaddyClient.screenshotMissingPermissionNotification, object: nil)
+                }
+            }
             return false
         }
         guard let image = await captureMainDisplayImage() else { return false }
