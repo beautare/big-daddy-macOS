@@ -869,9 +869,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 let previouslyIdle = self.wasIdle
                 let isIdle = self.client.isIdle
                 if !isIdle && previouslyIdle {
-                    // 从 IDLE 恢复 → 立即发送 RESUME 并拉取最新配置，恢复正常节奏
+                    // 从 IDLE 恢复 → 立即发送 RESUME 并拉取最新配置，恢复正常节奏。
+                    // 这是除 pollConfigForChildVisibility 之外唯一另一处调用 refreshConfig()
+                    // 却可能改变 screenshotIntervalMins 的地方：如果家长恰好在设备空闲期间
+                    // 改了截图间隔，这次 refreshConfig 会把新值同步进 client.config，但如果
+                    // 不在这里顺带重排 screenshotTimer，旧计时器会带着旧间隔继续跑——而且
+                    // 60 秒一次的 pollConfigForChildVisibility 下次执行时，config 已经是最新值，
+                    // 它自己的"变化前后对比"会发现"没有变化"，永远不会补上这次重排。
                     await self.client.sendHeartbeat(event: .resume)
+                    let intervalBeforeResume = self.client.config.screenshotIntervalMins
                     _ = await self.client.refreshConfig()
+                    if self.client.config.screenshotIntervalMins != intervalBeforeResume {
+                        self.scheduleScreenshotTimer()
+                    }
                 } else {
                     await self.client.sendHeartbeat(event: isIdle ? .idle : .heartbeat)
                 }
