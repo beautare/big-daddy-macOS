@@ -828,9 +828,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         return timer
     }
 
-    private func scheduleTimers() {
+    /// 只重排"定时截图"这一个计时器：家长在仪表盘改了截图间隔后，运行期配置轮询
+    /// （pollConfigForChildVisibility）需要单独把它按新间隔重排，而不必连带把心跳/命令
+    /// 轮询的自重排一次性打断——那些跟截图间隔无关。
+    private func scheduleScreenshotTimer() {
         screenshotTimer?.invalidate()
-
         // 定时截图（由后端 screenshotEnabled 控制，调度本身照常）
         screenshotTimer = scheduleCommonModeTimer(
             interval: TimeInterval(client.config.screenshotIntervalMins * 60),
@@ -838,6 +840,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.performScheduledScreenshot() }
         }
+    }
+
+    private func scheduleTimers() {
+        scheduleScreenshotTimer()
 
         scheduleNextHeartbeat()
         scheduleNextCommandPoll()
@@ -906,6 +912,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let boundBefore = client.config.bound
         let invalidBefore = client.credentialsInvalid
         let before = client.config.screenshotEnabled
+        // 记录旧的截图间隔，用于判断是否需要在配置变化后重排定时截图计时器
+        let intervalBefore = client.config.screenshotIntervalMins
         // 凭据失效时签名通道全断，config 轮询收不到任何信号（包括解绑）。register 不签名：
         // 家长解绑后，后端会重新接受本机 secret（未绑定设备允许换钥），凭据在这里自动恢复，
         // 随后回到常规配置轮询——不需要重启客户端。
@@ -927,6 +935,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if boundChanged {
                 // 心跳/命令轮询的节奏依赖 bound，翻转后立即切换调度
                 scheduleTimers()
+            } else if client.config.screenshotIntervalMins != intervalBefore {
+                // 关键修复：家长在仪表盘改了截图间隔后，之前这里只更新了 config 值、
+                // 却没有重排 screenshotTimer，导致定时截图仍按旧间隔触发——"关于"窗口
+                // 显示的新间隔与实际截图节奏对不上，家长以为客户端没遵循仪表盘设置。
+                // 现在检测到间隔变化就按新值重排这一个计时器。
+                scheduleScreenshotTimer()
+                AuditLog.record("SCREENSHOT_INTERVAL_UPDATED mins=\(client.config.screenshotIntervalMins) source=remote")
             }
             if boundChanged && !client.config.bound {
                 AuditLog.record("DEVICE_UNBOUND 家长已在仪表盘解除本设备的守护关系")

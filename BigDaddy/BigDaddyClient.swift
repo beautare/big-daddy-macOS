@@ -619,6 +619,38 @@ final class BigDaddyClient {
     /// 截图实际发生时广播，供 UI 层给孩子端即时可见提示
     static let screenshotSentNotification = Notification.Name("BigDaddyScreenshotSent")
 
+    /// 把截图按"最大宽度"等比缩小到严格的目标像素尺寸，只缩不放。
+    ///
+    /// 之前用 `NSImage(size:).lockFocus()` 缩放：lockFocus 会按主屏 backing scale 建后备
+    /// 存储，Retina（2x）上一张 640 点宽的 NSImage 导出后其实是 1280 像素——家长把
+    /// "截图最大宽度"设成 640，实际收到的截图却是 1280，压缩质量也因为像素翻倍、体积
+    /// 常年顶到 300KB 上限而被 compressToTargetSize 反复强压、家长设的挡位形同虚设。
+    /// 这里改成直接建一张"精确像素尺寸"的 CGBitmapContext 把源图画进去，输出宽度严格
+    /// 等于 targetWidth，与屏幕是不是 Retina 无关。
+    private func resizeToMaxWidth(_ image: CGImage, maxWidth: Int) -> NSBitmapImageRep? {
+        let srcWidth = image.width
+        let srcHeight = image.height
+        guard srcWidth > 0, srcHeight > 0 else { return nil }
+        // 只缩不放：源图本来就比目标窄时保持原尺寸
+        let targetWidth = min(max(1, maxWidth), srcWidth)
+        let targetHeight = max(1, Int((Double(srcHeight) * Double(targetWidth) / Double(srcWidth)).rounded()))
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        guard let scaled = ctx.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: scaled)
+    }
+
     /// 逐步降低 JPEG quality 直到落在目标大小区间以内（不强求下限，避免对本来就很
     /// 小的截图做无意义的画质牺牲），而不是像之前那样只压缩一次就直接上传。
     private func compressToTargetSize(_ rep: NSBitmapImageRep, startQuality: Double) -> Data {
@@ -690,16 +722,7 @@ final class BigDaddyClient {
             return false
         }
 
-        let bitmap = NSBitmapImageRep(cgImage: image)
-        let width = CGFloat(config.compressMaxWidth)
-        let scale = min(1, width / CGFloat(bitmap.pixelsWide))
-        let targetSize = NSSize(width: CGFloat(bitmap.pixelsWide) * scale, height: CGFloat(bitmap.pixelsHigh) * scale)
-        let nsImage = NSImage(size: targetSize)
-        nsImage.lockFocus()
-        NSImage(cgImage: image, size: NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)).draw(in: NSRect(origin: .zero, size: targetSize))
-        nsImage.unlockFocus()
-
-        guard let tiff = nsImage.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return false }
+        guard let rep = resizeToMaxWidth(image, maxWidth: config.compressMaxWidth) else { return false }
         let jpeg = compressToTargetSize(rep, startQuality: config.compressQuality)
 
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
