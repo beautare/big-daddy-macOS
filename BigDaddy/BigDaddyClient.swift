@@ -651,21 +651,39 @@ final class BigDaddyClient {
         return NSBitmapImageRep(cgImage: scaled)
     }
 
-    /// 逐步降低 JPEG quality 直到落在目标大小区间以内（不强求下限，避免对本来就很
-    /// 小的截图做无意义的画质牺牲），而不是像之前那样只压缩一次就直接上传。
+    /// 按家长在仪表盘选的压缩质量档位（30/40/50/65/80%）直接编码，不再事后偷偷改档。
+    ///
+    /// 这里原来有一个"目标字节数"上限（300KB），超出就一路把 quality 往下砍到满足为止。
+    /// 问题是：真实截图（代码编辑器、文字密集的界面）远比纯色测试图复杂，在"截图最大
+    /// 宽度"960px 时，65%/80% 档位编出来的 JPEG 常年就是 300~460KB 左右，稳定超过这个
+    /// 上限——于是 65% 被偷偷砍到约 55%，80% 被一路砍到约 50%，跟直接选 50% 编出来的
+    /// 效果几乎一样。家长选的档位形同虚设，65%/80% 永远看不到自己选的画质，这正是
+    /// "调质量肉眼看不出区别、80% 也不像该有的清晰度"的根因。
+    ///
+    /// 现在改成：直接按选定档位编码，不做任何隐藏降级。"压缩质量"和"截图最大宽度"是
+    /// 两个独立、彼此正交的档位选择，文件大小已经由二者的固定挡位表共同界定上限——
+    /// 用最宽 1280px + 最高 80% 质量、即便是完全随机噪声这种 JPEG 最坏情况也只有约
+    /// 1MB，远低于 Telegram Bot API（10MB）、邮件附件、后端 100MB 上传上限里的任何一个，
+    /// 没有必要为了凑一个 300KB 的软上限而牺牲用户的实际选择。
+    /// 只保留一个远高于正常挡位组合上限、几乎不会触发的兜底：真出现异常导致体积
+    /// 离谱地大，也不至于把一张截图挂到几十 MB 拖垮上传/转发。
     private func compressToTargetSize(_ rep: NSBitmapImageRep, startQuality: Double) -> Data {
-        let targetMaxBytes = 300 * 1024
+        let hardCapBytes = 8 * 1024 * 1024
+        let data = rep.representation(using: .jpeg, properties: [.compressionFactor: startQuality]) ?? Data()
+        guard data.count > hardCapBytes else { return data }
+        // 只有真撞到这个远高于正常情况的兜底时才降级，且尽量少降：每次减 0.1，
+        // 到 0.1 为止；正常挡位组合下这段代码路径不会被执行到。
         var quality = startQuality
-        var data = rep.representation(using: .jpeg, properties: [.compressionFactor: quality]) ?? Data()
-        while data.count > targetMaxBytes && quality > 0.1 {
+        var fallback = data
+        while fallback.count > hardCapBytes && quality > 0.1 {
             quality = max(0.1, quality - 0.1)
             if let smaller = rep.representation(using: .jpeg, properties: [.compressionFactor: quality]) {
-                data = smaller
+                fallback = smaller
             } else {
                 break
             }
         }
-        return data
+        return fallback
     }
 
     /// 抓取主显示器一帧画面。macOS 14+ 走 ScreenCaptureKit（`CGDisplayCreateImage`
