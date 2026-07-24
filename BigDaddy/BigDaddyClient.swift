@@ -1161,7 +1161,12 @@ enum LaunchAtLoginController {
             // 迁移：老版本可能已用手写 plist 装过自启；13+ 改用 SMAppService 后必须把
             // 遗留 plist 删掉，否则登录时两条机制各拉起一次、进程被重复启动。
             LaunchAgentInstaller.uninstall()
-            guard SMAppService.mainApp.status != .enabled else { return }
+            // .enabled 已经生效、.requiresApproval 已经注册只是在等家长去系统设置批准——
+            // 这两种状态下都不用再调 register()。syncWithPreference() 每次启动都会跑
+            // 到这里，如果只排除 .enabled，会导致 requiresApproval 期间每次启动都重复
+            // 调用 register()（且很可能每次都以"已注册"报错收场，纯粹的日志噪音）。
+            let status = SMAppService.mainApp.status
+            guard status != .enabled && status != .requiresApproval else { return }
             do {
                 try SMAppService.mainApp.register()
                 AuditLog.record("LAUNCH_AT_LOGIN_REGISTERED via=SMAppService")
@@ -1177,7 +1182,10 @@ enum LaunchAtLoginController {
     static func disable() {
         if #available(macOS 13.0, *) {
             LaunchAgentInstaller.uninstall() // 遗留 plist 一并清掉，双保险
-            guard SMAppService.mainApp.status != .notRegistered else { return }
+            // 只有确实处于"已注册"的某种状态（enabled / requiresApproval）时才需要
+            // unregister()；notRegistered / notFound 下调用只会换来一次可预期的报错。
+            let status = SMAppService.mainApp.status
+            guard status == .enabled || status == .requiresApproval else { return }
             do {
                 try SMAppService.mainApp.unregister()
                 AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService")
