@@ -192,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         #else
         print("BigDaddy: Sparkle updater skipped in DEBUG build")
         #endif
-        LaunchAgentInstaller.installIfNeeded()
+        LaunchAgentInstaller.syncWithPreference()
         print("BigDaddy: launch agent checked")
         // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
         updateStatusItemAppearance()
@@ -322,6 +322,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             title: Localization.string(zh: "关于 BigDaddy…", en: "About BigDaddy…"),
             action: #selector(showAboutWindow), keyEquivalent: ""
         ))
+
+        // 默认开启，孩子可自行开启（无需验证）；关闭是敏感操作，需要家长验证码才能
+        // 生效，见 toggleLaunchAtLogin/disableLaunchAtLoginWithVerification。
+        let launchAtLoginItem = NSMenuItem(
+            title: Localization.string(zh: "开机自动启动", en: "Start at Login"),
+            action: #selector(toggleLaunchAtLogin), keyEquivalent: ""
+        )
+        launchAtLoginItem.state = LaunchAtLoginPreference.isEnabled ? .on : .off
+        menu.addItem(launchAtLoginItem)
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(
@@ -712,6 +721,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     // 绑定成功：立即发送一次心跳，让后端即时感知设备上线
                     await self.client.sendHeartbeat(event: .start)
                     await MainActor.run {
+                        // 绑定即家长接管：强制恢复开机自启，抵消未绑定期间可能的关闭
+                        self.enforceLaunchAtLoginOnBind()
                         self.scheduleTimers()
                         self.rebuildMenu()
                         self.updateStatusItemAppearance()
@@ -974,6 +985,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if boundChanged {
                 // 心跳/命令轮询的节奏依赖 bound，翻转后立即切换调度
                 scheduleTimers()
+                // 家长在仪表盘侧完成绑定（未经过本机 startBindDetectionBurst 那条路径时）
+                // 也要强制恢复开机自启，抵消未绑定期间可能的关闭
+                if client.config.bound {
+                    enforceLaunchAtLoginOnBind()
+                }
             } else if client.config.screenshotIntervalMins != intervalBefore {
                 // 关键修复：家长在仪表盘改了截图间隔后，之前这里只更新了 config 值、
                 // 却没有重排 screenshotTimer，导致定时截图仍按旧间隔触发——"关于"窗口
@@ -1494,17 +1510,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     @objc private func quitWithPassword() {
+        guard let code = promptParentVerificationCode(
+            title: Localization.string(zh: "退出 BigDaddy 客户端", en: "Exit BigDaddy Client"),
+            message: Localization.string(
+                zh: "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可正常关闭客户端。",
+                en: "Please generate a secure exit verification code on the parent dashboard, enter it to close the client."
+            ),
+            confirmTitle: Localization.string(zh: "安全退出", en: "Secure Exit")
+        ) else { return }
+
+        Task {
+            let success = await client.verifyExitPassword(code)
+            await MainActor.run {
+                if success {
+                    client.sendShutdownSync()
+                    NSApp.terminate(nil)
+                } else {
+                    let errorAlert = NSAlert()
+                    errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
+                    errorAlert.informativeText = Localization.string(
+                        zh: "退出验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The exit code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                    )
+                    errorAlert.addButton(withTitle: "OK")
+                    errorAlert.runModal()
+                }
+            }
+        }
+    }
+
+    /// 开机自动启动菜单项的响应。
+    /// - 开启：只会扩大监控覆盖面、不构成绕过风险，任何状态下都直接落地、不设防护。
+    /// - 关闭（已绑定）：敏感操作（下次登录起守护就起不来），走家长验证码流程，
+    ///   见 disableLaunchAtLoginWithVerification。
+    /// - 关闭（未绑定）：此时还没有家长账户可以签发/校验验证码，也没有任何守护在进行，
+    ///   直接关闭即可；真正的兜底是"绑定成功时强制恢复自启"（enforceLaunchAtLoginOnBind），
+    ///   所以孩子在绑定前关掉自启并不能形成持久绕过——家长一接管就会被重新打开。
+    ///   这样也避免了"未绑定时弹验证码框、却随便输 6 位都能过"（verifyExitPassword 对
+    ///   未绑定设备恒返回 true）那种自相矛盾的体验。
+    @objc private func toggleLaunchAtLogin() {
+        if LaunchAtLoginPreference.isEnabled {
+            if client.config.bound {
+                disableLaunchAtLoginWithVerification()
+            } else {
+                applyLaunchAtLogin(enabled: false, source: "local-unbound")
+            }
+        } else {
+            applyLaunchAtLogin(enabled: true, source: "local")
+        }
+    }
+
+    /// 落地一次自启开关变更：写偏好、安装/卸载 LaunchAgent、记审计、重建菜单，
+    /// 并立即补发一次心跳把新状态推给后端（心跳 metadata 里带 launchAtLoginEnabled），
+    /// 不必等下一次定时心跳，家长端近实时可见。
+    private func applyLaunchAtLogin(enabled: Bool, source: String) {
+        LaunchAtLoginPreference.isEnabled = enabled
+        if enabled {
+            LaunchAgentInstaller.installIfNeeded()
+        } else {
+            LaunchAgentInstaller.uninstall()
+        }
+        AuditLog.record("LAUNCH_AT_LOGIN_TOGGLE state=\(enabled ? "ENABLED" : "DISABLED") source=\(source)")
+        rebuildMenu()
+        Task { await client.sendHeartbeat(event: .heartbeat) }
+    }
+
+    /// 设备绑定成功这一刻强制把开机自启恢复为开启：抵消孩子在"未绑定期间"可能已经
+    /// 关掉自启、导致家长接管后下次重启守护起不来的情况。绑定即家长正式接管，
+    /// 自启动必须回到默认开启；此后再要关闭，就必须走验证码流程了。
+    private func enforceLaunchAtLoginOnBind() {
+        let wasEnabled = LaunchAtLoginPreference.isEnabled
+        LaunchAtLoginPreference.isEnabled = true
+        LaunchAgentInstaller.installIfNeeded()
+        if !wasEnabled {
+            AuditLog.record("LAUNCH_AT_LOGIN_REENABLED_ON_BIND")
+        }
+    }
+
+    /// 关闭"开机自动启动"会让守护从下次登录起失效，且不需要退出客户端本身——如果做成
+    /// 自由开关，孩子关掉它再重启一次电脑就能悄悄绕过守护，与"安全退出"的验证强度
+    /// 不一致。这里复用同一个后端验证码接口（verifyExitPassword / verify-exit）和同一套
+    /// 6 位数字输入 UI，家长在 Dashboard 生成的验证码同时能用于"退出"和"关闭自启动"
+    /// 两个敏感动作。仅在已绑定设备走此路径（未绑定见 toggleLaunchAtLogin 注释）。
+    private func disableLaunchAtLoginWithVerification() {
+        guard let code = promptParentVerificationCode(
+            title: Localization.string(zh: "关闭开机自动启动", en: "Turn Off Start at Login"),
+            message: Localization.string(
+                zh: "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可关闭开机自动启动。",
+                en: "Please generate a secure exit verification code on the parent dashboard, enter it to turn off Start at Login."
+            ),
+            confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
+        ) else { return }
+
+        Task {
+            let success = await client.verifyExitPassword(code)
+            await MainActor.run {
+                if success {
+                    applyLaunchAtLogin(enabled: false, source: "local-verified")
+                } else {
+                    let errorAlert = NSAlert()
+                    errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
+                    errorAlert.informativeText = Localization.string(
+                        zh: "验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                    )
+                    errorAlert.addButton(withTitle: "OK")
+                    errorAlert.runModal()
+                }
+            }
+        }
+    }
+
+    /// "安全退出"与"关闭开机自动启动"共用的 6 位家长验证码输入弹窗（含倒计时、
+    /// 自动跳格），返回用户输入的 6 位数字；用户点取消，或未输满 6 位时返回 nil
+    /// （未输满会先提示"请输入完整的 6 位验证码"）。调用方自行决定拿到码之后怎么
+    /// 校验、以及成功/失败分别做什么。
+    private func promptParentVerificationCode(title: String, message: String, confirmTitle: String) -> String? {
         let alert = NSAlert()
-        alert.messageText = Localization.string(zh: "退出 BigDaddy 客户端", en: "Exit BigDaddy Client")
-        alert.informativeText = Localization.string(
-            zh: "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可正常关闭客户端。",
-            en: "Please generate a secure exit verification code on the parent dashboard, enter it to close the client."
-        )
-        
+        alert.messageText = title
+        alert.informativeText = message
+
         let accessory = self.createExitAccessoryView()
         alert.accessoryView = accessory
-        
-        alert.addButton(withTitle: Localization.string(zh: "安全退出", en: "Secure Exit"))
+
+        alert.addButton(withTitle: confirmTitle)
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
 
         // 初始化倒计时
@@ -1541,7 +1670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         self.countdownTimer?.invalidate()
         self.countdownTimer = nil
 
-        guard response == .alertFirstButtonReturn else { return }
+        guard response == .alertFirstButtonReturn else { return nil }
 
         let code = self.exitDigitFields.map { $0.stringValue }.joined()
         if code.count < 6 {
@@ -1550,27 +1679,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             errorAlert.informativeText = Localization.string(zh: "请输入完整的 6 位验证码。", en: "Please enter the complete 6-digit verification code.")
             errorAlert.addButton(withTitle: Localization.string(zh: "确认", en: "Confirm"))
             errorAlert.runModal()
-            return
+            return nil
         }
-        
-        Task {
-            let success = await client.verifyExitPassword(code)
-            await MainActor.run {
-                if success {
-                    client.sendShutdownSync()
-                    NSApp.terminate(nil)
-                } else {
-                    let errorAlert = NSAlert()
-                    errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
-                    errorAlert.informativeText = Localization.string(
-                        zh: "退出验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The exit code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
-                    )
-                    errorAlert.addButton(withTitle: "OK")
-                    errorAlert.runModal()
-                }
-            }
-        }
+        return code
     }
 
     private func createExitAccessoryView() -> NSView {

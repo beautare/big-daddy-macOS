@@ -328,7 +328,11 @@ final class BigDaddyClient {
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
-                "accessibilityGranted": AXIsProcessTrustedWithOptions(nil)
+                "accessibilityGranted": AXIsProcessTrustedWithOptions(nil),
+                // 开机自动启动的当前状态位：与权限位一样每次心跳都上报，家长端因此始终
+                // 能在服务端看到本机是否仍会开机自启，不必依赖"关闭那一刻"的单次事件
+                // 能否送达（那次事件可能因断网落进 PendingQueue 延迟补发）。
+                "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled
             ]
         ]
         // 如果有截图记录，一并上报
@@ -1116,15 +1120,41 @@ enum PendingQueueCrypto {
     }
 }
 
+/// 开机自动启动的本地开关：默认开启（首次运行未写过值时视为 true），孩子可在客户端
+/// 菜单里手动关闭。关闭是敏感操作（会让监控从下次登录起失效），需要家长验证码
+/// 才能生效，见 AppDelegate.disableLaunchAtLoginWithVerification；开启则不设防护，
+/// 因为开启只会增加监控覆盖面，不构成绕过风险。
+enum LaunchAtLoginPreference {
+    private static let key = "LaunchAtLoginEnabled"
+
+    static var isEnabled: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: key) != nil else { return true }
+            return UserDefaults.standard.bool(forKey: key)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: key) }
+    }
+}
+
 /// 用户级 LaunchAgent，实现开机自动启动（RunAtLoad），不使用特权 daemon。
 /// 注：不设置 KeepAlive——"崩溃后自动拉起"这类连续性模式按设计需要家长在
 /// Dashboard 显式开启才能启用，后端目前还没有提供这个配置项，暂缓实现；
 /// 这里先落地规格里最基础的"开机自动启动"，对孩子在系统设置的登录项列表
-/// 里始终可见，也可以随时自行移除。
+/// 里始终可见，也可以随时自行移除（本地关闭开关见 LaunchAtLoginPreference）。
 enum LaunchAgentInstaller {
     static var launchAgentURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/com.bigdaddy.client.plist")
+    }
+
+    /// 按 LaunchAtLoginPreference（默认开启）同步 LaunchAgent 的安装状态，
+    /// 取代原来无条件调用 installIfNeeded() 的启动逻辑。
+    static func syncWithPreference() {
+        if LaunchAtLoginPreference.isEnabled {
+            installIfNeeded()
+        } else {
+            uninstall()
+        }
     }
 
     static func installIfNeeded() {
@@ -1146,6 +1176,17 @@ enum LaunchAgentInstaller {
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: url, options: .atomic)
         AuditLog.record("LAUNCH_AGENT_INSTALLED path=\(executablePath)")
+    }
+
+    /// 移除 LaunchAgent plist，让本机从下一次登录起不再自动启动。不调用
+    /// launchctl unload——RunAtLoad 且未设 KeepAlive 的 agent 只在"登录时"读取一次
+    /// 这份 plist，删除文件本身已经足够；当前已经在跑的进程不受影响，与"安全退出"
+    /// 是两个独立动作一致（关闭自启动不等于立刻退出客户端）。
+    static func uninstall() {
+        let url = launchAgentURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.removeItem(at: url)
+        AuditLog.record("LAUNCH_AGENT_UNINSTALLED")
     }
 }
 
