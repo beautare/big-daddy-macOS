@@ -192,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         #else
         print("BigDaddy: Sparkle updater skipped in DEBUG build")
         #endif
-        LaunchAgentInstaller.syncWithPreference()
+        LaunchAtLoginController.syncWithPreference()
         print("BigDaddy: launch agent checked")
         // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
         updateStatusItemAppearance()
@@ -1566,9 +1566,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func applyLaunchAtLogin(enabled: Bool, source: String) {
         LaunchAtLoginPreference.isEnabled = enabled
         if enabled {
-            LaunchAgentInstaller.installIfNeeded()
+            LaunchAtLoginController.enable()
         } else {
-            LaunchAgentInstaller.uninstall()
+            LaunchAtLoginController.disable()
         }
         AuditLog.record("LAUNCH_AT_LOGIN_TOGGLE state=\(enabled ? "ENABLED" : "DISABLED") source=\(source)")
         rebuildMenu()
@@ -1581,7 +1581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func enforceLaunchAtLoginOnBind() {
         let wasEnabled = LaunchAtLoginPreference.isEnabled
         LaunchAtLoginPreference.isEnabled = true
-        LaunchAgentInstaller.installIfNeeded()
+        LaunchAtLoginController.enable()
         if !wasEnabled {
             AuditLog.record("LAUNCH_AT_LOGIN_REENABLED_ON_BIND")
         }

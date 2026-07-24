@@ -6,6 +6,7 @@ import Foundation
 import Network
 import ScreenCaptureKit
 import Security
+import ServiceManagement
 
 enum EventType: String, Codable {
     case start = "START"
@@ -332,7 +333,12 @@ final class BigDaddyClient {
                 // 开机自动启动的当前状态位：与权限位一样每次心跳都上报，家长端因此始终
                 // 能在服务端看到本机是否仍会开机自启，不必依赖"关闭那一刻"的单次事件
                 // 能否送达（那次事件可能因断网落进 PendingQueue 延迟补发）。
-                "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled
+                // launchAtLoginEnabled 是本机"意图"（客户端偏好），launchAtLoginOsStatus 是
+                // OS 层"实际"状态：两者不一致（如 enabled + notRegistered）即意味着有人在
+                // 系统设置的登录项里手动关掉了自启——这是 App 内验证码开关拦不住的绕过，
+                // 家长端应据此告警。
+                "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled,
+                "launchAtLoginOsStatus": LaunchAtLoginController.osLevelStatusDescription
             ]
         ]
         // 如果有截图记录，一并上报
@@ -1136,25 +1142,82 @@ enum LaunchAtLoginPreference {
     }
 }
 
-/// 用户级 LaunchAgent，实现开机自动启动（RunAtLoad），不使用特权 daemon。
-/// 注：不设置 KeepAlive——"崩溃后自动拉起"这类连续性模式按设计需要家长在
-/// Dashboard 显式开启才能启用，后端目前还没有提供这个配置项，暂缓实现；
-/// 这里先落地规格里最基础的"开机自动启动"，对孩子在系统设置的登录项列表
-/// 里始终可见，也可以随时自行移除（本地关闭开关见 LaunchAtLoginPreference）。
+/// 开机自启的统一入口：macOS 13+ 用官方 SMAppService（能查询 OS 级实际状态、从而
+/// 察觉用户在「系统设置 → 登录项」里的手动关闭，且用 bundle 身份、不受 .app 被移动
+/// 影响），12.x 回退到手写 LaunchAgent plist。全项目对"开机自启"的启停/查询都应经过
+/// 这里，不要再直接调用 LaunchAgentInstaller（它退化为 12.x 的 plist 实现细节）。
+enum LaunchAtLoginController {
+    /// 按 LaunchAtLoginPreference（默认开启）同步 OS 层的自启状态，启动时调用一次。
+    static func syncWithPreference() {
+        if LaunchAtLoginPreference.isEnabled {
+            enable()
+        } else {
+            disable()
+        }
+    }
+
+    static func enable() {
+        if #available(macOS 13.0, *) {
+            // 迁移：老版本可能已用手写 plist 装过自启；13+ 改用 SMAppService 后必须把
+            // 遗留 plist 删掉，否则登录时两条机制各拉起一次、进程被重复启动。
+            LaunchAgentInstaller.uninstall()
+            guard SMAppService.mainApp.status != .enabled else { return }
+            do {
+                try SMAppService.mainApp.register()
+                AuditLog.record("LAUNCH_AT_LOGIN_REGISTERED via=SMAppService")
+            } catch {
+                // 常见于 DEBUG 裸二进制（非 .app bundle）或未签名场景；如实记录、不崩。
+                NSLog("BigDaddy: SMAppService register failed: \(error.localizedDescription)")
+            }
+        } else {
+            LaunchAgentInstaller.installIfNeeded()
+        }
+    }
+
+    static func disable() {
+        if #available(macOS 13.0, *) {
+            LaunchAgentInstaller.uninstall() // 遗留 plist 一并清掉，双保险
+            guard SMAppService.mainApp.status != .notRegistered else { return }
+            do {
+                try SMAppService.mainApp.unregister()
+                AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService")
+            } catch {
+                NSLog("BigDaddy: SMAppService unregister failed: \(error.localizedDescription)")
+            }
+        } else {
+            LaunchAgentInstaller.uninstall()
+        }
+    }
+
+    /// OS 层实际状态字符串，供心跳上报。它与本地偏好 LaunchAtLoginPreference 可能不一致：
+    /// 家长端据此能看出"孩子在系统设置里手动关掉了自启"（偏好还是 enabled，但这里变成
+    /// notRegistered）这类客户端 App 内开关拦不住的绕过。13+ 返回 SMAppService 的四态；
+    /// 12.x 无等价查询 API，用 plist 是否存在近似表达。
+    static var osLevelStatusDescription: String {
+        if #available(macOS 13.0, *) {
+            switch SMAppService.mainApp.status {
+            case .enabled: return "enabled"
+            case .requiresApproval: return "requiresApproval"
+            case .notRegistered: return "notRegistered"
+            case .notFound: return "notFound"
+            @unknown default: return "unknown"
+            }
+        } else {
+            return FileManager.default.fileExists(atPath: LaunchAgentInstaller.launchAgentURL.path)
+                ? "plistPresent" : "plistAbsent"
+        }
+    }
+}
+
+/// 用户级 LaunchAgent（RunAtLoad，不使用特权 daemon）——macOS 12.x 的开机自启实现，
+/// 13+ 已由 LaunchAtLoginController 改走 SMAppService。注：不设置 KeepAlive——"崩溃后
+/// 自动拉起"这类连续性模式按设计需要家长在 Dashboard 显式开启，后端暂无此配置项，暂缓。
+/// 对孩子在系统设置的登录项列表里始终可见，也可随时自行移除（本地关闭开关见
+/// LaunchAtLoginPreference）。不要在业务代码里直接调用本类型，统一走 LaunchAtLoginController。
 enum LaunchAgentInstaller {
     static var launchAgentURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/com.bigdaddy.client.plist")
-    }
-
-    /// 按 LaunchAtLoginPreference（默认开启）同步 LaunchAgent 的安装状态，
-    /// 取代原来无条件调用 installIfNeeded() 的启动逻辑。
-    static func syncWithPreference() {
-        if LaunchAtLoginPreference.isEnabled {
-            installIfNeeded()
-        } else {
-            uninstall()
-        }
     }
 
     static func installIfNeeded() {
