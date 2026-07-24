@@ -219,6 +219,19 @@ final class BigDaddyClient {
         previousCrashAt = nil
     }
 
+    /// 签名接口（心跳/config/commands/verify-exit/screenshot）收到 401 时调用：说明本机
+    /// 手上的指纹+secret 当下已经过不了 BigDaddyDeviceAuthService 的认证（设备被解绑后又
+    /// 整条数据库记录被删掉就是这种情况），和 register() 报告 credentialsValid=false 是
+    /// 同一件事——把它标成失效，下一轮 pollConfigForChildVisibility 就会自动改走 register()
+    /// 去问权威状态，而不是让签名请求继续静默失败、本地 bound 状态永远卡在旧值上。
+    private func markCredentialsInvalid() {
+        let wasInvalid = credentialsInvalid
+        credentialsInvalid = true
+        if !wasInvalid {
+            NSLog("BigDaddy: signed request rejected as unauthorized (401); marking credentials invalid, will retry via register()")
+        }
+    }
+
     func register() async {
         let body: [String: Any] = [
             "deviceFingerprint": identity.fingerprint,
@@ -250,8 +263,16 @@ final class BigDaddyClient {
 
     @discardableResult
     func refreshConfig() async -> Bool {
-        guard let data = try? await request(path: "/bigdaddy/client/config", method: "GET", body: nil, signed: true),
-              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else { return false }
+        let data: Data
+        do {
+            data = try await request(path: "/bigdaddy/client/config", method: "GET", body: nil, signed: true)
+        } catch let error as BigDaddyAPIError where error.isAuthFailure {
+            markCredentialsInvalid()
+            return false
+        } catch {
+            return false
+        }
+        guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else { return false }
         let previous = config
         let remote = response.data
         if remote.bound {
@@ -324,6 +345,12 @@ final class BigDaddyClient {
             }
             lastHeartbeatDescription = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
             return true
+        } catch let error as BigDaddyAPIError where error.isAuthFailure {
+            // 服务器明确拒绝（设备已不存在/签名过不了），不是网络抖动，
+            // 重试也不会成功——不进补发队列，改走 credentialsInvalid 恢复路径。
+            NSLog("BigDaddy: heartbeat rejected (401): \(error.errorDescription ?? "")")
+            markCredentialsInvalid()
+            return false
         } catch {
             NSLog("BigDaddy: heartbeat failed, queuing for retry: \(error.localizedDescription)")
             PendingQueue.enqueue(body)
@@ -612,7 +639,11 @@ final class BigDaddyClient {
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = body
         
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data)
+            throw BigDaddyAPIError(statusCode: http.statusCode, serverMessage: envelope?.message)
+        }
         return data
     }
 
@@ -806,6 +837,10 @@ final class BigDaddyClient {
             }
             NSLog("BigDaddy: Screenshot uploaded (reason: \(reason)).")
             return true
+        } catch let error as BigDaddyAPIError where error.isAuthFailure {
+            NSLog("BigDaddy: Screenshot upload rejected (401): \(error.errorDescription ?? "")")
+            markCredentialsInvalid()
+            return false
         } catch {
             NSLog("BigDaddy: Screenshot upload failed: \(error.localizedDescription)")
             return false
@@ -814,8 +849,16 @@ final class BigDaddyClient {
 
     func pollCommands() async {
         guard config.bound else { return }
-        guard let data = try? await request(path: "/bigdaddy/client/commands?limit=10", method: "GET", body: nil, signed: true),
-              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
+        let data: Data
+        do {
+            data = try await request(path: "/bigdaddy/client/commands?limit=10", method: "GET", body: nil, signed: true)
+        } catch let error as BigDaddyAPIError where error.isAuthFailure {
+            markCredentialsInvalid()
+            return
+        } catch {
+            return
+        }
+        guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
         let screenshotCommands = response.data.filter { $0.type == "TAKE_SCREENSHOT_NOW" }
         // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在仪表盘改完压缩质量/
         // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
@@ -851,6 +894,11 @@ final class BigDaddyClient {
             if let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<Bool>.self, from: data) {
                 return response.data
             }
+        } catch let error as BigDaddyAPIError where error.isAuthFailure {
+            // 密码校验本身仍然失败关闭（不能因为凭据失效就放行退出），但顺带标记失效，
+            // 让后台轮询下一轮走 register() 发现"设备已解绑"，而不是让这个弹窗卡死用户。
+            NSLog("BigDaddy: verifyExitPassword rejected (401): \(error.errorDescription ?? "")")
+            markCredentialsInvalid()
         } catch {
             NSLog("BigDaddy: verifyExitPassword request failed: \(error.localizedDescription)")
         }
@@ -890,7 +938,11 @@ final class BigDaddyClient {
             request.setValue(nonce, forHTTPHeaderField: "X-Device-Nonce")
             request.setValue(signature, forHTTPHeaderField: "X-Device-Signature")
         }
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data)
+            throw BigDaddyAPIError(statusCode: http.statusCode, serverMessage: envelope?.message)
+        }
         return data
     }
 
@@ -1131,6 +1183,18 @@ struct ApiResponse<T: Codable>: Codable {
 struct ApiEnvelope: Codable {
     let code: Int
     let message: String
+}
+
+/// HTTP 状态码非 2xx 时 request() 抛出的错误：区分"服务器明确拒绝"和"网络传输失败"，
+/// 前者（尤其 401）不该被调用方当成可重试的临时故障静默吞掉。
+struct BigDaddyAPIError: LocalizedError {
+    let statusCode: Int
+    let serverMessage: String?
+    var errorDescription: String? { serverMessage ?? "HTTP \(statusCode)" }
+    /// 签名接口返回 401 只可能是 BigDaddyDeviceAuthService 里的认证失败
+    /// （设备未注册/无 secret/签名不对/时间戳超窗），语义上等价于 register() 报告的
+    /// credentialsValid=false，都意味着本机手上的凭据当下用不了。
+    var isAuthFailure: Bool { statusCode == 401 }
 }
 
 /// 携带后端 message 的业务错误，让弹窗能直接展示真实原因而不是笼统的"绑定码无效"
