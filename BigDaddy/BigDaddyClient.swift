@@ -693,8 +693,14 @@ final class BigDaddyClient {
     /// 抓取主显示器一帧画面。macOS 14+ 走 ScreenCaptureKit（`CGDisplayCreateImage`
     /// 已在 macOS 15 被废除，目前仅靠向后兼容仍能运行，随时可能被移除）；更早的系统
     /// 保留旧路径——SCK 的单帧截图 API `SCScreenshotManager` 本身要求 macOS 14。
-    /// 分辨率按显示器点数（1x）抓取即可：下游会压到 compressMaxWidth（默认 1280）以内，
-    /// 原生像素抓取只是白白放大中间图。
+    ///
+    /// 关键：`SCDisplay.width/height` 的单位是"点"，而 `SCStreamConfiguration.width/height`
+    /// 的单位是"像素"。之前直接把点数赋给像素数，等于在 Retina（2x）屏上按 1x 半分辨率
+    /// 抓取——文字/界面的次像素抗锯齿细节整帧丢失，图像发虚。这种"发虚/模糊"是分辨率
+    /// 损失造成的，跟 JPEG 压缩质量无关，所以家长把质量从 40% 调到 80% 也几乎看不出区别
+    /// （源图本来就没多少细节可供 JPEG 保留或丢弃）。改成按显示器原生像素分辨率抓取，
+    /// 再交给下游 resizeToMaxWidth 做高质量降采样到 compressMaxWidth——同样的目标宽度下，
+    /// "先原生抓取、再降采样"远比"直接 1x 抓取"清晰（等效于超采样抗锯齿）。
     private func captureMainDisplayImage() async -> CGImage? {
         if #available(macOS 14.0, *) {
             do {
@@ -706,8 +712,13 @@ final class BigDaddyClient {
                 }
                 let filter = SCContentFilter(display: display, excludingWindows: [])
                 let configuration = SCStreamConfiguration()
-                configuration.width = display.width
-                configuration.height = display.height
+                // 用 CGDisplayMode 拿当前显示模式的原生像素尺寸；拿不到就回退到点数（退化为
+                // 旧的 1x 行为，至少不崩）。宽高都按原生像素设，保持长宽比、避免拉伸/加黑边。
+                let (pixelWidth, pixelHeight) = nativePixelSize(displayID: display.displayID,
+                                                                fallbackWidth: display.width,
+                                                                fallbackHeight: display.height)
+                configuration.width = pixelWidth
+                configuration.height = pixelHeight
                 configuration.showsCursor = false
                 return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
             } catch {
@@ -715,8 +726,19 @@ final class BigDaddyClient {
                 return nil
             }
         } else {
+            // CGDisplayCreateImage 本身就返回原生像素，旧系统路径不受上述点/像素问题影响。
             return CGDisplayCreateImage(CGMainDisplayID())
         }
+    }
+
+    /// 返回指定显示器当前显示模式的原生像素尺寸；无法获取时回退到传入的点数尺寸。
+    private func nativePixelSize(displayID: CGDirectDisplayID, fallbackWidth: Int, fallbackHeight: Int) -> (Int, Int) {
+        if let mode = CGDisplayCopyDisplayMode(displayID) {
+            let w = mode.pixelWidth
+            let h = mode.pixelHeight
+            if w > 0 && h > 0 { return (w, h) }
+        }
+        return (fallbackWidth, fallbackHeight)
     }
 
     /// 返回是否真正完成了一次截图上传尝试（用于命令回执：截图被禁用/无权限/上传失败
@@ -794,7 +816,14 @@ final class BigDaddyClient {
         guard config.bound else { return }
         guard let data = try? await request(path: "/bigdaddy/client/commands?limit=10", method: "GET", body: nil, signed: true),
               let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
-        for command in response.data where command.type == "TAKE_SCREENSHOT_NOW" {
+        let screenshotCommands = response.data.filter { $0.type == "TAKE_SCREENSHOT_NOW" }
+        // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在仪表盘改完压缩质量/
+        // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
+        // 可能落后 60 秒配置轮询）的旧配置，家长对比时就会觉得"改了质量没区别/压缩没生效"。
+        if !screenshotCommands.isEmpty {
+            _ = await refreshConfig()
+        }
+        for command in screenshotCommands {
             // 之前无条件回执 SUCCEEDED，哪怕截图因为未开启/无权限/上传失败而根本没发生，
             // 家长在 Dashboard 看到的命令状态是假的。现在按实际结果回执。
             let succeeded = await captureAndSendScreenshot(reason: "command")

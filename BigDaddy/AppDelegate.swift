@@ -1380,7 +1380,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     @objc private func sendScreenshotNow() {
-        Task { await client.captureAndSendScreenshot(reason: "manual") }
+        // 同 pollCommands 里对"测试截图命令"的处理：本机菜单栏/"关于"窗口的"测试截图"
+        // 是另一条完全独立、不经过后端命令通道的路径，之前没有同步刷新配置。如果刚在
+        // 仪表盘保存了新的压缩质量/截图宽度就立刻在孩子的 Mac 上点这个按钮测试，客户端
+        // 手上可能还是保存前的旧配置（最长要等 60 秒的配置轮询才会同步），效果对不上。
+        Task {
+            _ = await client.refreshConfig()
+            await client.captureAndSendScreenshot(reason: "manual")
+        }
     }
 
     @objc private func checkForUpdates() {
