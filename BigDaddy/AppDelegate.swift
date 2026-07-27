@@ -892,10 +892,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         let browserName = Self.browserDisplayName(forBundleID: bundleID)
         if reason == BigDaddyClient.UrlUnavailableReason.notDetermined.rawValue {
-            // 弹授权框的调用会同步阻塞到用户点选为止，必须离开主线程，否则整个客户端
+            // 同样用真实 Apple Event 触发系统询问，理由见 probeAutomationByRealEvent。
+            // 这个调用会同步阻塞到用户点选为止，必须离开主线程，否则整个客户端
             // （含菜单栏图标）在用户做决定之前都是僵住的。
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let result = BigDaddyClient.automationPermission(forBundleID: bundleID, promptIfNeeded: true)
+                let result = self?.client.probeAutomationByRealEvent(bundleID: bundleID)
                 DispatchQueue.main.async {
                     guard let self else { return }
                     if result == .granted {
@@ -2187,23 +2188,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard !targets.isEmpty else { return }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            var stillDenied: [String] = []
+            // 必须把"有记录、被拒"和"根本没有记录"分开：系统设置的自动化面板只列出
+            // **已经产生过 TCC 记录**的 App，没有记录的话那个面板里连 BigDaddy 这一栏
+            // 都不存在，把用户送过去只会让他对着一个空列表发懵。
+            var denied: [String] = []      // -1743：有记录、用户拒过 → 去设置里勾
+            var noRecord: [String] = []    // -1744/其他：没有记录 → 去设置没用
             for bundleID in targets {
-                // promptIfNeeded: true —— notDetermined 时这一步就把系统授权框弹出来了
-                switch BigDaddyClient.automationPermission(forBundleID: bundleID, promptIfNeeded: true) {
-                case .granted:
+                // 用真实 Apple Event 探测：这是唯一能可靠让系统弹出授权询问、并在 TCC
+                // 里落下记录的方式（见 probeAutomationByRealEvent 的注释）。先前这里只调
+                // AEDeterminePermissionToAutomateTarget(askUserIfNeeded: true)，在它不弹
+                // 询问的情况下既建不出记录，又被判成"被拒"，用户就被送去一个根本没有
+                // BigDaddy 条目的自动化面板。
+                switch self?.client.probeAutomationByRealEvent(bundleID: bundleID) {
+                case .granted, .none:
                     continue
                 case .targetNotRunning:
                     // 浏览器没开就无法判定，也无法授权；不算失败，等它下次开起来再说
                     continue
-                default:
-                    stillDenied.append(bundleID)
+                case .denied:
+                    denied.append(bundleID)
+                case .notDetermined, .unknown:
+                    noRecord.append(bundleID)
                 }
             }
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.automationDeniedBundleIDs = Set(stillDenied)
-                if stillDenied.isEmpty {
+                self.automationDeniedBundleIDs = Set(denied + noRecord)
+                if denied.isEmpty && noRecord.isEmpty {
                     self.automationNoticeShownBundleIDs.removeAll()
                     let alert = NSAlert()
                     alert.messageText = Localization.string(zh: "网址记录已生效", en: "Website Logging Enabled")
@@ -2215,9 +2226,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     alert.runModal()
                     return
                 }
-                self.showAutomationSettingsGuidance(bundleIDs: stillDenied)
+                if !denied.isEmpty {
+                    self.showAutomationSettingsGuidance(bundleIDs: denied)
+                } else {
+                    self.showAutomationPromptUnavailable(bundleIDs: noRecord)
+                }
             }
         }
+    }
+
+    /// 当前运行的是不是一个正经的 .app（带 Info.plist 和用途说明字符串）。
+    ///
+    /// `swift run` / Xcode 直接运行产出的是裸 Mach-O：没有 Info.plist，也就没有
+    /// NSAppleEventsUsageDescription。macOS 对此的处理是**拒绝弹出自动化授权框、直接
+    /// 以 -1743 回绝、且不创建任何 TCC 记录**——于是系统设置的自动化面板里永远不会
+    /// 出现 BigDaddy，这个权限在开发构建下无论如何都授不成。这不是代码问题，但如果
+    /// 不明说，开发和测试时会反复撞上同一堵墙还以为是功能坏了。
+    private var canRequestAutomationConsent: Bool {
+        Bundle.main.bundleIdentifier != nil
+            && Bundle.main.object(forInfoDictionaryKey: "NSAppleEventsUsageDescription") != nil
+    }
+
+    /// 系统没有为这些浏览器留下任何 TCC 记录 —— 去系统设置是没有意义的，
+    /// 得说清楚真正该做什么。
+    private func showAutomationPromptUnavailable(bundleIDs: [String]) {
+        let names = bundleIDs.map { Self.browserDisplayName(forBundleID: $0) }.joined(separator: "、")
+        let alert = NSAlert()
+        alert.messageText = Localization.string(zh: "系统没有弹出授权询问", en: "macOS Didn't Show the Prompt")
+        alert.informativeText = canRequestAutomationConsent
+            ? Localization.string(
+                zh: "系统这次没有弹出「允许 BigDaddy 控制 \(names)」的询问，因此「隐私与安全性 → 自动化」里也还看不到 BigDaddy——那个列表只会列出已经询问过的 App。请确认 \(names) 正在运行、窗口没有全部关闭，然后再点一次本按钮。",
+                en: "macOS didn't show the “allow BigDaddy to control \(names)” prompt, so BigDaddy won't appear under Privacy & Security → Automation yet — that list only shows apps that have already been asked. Make sure \(names) is running with at least one window open, then tap this button again."
+            )
+            : Localization.string(
+                zh: "当前运行的是开发构建（未打包成 .app，缺少 Info.plist 中的用途说明），macOS 在这种情况下不会弹出自动化授权询问，也不会在「隐私与安全性 → 自动化」里创建 BigDaddy 条目。请改用打包并签名后的正式版本再试。",
+                en: "This is a development build (a bare binary without the Info.plist usage description). macOS never shows the automation prompt for it, and won't create a BigDaddy entry under Privacy & Security → Automation. Use a packaged, signed build instead."
+            )
+        applyShieldIcon(to: alert)
+        alert.runModal()
     }
 
     /// 用户此前点过"不允许"，系统不会再弹框，只能引导去系统设置手动勾选。

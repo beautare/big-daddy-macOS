@@ -688,6 +688,44 @@ final class BigDaddyClient {
         }
     }
 
+    /// 用**真实的 Apple Event** 探测某个浏览器的自动化授权状态。
+    ///
+    /// 为什么不只用 AEDeterminePermissionToAutomateTarget：那个 API 传 typeWildCard 时
+    /// 系统拿不到具体事件类别，实测存在"不弹询问、直接回否定结果"的情况——于是既没有
+    /// 创建 TCC 记录（系统设置的自动化面板里因此看不到 BigDaddy），又让调用方误以为
+    /// 用户拒绝过。而真正能可靠让系统弹出询问、并在 TCC 里落下记录的，就是老老实实发
+    /// 一个真实事件（正是每次心跳在做的事）。
+    ///
+    /// 返回码也比 AEDetermine 更准：浏览器回 -1719/-1728（没有窗口、对象不存在）恰恰
+    /// 证明事件**已经送达浏览器**，也就是权限是通的——这种情况必须判成 granted，
+    /// 否则会把一台权限完全正常、只是当时没开窗口的设备误报成"未授权"。
+    func probeAutomationByRealEvent(bundleID: String) -> AutomationPermission {
+        guard let dialect = BigDaddyClient.supportedBrowsers[bundleID] else {
+            return .unknown(OSStatus(errOSAScriptError))
+        }
+        let script = browserTabCombinedScript(bundleID: bundleID, dialect: dialect)
+        switch runAppleScript(script) {
+        case .success:
+            // 脚本跑通了（不管拿没拿到 URL），说明事件被允许送达
+            return .granted
+        case .failure(let code):
+            switch code {
+            case OSStatus(errAEEventNotPermitted):
+                return .denied
+            case BigDaddyClient.errAEEventWouldRequireUserConsentCode:
+                return .notDetermined
+            case OSStatus(errAEIllegalIndex), OSStatus(errAENoSuchObject):
+                // 浏览器亲自回的错 → 事件送达了 → 权限没问题
+                return .granted
+            case OSStatus(procNotFound):
+                return .targetNotRunning
+            default:
+                NSLog("BigDaddy: automation probe to \(bundleID) got OSStatus=\(code)")
+                return .unknown(code)
+            }
+        }
+    }
+
     /// 最近一次取活动窗口时，浏览器 URL 为什么没拿到。随心跳上报给后端，
     /// 家长端据此把"没有链接"从一个哑状态变成一句可行动的提示。
     private(set) var lastUrlUnavailableReason: UrlUnavailableReason = .notApplicable
