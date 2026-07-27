@@ -726,6 +726,21 @@ final class BigDaddyClient {
         }
     }
 
+    /// 已经记过一笔的前台应用 bundle id，避免每次心跳都刷同一行日志
+    private var loggedUnsupportedBundleIDs: Set<String> = []
+
+    /// 前台应用没有命中 supportedBrowsers 时记一行（每个 bundle id 只记一次）。
+    ///
+    /// 为什么非记不可：其余所有诊断日志都写在 browserTabInfo 内部，而那个函数**只有
+    /// 命中白名单才会被调用**。于是"浏览器没被识别"这种情况下一行日志都不会有，排查时
+    /// 看到的是一片空白，和"客户端没在跑""日志没落盘"完全无法区分——实测就因此绕了一圈。
+    /// 记下 bundle id 之后，往白名单里补一行就能解决的问题不必再猜。
+    private func logUnsupportedFrontAppOnce(bundleID: String, appName: String?, known: Bool) {
+        guard !bundleID.isEmpty, !loggedUnsupportedBundleIDs.contains(bundleID) else { return }
+        loggedUnsupportedBundleIDs.insert(bundleID)
+        NSLog("BigDaddy: front app not URL-capable, bundleID=\(bundleID), name=\(appName ?? "?"), knownBrowser=\(known)")
+    }
+
     /// 最近一次取活动窗口时，浏览器 URL 为什么没拿到。随心跳上报给后端，
     /// 家长端据此把"没有链接"从一个哑状态变成一句可行动的提示。
     private(set) var lastUrlUnavailableReason: UrlUnavailableReason = .notApplicable
@@ -764,9 +779,11 @@ final class BigDaddyClient {
         } else if BigDaddyClient.knownUnscriptableBrowsers.contains(bundleID) {
             lastBrowserBundleID = bundleID
             lastUrlUnavailableReason = .unsupportedBrowser
+            logUnsupportedFrontAppOnce(bundleID: bundleID, appName: frontApp.localizedName, known: true)
         } else {
             lastBrowserBundleID = nil
             lastUrlUnavailableReason = .notApplicable
+            logUnsupportedFrontAppOnce(bundleID: bundleID, appName: frontApp.localizedName, known: false)
         }
 
         let pid = frontApp.processIdentifier
