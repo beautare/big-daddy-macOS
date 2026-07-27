@@ -122,6 +122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 翻转（见 pollConfigForChildVisibility）都会复位，让下一段新的"开着但缺权限"
     /// 期间还能再提醒一次。
     private var missingPermissionNoticeShown = false
+    /// 已经就"浏览器自动化权限"提醒/弹窗过的浏览器 bundle id。与屏幕录制那个布尔开关
+    /// 不同，这里必须按浏览器分区：自动化是"发起方 × 目标"逐对授权的，孩子换个浏览器
+    /// 就是一份全新的、同样需要引导的授权，不能因为提醒过 Chrome 就对 Safari 闭嘴。
+    private var automationNoticeShownBundleIDs: Set<String> = []
+    /// 是否有浏览器处于"自动化权限被拒"状态——决定"关于"面板里要不要出现引导入口。
+    /// 记 bundle id 而不是布尔，是为了在面板文案里说清楚是哪个浏览器。
+    private var automationDeniedBundleIDs: Set<String> = []
     private var screenshotFlashTimer: Timer?
     private var countdownTimer: Timer?
     private var countdownSeconds = 300
@@ -207,6 +214,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         NotificationCenter.default.addObserver(
             self, selector: #selector(onScreenshotMissingPermission),
             name: BigDaddyClient.screenshotMissingPermissionNotification, object: nil
+        )
+        // 监听"前台浏览器因自动化权限拿不到 URL"事件，按浏览器节流后引导授权
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(onBrowserAutomationBlocked),
+            name: BigDaddyClient.browserAutomationBlockedNotification, object: nil
         )
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
@@ -372,6 +384,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
             actions.append((Localization.string(zh: "⚠️ 前往设置授权", en: "⚠️ Open Settings"), openScreenRecordingSettings, false))
             actions.append((Localization.string(zh: "已授权？重启客户端", en: "Granted? Restart App"), promptRestartForScreenRecording, false))
+        }
+        // 浏览器自动化权限缺失：家长端会看到"有标题、没链接"的日志。这条和屏幕录制那条
+        // 的可见性条件不同——它跟 screenshotEnabled 无关，只要设备已绑定、且实际撞到过
+        // 被拒的浏览器就该出现（未绑定时没有任何上报，提示也就没有意义）。
+        if client.config.bound && !automationDeniedBundleIDs.isEmpty {
+            actions.append((
+                Localization.string(zh: "⚠️ 允许读取浏览器网址", en: "⚠️ Allow Browser URL Access"),
+                promptAutomationPermission,
+                false
+            ))
         }
         // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
         // （见 createAboutContentView 的 .nextScreenshot 分支）。
@@ -839,6 +861,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 en: "This Mac hasn't granted Screen Recording permission yet. If you've already enabled it in System Settings, open “About BigDaddy…” from the menu bar and tap “Granted? Restart App” to apply it."
             )
         )
+    }
+
+    /// 前台浏览器因自动化权限拿不到 URL 时被调用（由 activeWindowInfo 广播）。
+    ///
+    /// 分两种状态给完全不同的处理，这是 macOS 自动化权限的硬约束：
+    /// - notDetermined：系统还没问过用户，这时**主动发一次 Apple Event 才能触发**系统
+    ///   原生授权框。这也是唯一能让 BigDaddy 出现在「系统设置 → 隐私与安全性 → 自动化」
+    ///   列表里的方式——没被弹过窗的 App 在那个列表里根本不存在，直接叫用户去设置里
+    ///   打开是找不到开关的。
+    /// - denied：用户点过"不允许"，系统此后永远不再弹窗，只能引导去系统设置手动勾选。
+    ///
+    /// 每个浏览器只处理一次（automationNoticeShownBundleIDs），孩子在浏览器里每分钟
+    /// 心跳一次，不节流就是每分钟一个弹窗/通知。
+    @objc private func onBrowserAutomationBlocked(_ note: Notification) {
+        guard let bundleID = note.userInfo?["bundleID"] as? String else { return }
+        let reason = note.userInfo?["reason"] as? String
+        // activeWindowInfo 跑在 Task.detached 的后台线程上（见 sendHeartbeat 的注释），
+        // NotificationCenter 又是在发送方线程同步派发的——这个处理器因此默认就在后台
+        // 线程上执行，而它下面碰的全是 UI（菜单重建、本机通知、NSAlert）。显式回主线程。
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.onBrowserAutomationBlocked(note) }
+            return
+        }
+        if reason == BigDaddyClient.UrlUnavailableReason.notPermitted.rawValue {
+            automationDeniedBundleIDs.insert(bundleID)
+        }
+        guard !automationNoticeShownBundleIDs.contains(bundleID) else { return }
+        automationNoticeShownBundleIDs.insert(bundleID)
+
+        let browserName = Self.browserDisplayName(forBundleID: bundleID)
+        if reason == BigDaddyClient.UrlUnavailableReason.notDetermined.rawValue {
+            // 弹授权框的调用会同步阻塞到用户点选为止，必须离开主线程，否则整个客户端
+            // （含菜单栏图标）在用户做决定之前都是僵住的。
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let result = BigDaddyClient.automationPermission(forBundleID: bundleID, promptIfNeeded: true)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if result == .granted {
+                        self.automationDeniedBundleIDs.remove(bundleID)
+                        // 授权当场生效，下一次心跳就能带上 URL，无需重启（这点和屏幕录制不同）
+                        return
+                    }
+                    self.automationDeniedBundleIDs.insert(bundleID)
+                    self.noticeAutomationDenied(browserName: browserName)
+                }
+            }
+            return
+        }
+        noticeAutomationDenied(browserName: browserName)
+    }
+
+    private func noticeAutomationDenied(browserName: String) {
+        rebuildMenu()
+        postLocalNotice(
+            title: Localization.string(zh: "网址记录未生效", en: "Website logging not working"),
+            body: Localization.string(
+                zh: "BigDaddy 还不能读取 \(browserName) 的当前网址，家长端只会看到页面标题、看不到链接。请打开菜单栏「关于 BigDaddy…」，点击「⚠️ 允许读取浏览器网址」完成设置。",
+                en: "BigDaddy can't read the current address in \(browserName), so the parent dashboard shows page titles without links. Open “About BigDaddy…” from the menu bar and tap “⚠️ Allow Browser URL Access”."
+            )
+        )
+    }
+
+    /// bundle id → 给用户看的浏览器名。优先问系统要本地化名称（用户装的是中文版就显示
+    /// 中文名），拿不到时退回 bundle id 末段，至少比整串 id 可读。
+    private static func browserDisplayName(forBundleID bundleID: String) -> String {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return FileManager.default.displayName(atPath: url.path)
+                .replacingOccurrences(of: ".app", with: "")
+        }
+        return bundleID.components(separatedBy: ".").last ?? bundleID
     }
 
     /// 本机通知（无需额外权限），用于把"发生了什么"即时告知使用本机的孩子。
@@ -1878,6 +1970,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         client.hasScreenRecordingAccess()
     }
 
+    /// 绑定自检里"浏览器网址"这一行的状态。自动化权限是逐个浏览器授权的，这里只看
+    /// **当前默认浏览器**：绑定当下多数机器只开着一个浏览器，把全部已装浏览器都列出来
+    /// 会让这个弹窗变成一张清单，反而没人看。其余浏览器由运行期的 onBrowserAutomationBlocked
+    /// 在孩子真正用到它们的那一刻再引导——那时弹窗才和用户正在做的事有关。
+    private func defaultBrowserAutomationState() -> (bundleID: String, permission: BigDaddyClient.AutomationPermission)? {
+        guard let url = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://bigdaddy.mom")!),
+              let bundleID = Bundle(url: url)?.bundleIdentifier,
+              BigDaddyClient.supportedBrowsers[bundleID] != nil else { return nil }
+        return (bundleID, BigDaddyClient.automationPermission(forBundleID: bundleID, promptIfNeeded: false))
+    }
+
     private func createPermissionCheckerView(hasAccessibility: Bool) -> NSView {
         // 创建具有明确 frame 的普通 NSView 作为最外层容器，撑开 NSAlert 的 accessoryView 空间
         let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 60))
@@ -1910,8 +2013,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             action: #selector(openAccessibilitySettings)
         )
         container.addArrangedSubview(accRow)
-        
+
+        // 浏览器网址读取（Apple Events 自动化）：与辅助功能、屏幕录制是三种彼此独立的
+        // TCC 权限，缺了它家长端只有页面标题、没有链接。目标浏览器没在运行时无法判定，
+        // 这一行就不显示——摆一个"未知"状态的勾选行只会让家长以为出了问题。
+        if let state = defaultBrowserAutomationState(), state.permission != .targetNotRunning {
+            let browserName = Self.browserDisplayName(forBundleID: state.bundleID)
+            let row = createPermissionRow(
+                title: Localization.string(zh: "浏览器网址读取", en: "Browser URL Access"),
+                description: Localization.string(
+                    zh: "读取 \(browserName) 当前网址，家长端才能看到可点击的访问记录",
+                    en: "Read the current address in \(browserName) so the dashboard can show clickable links"
+                ),
+                isGranted: state.permission == .granted,
+                action: #selector(authorizeDefaultBrowserAutomation)
+            )
+            container.addArrangedSubview(row)
+            parentView.frame = NSRect(x: 0, y: 0, width: 400, height: 120)
+        }
+
         return parentView
+    }
+
+    /// 绑定自检里"去授权"按钮：对默认浏览器走和运行期同一套引导逻辑
+    @objc private func authorizeDefaultBrowserAutomation() {
+        guard let state = defaultBrowserAutomationState() else { return }
+        automationDeniedBundleIDs.insert(state.bundleID)
+        promptAutomationPermission()
     }
     
     private func createPermissionRow(title: String, description: String, isGranted: Bool, action: Selector) -> NSView {
@@ -1972,33 +2100,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         return row
     }
 
+    /// 绑定前的权限自检。两项权限的"必要程度"不同，处理方式也不同：
+    /// - 辅助功能：缺了连窗口标题都拿不到，守护基本失效，**阻断绑定**；
+    /// - 浏览器网址读取（自动化）：缺了只是家长端看不到链接、仍有标题，属于降级而非
+    ///   失效，所以只在弹窗里如实展示 ❌ 和"去授权"按钮，**不阻断绑定**——为一个可降级
+    ///   的能力挡住整个绑定流程，代价和收益完全不成比例。
     private func checkAndRequestPermissions() -> Bool {
         let hasAccessibility = AXIsProcessTrustedWithOptions(nil)
-        
-        if hasAccessibility {
+        let automation = defaultBrowserAutomationState()
+        let automationNeedsAttention = automation.map {
+            $0.permission != .granted && $0.permission != .targetNotRunning
+        } ?? false
+
+        if hasAccessibility && !automationNeedsAttention {
             return true
         }
-        
+
         let alert = NSAlert()
-        alert.messageText = Localization.string(zh: "需要系统辅助功能权限", en: "Accessibility Permission Required")
-        alert.informativeText = Localization.string(
-            zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要辅助功能权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
-            en: "To protect your child, BigDaddy needs Accessibility permission. Click 'Authorize' to grant access in System Settings, then click 'I've enabled, continue'."
-        )
-        
+        alert.messageText = hasAccessibility
+            ? Localization.string(zh: "还有一项权限建议开启", en: "One More Permission Recommended")
+            : Localization.string(zh: "需要系统辅助功能权限", en: "Accessibility Permission Required")
+        alert.informativeText = hasAccessibility
+            ? Localization.string(
+                zh: "辅助功能已就绪。还差浏览器网址读取权限——没有它，家长端只能看到网页标题、看不到可点击的网址。可以点击右侧「去授权」现在开启，也可以先继续绑定、之后从菜单栏「关于 BigDaddy…」里补上。",
+                en: "Accessibility is ready. Browser URL access is still missing — without it the dashboard shows page titles but no clickable links. Grant it now with 'Authorize', or continue binding and enable it later from “About BigDaddy…”."
+            )
+            : Localization.string(
+                zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要辅助功能权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
+                en: "To protect your child, BigDaddy needs Accessibility permission. Click 'Authorize' to grant access in System Settings, then click 'I've enabled, continue'."
+            )
+
         let accessory = createPermissionCheckerView(hasAccessibility: hasAccessibility)
         alert.accessoryView = accessory
-        
+
         alert.addButton(withTitle: Localization.string(zh: "我已开启，继续绑定", en: "I've enabled, continue"))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
-        
+
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
-            // 家长配置好后点击“继续”，递归刷新自检状态
-            return checkAndRequestPermissions()
+            // 家长配置好后点击“继续”，递归刷新自检状态。
+            // 辅助功能已就绪时不再递归——否则用户选择"网址权限以后再说"就会陷入
+            // 同一个弹窗反复出现、点不掉的死循环。
+            return hasAccessibility ? true : checkAndRequestPermissions()
         }
-        
-        return false
+
+        // 同理，辅助功能没问题就不该因为一个可降级的权限把绑定拦下来
+        return hasAccessibility
     }
 
     private func restartApplication() {
@@ -2020,6 +2167,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     @objc private func openScreenRecordingSettings() {
         CGRequestScreenCaptureAccess()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// "允许读取浏览器网址"按钮：先对每个被拒的浏览器重新查一次当前状态。
+    ///
+    /// 为什么要重查而不是直接开系统设置：用户可能已经在别处授权好了（自动化权限改完
+    /// 立即生效，不像屏幕录制那样有进程级缓存），这时该告诉他"已经好了"，而不是再把
+    /// 他推去设置里找一个已经勾上的开关——屏幕录制那边只能摆两个按钮让用户自己猜，
+    /// 是因为那个状态在本进程内查不准；这里查得准，就不该让用户猜。
+    ///
+    /// 仍是 notDetermined 的，直接弹系统原生授权框（一次点击就能解决）；确实是 denied
+    /// 的，才打开系统设置的自动化面板并说明要勾哪一项。
+    @objc private func promptAutomationPermission() {
+        let targets = Array(automationDeniedBundleIDs)
+        guard !targets.isEmpty else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var stillDenied: [String] = []
+            for bundleID in targets {
+                // promptIfNeeded: true —— notDetermined 时这一步就把系统授权框弹出来了
+                switch BigDaddyClient.automationPermission(forBundleID: bundleID, promptIfNeeded: true) {
+                case .granted:
+                    continue
+                case .targetNotRunning:
+                    // 浏览器没开就无法判定，也无法授权；不算失败，等它下次开起来再说
+                    continue
+                default:
+                    stillDenied.append(bundleID)
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.automationDeniedBundleIDs = Set(stillDenied)
+                if stillDenied.isEmpty {
+                    self.automationNoticeShownBundleIDs.removeAll()
+                    let alert = NSAlert()
+                    alert.messageText = Localization.string(zh: "网址记录已生效", en: "Website Logging Enabled")
+                    alert.informativeText = Localization.string(
+                        zh: "BigDaddy 现在可以读取浏览器当前网址了，下一次上报起家长端就能看到带链接的访问记录，不需要重启。",
+                        en: "BigDaddy can now read the browser's current address. Links will appear in the parent dashboard from the next report on — no restart needed."
+                    )
+                    self.applyShieldIcon(to: alert)
+                    alert.runModal()
+                    return
+                }
+                self.showAutomationSettingsGuidance(bundleIDs: stillDenied)
+            }
+        }
+    }
+
+    /// 用户此前点过"不允许"，系统不会再弹框，只能引导去系统设置手动勾选。
+    /// 文案里点名具体浏览器：那个面板下是「BigDaddy」一栏里列着一串目标应用的勾选框，
+    /// 不说清楚要勾哪个，用户很容易只勾了一个就以为设置完了。
+    private func showAutomationSettingsGuidance(bundleIDs: [String]) {
+        let names = bundleIDs.map { Self.browserDisplayName(forBundleID: $0) }.joined(separator: "、")
+        let alert = NSAlert()
+        alert.messageText = Localization.string(zh: "需要在系统设置里手动开启", en: "Enable It in System Settings")
+        alert.informativeText = Localization.string(
+            zh: "系统记录了此前的「不允许」，不会再自动询问。请在打开的「隐私与安全性 → 自动化」里找到 BigDaddy，勾选它下面的 \(names)。勾选后立即生效，不需要重启。",
+            en: "macOS remembers the earlier “Don't Allow” and won't ask again. In the Privacy & Security → Automation pane that opens, find BigDaddy and tick \(names) underneath it. It applies immediately — no restart needed."
+        )
+        applyShieldIcon(to: alert)
+        alert.addButton(withTitle: Localization.string(zh: "打开系统设置", en: "Open System Settings"))
+        alert.addButton(withTitle: Localization.string(zh: "稍后", en: "Later"))
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
             NSWorkspace.shared.open(url)
         }
     }

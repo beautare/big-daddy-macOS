@@ -330,6 +330,11 @@ final class BigDaddyClient {
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
                 "accessibilityGranted": AXIsProcessTrustedWithOptions(nil),
+                // 浏览器 URL 这次为什么没拿到（NOT_APPLICABLE 表示前台不是浏览器、一切正常）。
+                // 与上面两个权限位同样每次心跳都带，家长端才能在"这条日志没有链接"的当下
+                // 立刻说清是缺授权还是浏览器没开窗口，而不是只看到一段没有链接的纯文本。
+                "urlUnavailableReason": lastUrlUnavailableReason.rawValue,
+                "browserBundleId": lastBrowserBundleID as Any? ?? NSNull(),
                 // 开机自动启动的当前状态位：与权限位一样每次心跳都上报，家长端因此始终
                 // 能在服务端看到本机是否仍会开机自启，不必依赖"关闭那一刻"的单次事件
                 // 能否送达（那次事件可能因断网落进 PendingQueue 延迟补发）。
@@ -489,83 +494,205 @@ final class BigDaddyClient {
         return averageDiff < 8.0
     }
 
-    // Chromium 系浏览器共用同一套 AppleScript 方言（active tab of first window），
-    // 按应用名匹配即可复用；Safari 用 current tab；Firefox 无 AppleScript URL 接口，返回空
-    // 由窗口标题兜底。注意：AppleScript 自动化是按目标应用逐个授权的 TCC 权限，且需要
-    // Info.plist 里的 NSAppleEventsUsageDescription 才能弹出授权（打包版），否则静默失败。
+    // 受支持的浏览器按 **bundle identifier** 匹配，不再按 localizedName 做子串匹配：
+    // 应用名会随系统语言变化（中文系统下 Safari 的 localizedName 是"Safari浏览器"）、
+    // 会被用户改名，而且子串匹配本身就脆——"Google Chrome" 会抢先命中
+    // "Google Chrome Canary"，"Arc" 会命中 "Archive Utility"，都得靠排序和特例去绕。
+    // bundle id 是稳定且唯一的，一次匹配到底。
     //
-    // 顺序很重要：用 contains 做子串匹配时必须"长的排前面"，否则 "Google Chrome" 会
-    // 抢先命中 "Google Chrome Canary"，导致对错误的应用发 AppleScript。
-    private static let chromiumBrowserNames = [
-        "Google Chrome Canary", "Google Chrome", "Chromium",
-        "Microsoft Edge", "Brave Browser", "Vivaldi", "Opera"
+    // 注意：AppleScript 自动化是按"发起方 App × 目标 App"逐对授权的 TCC 权限
+    // （kTCCServiceAppleEvents），与辅助功能、屏幕录制完全独立，且需要 Info.plist 里的
+    // NSAppleEventsUsageDescription 才能弹出授权框，否则静默失败。
+    enum BrowserDialect {
+        /// Chromium 系：`title`/`URL` of active tab
+        case chromium
+        /// Safari 系：`name`/`URL` of current tab
+        case safari
+    }
+
+    static let supportedBrowsers: [String: BrowserDialect] = [
+        "com.google.Chrome": .chromium,
+        "com.google.Chrome.canary": .chromium,
+        "com.google.Chrome.beta": .chromium,
+        "com.google.Chrome.dev": .chromium,
+        "org.chromium.Chromium": .chromium,
+        "com.microsoft.edgemac": .chromium,
+        "com.microsoft.edgemac.Beta": .chromium,
+        "com.brave.Browser": .chromium,
+        "com.brave.Browser.beta": .chromium,
+        "com.vivaldi.Vivaldi": .chromium,
+        "com.operasoftware.Opera": .chromium,
+        "company.thebrowser.Browser": .chromium,   // Arc
+        "company.thebrowser.dia": .chromium,       // Dia
+        "com.apple.Safari": .safari,
+        "com.apple.SafariTechnologyPreview": .safari
     ]
+
+    /// 前台是浏览器却拿不到 URL 时，究竟卡在哪一步。之前这些情况全部收敛成同一个空
+    /// 字符串，客户端、后端、家长三方都无从判断"这台设备为什么没有网址记录"——
+    /// 是权限没给（需要引导授权），还是浏览器压根没开窗口（正常，不该打扰用户），
+    /// 又或者用的是 Firefox（能力边界，永远拿不到）。原因码随心跳上报，家长端据此提示。
+    enum UrlUnavailableReason: String {
+        /// 前台不是浏览器，本来就没有 URL 可言
+        case notApplicable = "NOT_APPLICABLE"
+        /// Firefox 等没有 AppleScript URL 接口的浏览器
+        case unsupportedBrowser = "UNSUPPORTED_BROWSER"
+        /// 自动化权限被拒（-1743），需要引导家长去系统设置打开
+        case notPermitted = "NOT_PERMITTED"
+        /// 还没弹过授权框（-1744），可以主动触发一次系统授权
+        case notDetermined = "NOT_DETERMINED"
+        /// 浏览器在跑但没有可脚本窗口（-1719 / count 为 0），属正常状态
+        case noWindow = "NO_WINDOW"
+        /// 其他脚本错误，具体错误码见 NSLog
+        case scriptFailed = "SCRIPT_FAILED"
+    }
+
+    /// 自动化权限的三态。用 AEDeterminePermissionToAutomateTarget 查询，
+    /// askUserIfNeeded 为 false 时**不弹窗、不打扰**，可以每次心跳顺手查一次。
+    /// 这是唯一能在进程内确定 BigDaddy 自己（而非 Terminal）授权状态的途径——
+    /// TCC 按发起进程的代码签名身份记账，命令行里怎么试都测不到本 App 的状态。
+    enum AutomationPermission: Equatable {
+        case granted
+        /// 用户点过"不允许"，之后不会再弹窗，只能去系统设置手动打开
+        case denied
+        /// 还没问过，可以弹一次系统授权框
+        case notDetermined
+        /// 目标浏览器没在运行，本次无法判定
+        case targetNotRunning
+        case unknown(OSStatus)
+    }
+
+    /// errAEEventWouldRequireUserConsent，部分 SDK 版本没有导出这个常量，用字面量兜底
+    private static let errAEEventWouldRequireUserConsentCode: OSStatus = -1744
+
+    /// 查询本进程对指定 bundle id 的自动化授权状态。
+    /// - Parameter promptIfNeeded: true 时在"尚未询问"状态下会**同步阻塞并弹出**系统
+    ///   授权框，因此只能在后台线程调用，且必须由明确的引导流程触发，不能挂在心跳上。
+    static func automationPermission(forBundleID bundleID: String, promptIfNeeded: Bool) -> AutomationPermission {
+        var target = AEAddressDesc()
+        let bytes = Array(bundleID.utf8)
+        // AECreateDesc 返回的是 OSErr(Int16)，AEDeterminePermissionToAutomateTarget 返回
+        // 的是 OSStatus(Int32)，统一成后者再对外暴露
+        let createStatus = OSStatus(AECreateDesc(typeApplicationBundleID, bytes, bytes.count, &target))
+        guard createStatus == noErr else { return .unknown(createStatus) }
+        defer { AEDisposeDesc(&target) }
+
+        let status = AEDeterminePermissionToAutomateTarget(&target, typeWildCard, typeWildCard, promptIfNeeded)
+        switch status {
+        case noErr:
+            return .granted
+        case OSStatus(errAEEventNotPermitted):
+            return .denied
+        case errAEEventWouldRequireUserConsentCode:
+            return .notDetermined
+        case OSStatus(procNotFound):
+            return .targetNotRunning
+        default:
+            return .unknown(status)
+        }
+    }
 
     /// 标题和 URL 在同一个 AppleScript 往返里一起拿，中间用这个几乎不可能出现在真实
     /// 标题/URL 里的不可见字符拼接，回来后再拆开——避免对同一个浏览器发两次独立的
     /// Apple Event（各自都是一次完整的 tell-application 往返）。
     private static let browserFieldSeparator = "\u{2063}"
 
-    /// 生成向指定浏览器一次性查询"当前标签页标题 + URL"的 AppleScript，非受支持的
-    /// 浏览器返回 nil。属性名在不同浏览器里不同：Chromium 系是 `title`/`URL` of
-    /// active tab，Safari 是 `name`/`URL` of current tab。
-    private func browserTabCombinedScript(appName: String) -> String? {
+    /// 生成向指定浏览器一次性查询"当前标签页标题 + URL"的 AppleScript。
+    ///
+    /// 脚本自带 try/on error 分支并返回 "OK"/"ERR" 前缀的结构化结果：浏览器侧的错误
+    /// （典型的是 -1719 没有窗口）必须能和"权限被拒"区分开。注意 -1743 是 TCC 在脚本体
+    /// 执行**之前**就拦下的，落不进这个 on error 分支，只能由 Swift 侧读 NSAppleScript
+    /// 错误字典里的 NSAppleScriptErrorNumber——两层都要，少一层就漏一类。
+    ///
+    /// 用 `application id` 而不是应用名，与 supportedBrowsers 的匹配键保持一致。
+    private func browserTabCombinedScript(bundleID: String, dialect: BrowserDialect) -> String {
         let sep = BigDaddyClient.browserFieldSeparator
-        if let chromium = BigDaddyClient.chromiumBrowserNames.first(where: { appName.contains($0) }) {
-            return """
-            tell application "\(chromium)"
-                if (count of windows) > 0 then
-                    return (title of active tab of first window) & "\(sep)" & (URL of active tab of first window)
-                end if
-            end tell
-            return ""
-            """
-        } else if appName == "Arc" {
-            // "Arc" 是常见英文词/前缀（"Archive Utility""Arcade"等系统应用都包含它），
-            // 子串匹配风险过高，单独用精确相等判断，不并入上面的 contains 名单。
-            return """
-            tell application "Arc"
-                if (count of windows) > 0 then
-                    return (title of active tab of first window) & "\(sep)" & (URL of active tab of first window)
-                end if
-            end tell
-            return ""
-            """
-        } else if appName.contains("Safari") {
-            return """
-            tell application "Safari"
-                if (count of windows) > 0 then
-                    return (name of current tab of first window) & "\(sep)" & (URL of current tab of first window)
-                end if
-            end tell
-            return ""
-            """
-        }
-        // Firefox 等无脚本接口的浏览器：拿不到，交由窗口标题兜底
-        return nil
+        let tabExpr = dialect == .chromium
+            ? (title: "title of active tab of front window", url: "URL of active tab of front window")
+            : (title: "name of current tab of front window", url: "URL of current tab of front window")
+        return """
+        tell application id "\(bundleID)"
+            try
+                if (count of windows) is 0 then return "ERR\(sep)NO_WINDOW"
+                return "OK\(sep)" & (\(tabExpr.title)) & "\(sep)" & (\(tabExpr.url))
+            on error errMsg number errNum
+                return "ERR\(sep)" & errNum
+            end try
+        end tell
+        """
     }
 
-    private func runAppleScript(_ source: String) -> String {
-        if let script = NSAppleScript(source: source) {
-            var error: NSDictionary?
-            let result = script.executeAndReturnError(&error)
-            if error == nil {
-                return result.stringValue ?? ""
+    /// 执行 AppleScript，成功返回字符串结果，失败返回 NSAppleScript 报的错误码。
+    /// 之前这里把错误整个吞掉、一律返回 ""，导致权限被拒和"浏览器没开窗口"在上层
+    /// 完全无法区分，也没有任何日志——这正是"有的设备有链接、有的没有"查不下去的原因。
+    /// OSStatus 是 Int32，不符合 Error，用不了 Result；这里用一个专门的两态枚举
+    enum AppleScriptOutcome {
+        case success(String)
+        case failure(OSStatus)
+    }
+
+    private func runAppleScript(_ source: String) -> AppleScriptOutcome {
+        guard let script = NSAppleScript(source: source) else { return .failure(OSStatus(errOSAScriptError)) }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        if let error {
+            let code = (error[NSAppleScript.errorNumber] as? NSNumber)?.int32Value ?? OSStatus(errOSAScriptError)
+            return .failure(code)
+        }
+        return .success(result.stringValue ?? "")
+    }
+
+    /// AppleScript 层面的错误码 → 原因码。-1743 只会出现在 NSAppleScript 的错误字典里，
+    /// -1719/-1728 既可能来自脚本内的 on error 分支，也可能来自这里。
+    private func reason(forScriptError code: OSStatus) -> UrlUnavailableReason {
+        switch code {
+        case OSStatus(errAEEventNotPermitted):
+            return .notPermitted
+        case BigDaddyClient.errAEEventWouldRequireUserConsentCode:
+            return .notDetermined
+        case OSStatus(errAEIllegalIndex), OSStatus(errAENoSuchObject):
+            return .noWindow
+        default:
+            return .scriptFailed
+        }
+    }
+
+    /// 浏览器场景下的标题 + URL，一次 AppleScript 往返拿全。
+    /// 拿不到时返回具体原因，交由调用方回退到 CGWindowList/Accessibility（那两条路只有
+    /// 标题，没有 URL），并把原因随心跳上报。
+    private func browserTabInfo(bundleID: String, dialect: BrowserDialect)
+        -> (info: (title: String, url: String)?, reason: UrlUnavailableReason?) {
+        let script = browserTabCombinedScript(bundleID: bundleID, dialect: dialect)
+        switch runAppleScript(script) {
+        case .failure(let code):
+            let reason = reason(forScriptError: code)
+            NSLog("BigDaddy: AppleScript to \(bundleID) failed, OSStatus=\(code), reason=\(reason.rawValue)")
+            return (nil, reason)
+        case .success(let raw):
+            let parts = raw.components(separatedBy: BigDaddyClient.browserFieldSeparator)
+            if parts.first == "OK", parts.count == 3 {
+                // 极少数情况下浏览器会回一个空 URL（如刚打开、尚未导航的标签页），
+                // 这不算失败，但也没有链接可展示，按"没有窗口内容"归类。
+                guard !parts[2].isEmpty else { return (nil, .noWindow) }
+                return ((title: parts[1], url: parts[2]), nil)
             }
+            if parts.first == "ERR", parts.count == 2 {
+                if parts[1] == "NO_WINDOW" { return (nil, .noWindow) }
+                let code = OSStatus(parts[1]) ?? OSStatus(errOSAScriptError)
+                let reason = reason(forScriptError: code)
+                NSLog("BigDaddy: \(bundleID) reported script error \(code), reason=\(reason.rawValue)")
+                return (nil, reason)
+            }
+            NSLog("BigDaddy: unexpected AppleScript payload from \(bundleID): \(raw.prefix(120))")
+            return (nil, .scriptFailed)
         }
-        return ""
     }
 
-    /// 浏览器场景下的标题 + URL，一次 AppleScript 往返拿全；非浏览器或脚本失败返回 nil，
-    /// 交由调用方回退到 CGWindowList/Accessibility（那两条路只有标题，没有 URL）。
-    private func browserTabInfo(appName: String) -> (title: String, url: String)? {
-        guard let script = browserTabCombinedScript(appName: appName) else { return nil }
-        let raw = runAppleScript(script)
-        guard !raw.isEmpty else { return nil }
-        let parts = raw.components(separatedBy: BigDaddyClient.browserFieldSeparator)
-        guard parts.count == 2 else { return nil }
-        return (title: parts[0], url: parts[1])
-    }
+    /// 最近一次取活动窗口时，浏览器 URL 为什么没拿到。随心跳上报给后端，
+    /// 家长端据此把"没有链接"从一个哑状态变成一句可行动的提示。
+    private(set) var lastUrlUnavailableReason: UrlUnavailableReason = .notApplicable
+    /// 最近一次遇到的浏览器 bundle id，配合上面的原因码定位是哪个浏览器没授权
+    private(set) var lastBrowserBundleID: String?
 
     /// 一次心跳/截图需要的"活动窗口标题 + 浏览器 URL"。浏览器优先走上面的合并 AppleScript
     /// 查询：下面的 CGWindowList(kCGWindowName) 与 Accessibility 两条路都需要屏幕录制或
@@ -573,10 +700,35 @@ final class BigDaddyClient {
     /// 自动化是另一套按目标应用逐个授权的 TCC 权限，用它能在缺屏幕录制权限时仍抓到主流
     /// 浏览器的当前页面标题（顺带把 URL 也拿到，不需要再发一次 Apple Event）。
     func activeWindowInfo() -> (title: String, url: String) {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return ("", "") }
-        let appName = frontApp.localizedName ?? ""
-        if let info = browserTabInfo(appName: appName) {
-            return info
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else {
+            lastUrlUnavailableReason = .notApplicable
+            lastBrowserBundleID = nil
+            return ("", "")
+        }
+        let bundleID = frontApp.bundleIdentifier ?? ""
+
+        if let dialect = BigDaddyClient.supportedBrowsers[bundleID] {
+            lastBrowserBundleID = bundleID
+            let (info, reason) = browserTabInfo(bundleID: bundleID, dialect: dialect)
+            if let info {
+                lastUrlUnavailableReason = .notApplicable
+                return info
+            }
+            lastUrlUnavailableReason = reason ?? .scriptFailed
+            // 权限类失败广播出去，由 AppDelegate 决定要不要引导用户（带节流）
+            if lastUrlUnavailableReason == .notPermitted || lastUrlUnavailableReason == .notDetermined {
+                NotificationCenter.default.post(
+                    name: BigDaddyClient.browserAutomationBlockedNotification,
+                    object: nil,
+                    userInfo: ["bundleID": bundleID, "reason": lastUrlUnavailableReason.rawValue]
+                )
+            }
+        } else if BigDaddyClient.knownUnscriptableBrowsers.contains(bundleID) {
+            lastBrowserBundleID = bundleID
+            lastUrlUnavailableReason = .unsupportedBrowser
+        } else {
+            lastBrowserBundleID = nil
+            lastUrlUnavailableReason = .notApplicable
         }
 
         let pid = frontApp.processIdentifier
@@ -595,6 +747,19 @@ final class BigDaddyClient {
         }
         return (accessibilityWindowTitle(pid: pid), "")
     }
+
+    /// 有 AppleScript 字典但没有 URL 接口的浏览器：明确归类成"能力边界"而不是
+    /// "未授权"，避免家长端对着 Firefox 反复提示去授权一个根本不存在的开关。
+    static let knownUnscriptableBrowsers: Set<String> = [
+        "org.mozilla.firefox",
+        "org.mozilla.firefoxdeveloperedition",
+        "org.mozilla.nightly",
+        "org.torproject.torbrowser",
+        "com.apple.SafariViewService"
+    ]
+
+    /// 前台浏览器因自动化权限缺失而拿不到 URL 时广播，由 AppDelegate 节流后引导用户授权
+    static let browserAutomationBlockedNotification = Notification.Name("BigDaddyBrowserAutomationBlocked")
 
     /// Accessibility 兜底：读焦点窗口的 AXTitle。需要辅助功能授权（同样受 dev 构建
     /// 签名不稳定影响），但在已授权时能在屏幕录制权限缺失的情况下仍拿到标题。
