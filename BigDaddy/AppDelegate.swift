@@ -2140,12 +2140,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if response == .alertFirstButtonReturn {
             // 家长配置好后点击“继续”，递归刷新自检状态。
             // 辅助功能已就绪时不再递归——否则用户选择"网址权限以后再说"就会陷入
-            // 同一个弹窗反复出现、点不掉的死循环。
+            // 同一个弹窗反复出现、点不掉的死循环；"不阻断"靠的是这颗"继续"按钮放行，
+            // 而不是把「取消」也偷偷当成继续。
             return hasAccessibility ? true : checkAndRequestPermissions()
         }
 
-        // 同理，辅助功能没问题就不该因为一个可降级的权限把绑定拦下来
-        return hasAccessibility
+        // 取消就是取消：即便只差可降级的网址权限，用户点「取消」也应中止绑定流程，
+        // 想跳过网址权限继续绑定的话，上面的「继续」按钮本来就是干这个的。
+        return false
     }
 
     private func restartApplication() {
