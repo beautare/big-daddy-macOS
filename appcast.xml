@@ -7,6 +7,15 @@
     <language>zh</language>
     <!-- ITEMS -->
     <item>
+      <title>Version 0.9.3</title>
+      <pubDate>Mon, 27 Jul 2026 13:52:55 +0000</pubDate>
+      <sparkle:version>66</sparkle:version>
+      <sparkle:shortVersionString>0.9.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.3/BigDaddy-v0.9.3.dmg" sparkle:edSignature="u3AU7a3JjKWNh1MFVPvlb1Q8IHWUyV4cu9RwRjE0fIt+TgVDxKogb/bRz87nM3f11ui1MFOpwcHpKRjxsXf4Bw==" length="1745299" type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 0.9.2</title>
       <pubDate>Mon, 27 Jul 2026 13:41:09 +0000</pubDate>
       <sparkle:version>65</sparkle:version>
