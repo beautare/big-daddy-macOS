@@ -940,7 +940,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // （含菜单栏图标）在用户做决定之前都是僵住的。
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 let probe = self?.client.probeAutomation(bundleID: bundleID)
-                DispatchQueue.main.async {
+                // 内层闭包显式重新弱捕获 self，而不是沿用外层 [weak self] 解出来的那个
+                // 变量——后者是"跨并发边界引用被捕获的 var"，Swift 6 下是错误。
+                DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     if probe?.permission == .granted {
                         self.automationDeniedBundleIDs.remove(bundleID)
@@ -1001,9 +1003,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 记账放在探测之后：中途进程被杀的话，这些浏览器下次启动还会再预热一次，
             // 比"记了账却没真发出去、从此再也不预热"要好。
             UserDefaults.standard.set(Array(warmed.union(targets)), forKey: warmedKey)
-            DispatchQueue.main.async {
-                guard let self, !stillBlocked.isEmpty else { return }
-                self.automationDeniedBundleIDs.formUnion(stillBlocked)
+            // 跨线程边界前定格成不可变副本：直接捕获上面那个 var，编译器无法证明
+            // "派发之后不会再被改"，Swift 6 下会直接判成错误（旧版编译器只给警告）。
+            let blocked = stillBlocked
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !blocked.isEmpty else { return }
+                self.automationDeniedBundleIDs.formUnion(blocked)
                 self.rebuildMenu()
             }
         }
@@ -2408,19 +2413,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     noRecord.append(bundleID)
                 }
             }
-            DispatchQueue.main.async {
+            // 跨线程边界前定格成不可变副本：直接捕获上面那三个 var，编译器无法证明
+            // "派发之后不会再被改"，Swift 6 下会直接判成错误（旧版编译器只给警告）。
+            let (finalDenied, finalNoRecord, finalEvidence) = (denied, noRecord, evidence)
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.automationDeniedBundleIDs = Set(denied + noRecord)
+                self.automationDeniedBundleIDs = Set(finalDenied + finalNoRecord)
                 self.rebuildMenu()
-                if denied.isEmpty && noRecord.isEmpty {
+                if finalDenied.isEmpty && finalNoRecord.isEmpty {
                     self.automationNoticeShownAt.removeAll()
-                    self.showAutomationGranted(evidence: evidence)
+                    self.showAutomationGranted(evidence: finalEvidence)
                     return
                 }
-                if !denied.isEmpty {
-                    self.showAutomationSettingsGuidance(bundleIDs: denied)
+                if !finalDenied.isEmpty {
+                    self.showAutomationSettingsGuidance(bundleIDs: finalDenied)
                 } else {
-                    self.showAutomationPromptUnavailable(bundleIDs: noRecord)
+                    self.showAutomationPromptUnavailable(bundleIDs: finalNoRecord)
                 }
             }
         }
