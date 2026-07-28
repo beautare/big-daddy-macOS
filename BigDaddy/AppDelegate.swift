@@ -122,10 +122,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 翻转（见 pollConfigForChildVisibility）都会复位，让下一段新的"开着但缺权限"
     /// 期间还能再提醒一次。
     private var missingPermissionNoticeShown = false
-    /// 已经就"浏览器自动化权限"提醒/弹窗过的浏览器 bundle id。与屏幕录制那个布尔开关
-    /// 不同，这里必须按浏览器分区：自动化是"发起方 × 目标"逐对授权的，孩子换个浏览器
-    /// 就是一份全新的、同样需要引导的授权，不能因为提醒过 Chrome 就对 Safari 闭嘴。
-    private var automationNoticeShownBundleIDs: Set<String> = []
+    /// 上一次就"浏览器自动化权限"提醒过的时间，按浏览器 bundle id 分区。
+    ///
+    /// 按浏览器分区：自动化是"发起方 × 目标"逐对授权的，孩子换个浏览器就是一份全新的、
+    /// 同样需要引导的授权，不能因为提醒过 Chrome 就对 Safari 闭嘴。
+    ///
+    /// 记时间而不是"提醒过没有"：这个客户端设计上常年不退出（开机自启 + 无人值守），
+    /// 一个进程生命周期内只提醒一次，实际效果就是家长错过第一次通知之后再也收不到第二次。
+    /// 改成按 automationNoticeInterval 衰减，既不会每分钟心跳都骚扰，也不会永久闭嘴。
+    private var automationNoticeShownAt: [String: Date] = [:]
+    /// 同一个浏览器两次"网址未授权"提醒之间的最小间隔
+    private static let automationNoticeInterval: TimeInterval = 24 * 60 * 60
+    /// 绑定自检弹窗里最多列几个浏览器（NSAlert 的 accessoryView 不滚动，见 createPermissionCheckerView）
+    private static let maxBrowserPermissionRows = 5
     /// 是否有浏览器处于"自动化权限被拒"状态——决定"关于"面板里要不要出现引导入口。
     /// 记 bundle id 而不是布尔，是为了在面板文案里说清楚是哪个浏览器。
     private var automationDeniedBundleIDs: Set<String> = []
@@ -250,6 +259,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 }
                 rebuildMenu()
                 presentCredentialsAlertIfNeeded()
+                // 已绑定的机器上装了新浏览器时，这里补一次预热——每个 bundle id 一生
+                // 只会走到一次，已经预热过的启动不会有任何动静（见方法注释）
+                warmAutomationConsentIfNeeded()
             }
         }
     }
@@ -324,6 +336,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(NSMenuItem(
                 title: Localization.string(zh: "⚡️ 绑定本设备…", en: "⚡️ Bind This Mac…"),
                 action: #selector(showBindEntry), keyEquivalent: "b"
+            ))
+            menu.addItem(.separator())
+        }
+
+        // 浏览器网址未授权：这是一条**可点即修**的待办，必须留在一级菜单。
+        //
+        // 之前它只存在于两个地方：一次性的本机通知（错过就没了）和「关于 BigDaddy…」
+        // 里的一颗按钮（要先知道去那儿翻）。结果是家长端一直显示"网址未授权"，而机器
+        // 跟前的人根本不知道有个开关等着点。放在这里，图标上的 ⚠️ 也就有了落点。
+        if client.config.bound && !automationDeniedBundleIDs.isEmpty {
+            menu.addItem(NSMenuItem(
+                title: Localization.string(
+                    zh: "⚠️ 浏览器网址未授权 · 点此修复",
+                    en: "⚠️ Browser URL access off · Fix it"
+                ),
+                action: #selector(promptAutomationPermission), keyEquivalent: ""
             ))
             menu.addItem(.separator())
         }
@@ -748,6 +776,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                         self.scheduleTimers()
                         self.rebuildMenu()
                         self.updateStatusItemAppearance()
+                        // 绑定即家长在场：此刻是把浏览器授权一次问清楚的最好时机，
+                        // 错过它就只能等孩子日后被逐个浏览器零散打断（见该方法注释）
+                        self.warmAutomationConsentIfNeeded()
                         self.postLocalNotice(
                             title: Localization.string(zh: "绑定成功", en: "Binding successful"),
                             body: Localization.string(
@@ -768,10 +799,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 让菜单栏图标反映当前"截图是否开启 / 是否正在截图 / 权限是否缺失"，作为孩子端常驻可见指示。
     /// - off: 盾牌；on: 眼睛（正被家长可视）；capturing: 相机（此刻正在截屏）；
     /// - missingPermission: 家长已开启截图但系统权限未授权，三角警示号提示"配置了但实际不生效"。
+    ///
+    /// 浏览器网址未授权也走同一个 ⚠️ 状态：两者是同一类问题（配置了但实际不生效），
+    /// 用同一套视觉语言，点开菜单第一眼就能看到对应那条待办。屏幕录制排在前面——
+    /// 它缺失时家长一张截图都收不到，比"有标题没链接"更严重。
     private func updateStatusItemAppearance(capturing: Bool = false) {
         guard let button = statusItem?.button else { return }
         let on = client.config.screenshotEnabled
-        let missingPermission = on && !checkScreenRecordingPermission()
+        let missingScreenRecording = on && !checkScreenRecordingPermission()
+        let missingAutomation = client.config.bound && !automationDeniedBundleIDs.isEmpty
+        let missingPermission = missingScreenRecording || missingAutomation
         if #available(macOS 11.0, *) {
             let desc: String
             let image: NSImage?
@@ -780,7 +817,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
             } else if missingPermission {
                 image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
-                desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限", en: "BigDaddy screenshots on but missing system permission")
+                desc = missingScreenRecording
+                    ? Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限",
+                                          en: "BigDaddy screenshots on but missing system permission")
+                    : Localization.string(zh: "BigDaddy 缺少浏览器网址读取权限",
+                                          en: "BigDaddy is missing browser URL access")
             } else if on {
                 image = NSImage(systemSymbolName: "eye", accessibilityDescription: nil)
                 desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
@@ -872,8 +913,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     ///   打开是找不到开关的。
     /// - denied：用户点过"不允许"，系统此后永远不再弹窗，只能引导去系统设置手动勾选。
     ///
-    /// 每个浏览器只处理一次（automationNoticeShownBundleIDs），孩子在浏览器里每分钟
-    /// 心跳一次，不节流就是每分钟一个弹窗/通知。
+    /// 每个浏览器按 automationNoticeInterval 节流，孩子在浏览器里每分钟心跳一次，
+    /// 不节流就是每分钟一个弹窗/通知。
     @objc private func onBrowserAutomationBlocked(_ note: Notification) {
         guard let bundleID = note.userInfo?["bundleID"] as? String else { return }
         let reason = note.userInfo?["reason"] as? String
@@ -886,22 +927,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
         if reason == BigDaddyClient.UrlUnavailableReason.notPermitted.rawValue {
             automationDeniedBundleIDs.insert(bundleID)
+            // 菜单栏那条一级警示项和图标状态都由这个集合驱动，插入后要立刻重绘——
+            // 常驻入口不受下面的通知节流管辖，本来就该在第一时间出现。
+            rebuildMenu()
         }
-        guard !automationNoticeShownBundleIDs.contains(bundleID) else { return }
-        automationNoticeShownBundleIDs.insert(bundleID)
+        guard shouldPostAutomationNotice(for: bundleID) else { return }
 
         let browserName = Self.browserDisplayName(forBundleID: bundleID)
         if reason == BigDaddyClient.UrlUnavailableReason.notDetermined.rawValue {
-            // 同样用真实 Apple Event 触发系统询问，理由见 probeAutomationByRealEvent。
+            // 同样用真实 Apple Event 触发系统询问，理由见 probeAutomation。
             // 这个调用会同步阻塞到用户点选为止，必须离开主线程，否则整个客户端
             // （含菜单栏图标）在用户做决定之前都是僵住的。
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let result = self?.client.probeAutomationByRealEvent(bundleID: bundleID)
+                let probe = self?.client.probeAutomation(bundleID: bundleID)
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    if result == .granted {
+                    if probe?.permission == .granted {
                         self.automationDeniedBundleIDs.remove(bundleID)
                         // 授权当场生效，下一次心跳就能带上 URL，无需重启（这点和屏幕录制不同）
+                        self.rebuildMenu()
                         return
                     }
                     self.automationDeniedBundleIDs.insert(bundleID)
@@ -913,13 +957,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         noticeAutomationDenied(browserName: browserName)
     }
 
+    /// 已经主动预热过自动化授权的浏览器 bundle id，跨启动持久化
+    private static let warmedAutomationTargetsKey = "BigDaddyWarmedAutomationTargets"
+
+    /// 绑定完成后，主动给每个"已安装且正在运行"的受支持浏览器各发一次真实 Apple Event，
+    /// 让 macOS 当场弹出授权询问、并在 TCC 里建出记录。
+    ///
+    /// 为什么非要主动发：系统设置的「隐私与安全性 → 自动化」**只列出已经产生过 TCC 记录
+    /// 的 App**，而记录只有在真的发过一次事件之后才存在。不预热的话，家长按我们的提示
+    /// 打开那个面板，看到的是一个根本没有 BigDaddy 的列表——"去设置里勾上"这条退路在
+    /// 那之前是死的（showAutomationPromptUnavailable 就是在给这种情况擦屁股）。
+    ///
+    /// 三条约束都是必要的，不是保守：
+    /// - **只在绑定后**：未绑定时不上报任何数据，这个权限没有意义，不该打扰；
+    /// - **只对运行中的浏览器**：`tell application id` 会把没运行的目标 App **启动起来**，
+    ///   绑定那一刻凭空弹出四个浏览器窗口是不可接受的；
+    /// - **每个浏览器一生只预热一次**（持久化）：预热的目的是建记录，记录建好之后再发
+    ///   就只是重复打扰了；后续状态变化由运行期的 onBrowserAutomationBlocked 接手。
+    ///
+    /// 串行而不是并发：并发发四个事件会让系统把四个授权框叠在一起，用户看不清自己在同意什么。
+    private func warmAutomationConsentIfNeeded() {
+        guard client.config.bound else { return }
+        let warmedKey = Self.warmedAutomationTargetsKey
+        let warmed = Set(UserDefaults.standard.stringArray(forKey: warmedKey) ?? [])
+        let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+        let targets = BigDaddyClient.installedSupportedBrowsers()
+            .filter { running.contains($0) && !warmed.contains($0) }
+        guard !targets.isEmpty else { return }
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            // 每次调用都会同步阻塞到用户在系统授权框上点选为止——这正是我们要的效果，
+            // 但因此绝不能放在主线程上，否则菜单栏图标在用户做决定之前整个僵住。
+            var stillBlocked: [String] = []
+            for bundleID in targets {
+                guard let probe = self?.client.probeAutomation(bundleID: bundleID) else { return }
+                switch probe.permission {
+                case .granted, .targetNotRunning:
+                    continue
+                default:
+                    stillBlocked.append(bundleID)
+                }
+            }
+            // 记账放在探测之后：中途进程被杀的话，这些浏览器下次启动还会再预热一次，
+            // 比"记了账却没真发出去、从此再也不预热"要好。
+            UserDefaults.standard.set(Array(warmed.union(targets)), forKey: warmedKey)
+            DispatchQueue.main.async {
+                guard let self, !stillBlocked.isEmpty else { return }
+                self.automationDeniedBundleIDs.formUnion(stillBlocked)
+                self.rebuildMenu()
+            }
+        }
+    }
+
+    /// 距离上次就这个浏览器提醒是否已经超过 automationNoticeInterval。
+    /// 返回 true 的同时就地记账，调用方拿到 true 即可直接提醒。
+    private func shouldPostAutomationNotice(for bundleID: String) -> Bool {
+        if let last = automationNoticeShownAt[bundleID],
+           Date().timeIntervalSince(last) < Self.automationNoticeInterval {
+            return false
+        }
+        automationNoticeShownAt[bundleID] = Date()
+        return true
+    }
+
     private func noticeAutomationDenied(browserName: String) {
         rebuildMenu()
         postLocalNotice(
             title: Localization.string(zh: "网址记录未生效", en: "Website logging not working"),
             body: Localization.string(
-                zh: "BigDaddy 还不能读取 \(browserName) 的当前网址，家长端只会看到页面标题、看不到链接。请打开菜单栏「关于 BigDaddy…」，点击「⚠️ 允许读取浏览器网址」完成设置。",
-                en: "BigDaddy can't read the current address in \(browserName), so the parent dashboard shows page titles without links. Open “About BigDaddy…” from the menu bar and tap “⚠️ Allow Browser URL Access”."
+                zh: "BigDaddy 还不能读取 \(browserName) 的当前网址，家长端只会看到页面标题、看不到链接。请点开菜单栏的 BigDaddy 图标，选择「⚠️ 浏览器网址未授权 · 点此修复」。",
+                en: "BigDaddy can't read the current address in \(browserName), so the parent dashboard shows page titles without links. Click the BigDaddy menu bar icon and choose “⚠️ Browser URL access off · Fix it”."
             )
         )
     }
@@ -1082,6 +1189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 也要强制恢复开机自启，抵消未绑定期间可能的关闭
                 if client.config.bound {
                     enforceLaunchAtLoginOnBind()
+                    warmAutomationConsentIfNeeded()
                 }
             } else if client.config.screenshotIntervalMins != intervalBefore {
                 // 关键修复：家长在仪表盘改了截图间隔后，之前这里只更新了 config 值、
@@ -1971,21 +2079,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         client.hasScreenRecordingAccess()
     }
 
-    /// 绑定自检里"浏览器网址"这一行的状态。自动化权限是逐个浏览器授权的，这里只看
-    /// **当前默认浏览器**：绑定当下多数机器只开着一个浏览器，把全部已装浏览器都列出来
-    /// 会让这个弹窗变成一张清单，反而没人看。其余浏览器由运行期的 onBrowserAutomationBlocked
-    /// 在孩子真正用到它们的那一刻再引导——那时弹窗才和用户正在做的事有关。
-    private func defaultBrowserAutomationState() -> (bundleID: String, permission: BigDaddyClient.AutomationPermission)? {
-        guard let url = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://bigdaddy.mom")!),
-              let bundleID = Bundle(url: url)?.bundleIdentifier,
-              BigDaddyClient.supportedBrowsers[bundleID] != nil else { return nil }
-        return (bundleID, BigDaddyClient.automationPermission(forBundleID: bundleID, promptIfNeeded: false))
+    /// 绑定自检里"浏览器网址"这些行的状态。
+    ///
+    /// 列的是**本机已安装的每一个受支持浏览器**，不是只看默认浏览器：自动化权限按
+    /// "发起方 × 目标"逐对授权，孩子同时装着 Chrome / Arc / Brave / Vivaldi 是常态，
+    /// 只查默认浏览器意味着另外三个要等孩子真的用到、被运行期的 onBrowserAutomationBlocked
+    /// 逐个打断才浮出来。把日后四次零散打断换成绑定那一刻的一次集中确认，对家长和孩子
+    /// 都更省事，家长也才第一次看清"这台机器上到底有几个浏览器要管"。
+    ///
+    /// 一律用 promptIfNeeded: false：这里只是渲染一张清单，不能同步阻塞去弹授权框。
+    private func browserAutomationStates() -> [(bundleID: String, permission: BigDaddyClient.AutomationPermission)] {
+        BigDaddyClient.installedSupportedBrowsers().map {
+            ($0, BigDaddyClient.automationPermission(forBundleID: $0, promptIfNeeded: false))
+        }
+    }
+
+    /// 上面那些浏览器里"用户还需要做点什么"的部分。
+    ///
+    /// targetNotRunning 不算：浏览器没在跑时既判定不了、也授权不了（系统授权框要求目标
+    /// App 在运行），把它算成"待办"只会在自检里摆一个点了也没用的按钮。这些浏览器会在
+    /// 孩子下次真正打开它们时由 onBrowserAutomationBlocked 接手。
+    private func browserAutomationNeedingAttention() -> [String] {
+        browserAutomationStates()
+            .filter { $0.permission != .granted && $0.permission != .targetNotRunning }
+            .map(\.bundleID)
     }
 
     private func createPermissionCheckerView(hasAccessibility: Bool) -> NSView {
-        // 创建具有明确 frame 的普通 NSView 作为最外层容器，撑开 NSAlert 的 accessoryView 空间
+        // 创建具有明确 frame 的普通 NSView 作为最外层容器，撑开 NSAlert 的 accessoryView 空间。
+        // 高度最后按内容实测（见函数末尾）：浏览器行数由本机装了几个浏览器决定，从 0 到 5
+        // 都有可能，写死高度会把多出来的行裁掉。
         let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 60))
-        
+
         let container = NSStackView()
         container.orientation = .vertical
         container.spacing = 16
@@ -2010,52 +2135,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 zh: "用于读取前台活动窗口标题，生成使用摘要（家庭已知情）",
                 en: "Read active window titles to build usage summaries (with the family's knowledge)"
             ),
-            isGranted: hasAccessibility,
+            status: hasAccessibility ? .granted : .needsAction,
             action: #selector(openAccessibilitySettings)
         )
         container.addArrangedSubview(accRow)
 
         // 浏览器网址读取（Apple Events 自动化）：与辅助功能、屏幕录制是三种彼此独立的
-        // TCC 权限，缺了它家长端只有页面标题、没有链接。目标浏览器没在运行时无法判定，
-        // 这一行就不显示——摆一个"未知"状态的勾选行只会让家长以为出了问题。
-        if let state = defaultBrowserAutomationState(), state.permission != .targetNotRunning {
+        // TCC 权限，缺了它家长端只有页面标题、没有链接。每个已安装的受支持浏览器一行——
+        // 这是一份"逐对授权"的清单，合并成一行就说不清到底是哪个浏览器还没授权。
+        //
+        // 但行数必须封顶：Safari 在每台 Mac 上都存在，再叠上 Chrome 的 canary/beta/dev、
+        // Edge、Brave、Vivaldi、Opera、Arc……装得多的机器能凑出十几行，而 NSAlert 的
+        // accessoryView 不会滚动，太高会把下面的按钮顶出屏幕。排序上让"待办"排在最前，
+        // 保证被截掉的永远是已授权/无法判定这类不需要动手的行。
+        let allStates = browserAutomationStates()
+        let ranked = allStates.enumerated().sorted { lhs, rhs in
+            let rank: (BigDaddyClient.AutomationPermission) -> Int = {
+                switch $0 {
+                case .granted: return 2
+                case .targetNotRunning: return 1
+                default: return 0    // 需要用户处理的排最前
+                }
+            }
+            let (lRank, rRank) = (rank(lhs.element.permission), rank(rhs.element.permission))
+            // 同档内保持 installedSupportedBrowsers 定下的顺序（运行中的在前）
+            return lRank == rRank ? lhs.offset < rhs.offset : lRank < rRank
+        }.map(\.element)
+        for state in ranked.prefix(Self.maxBrowserPermissionRows) {
             let browserName = Self.browserDisplayName(forBundleID: state.bundleID)
+            // 没在运行的浏览器判定不了，也授权不了：如实标成"未运行"而不是 ❌。
+            // 摆一个点了没反应的"去授权"按钮，比不摆更伤信任。
+            let status: PermissionRowStatus
+            switch state.permission {
+            case .granted: status = .granted
+            case .targetNotRunning: status = .indeterminate
+            default: status = .needsAction
+            }
             let row = createPermissionRow(
-                title: Localization.string(zh: "浏览器网址读取", en: "Browser URL Access"),
-                description: Localization.string(
-                    zh: "读取 \(browserName) 当前网址，家长端才能看到可点击的访问记录",
-                    en: "Read the current address in \(browserName) so the dashboard can show clickable links"
-                ),
-                isGranted: state.permission == .granted,
-                action: #selector(authorizeDefaultBrowserAutomation)
+                title: Localization.string(zh: "浏览器网址读取 · \(browserName)",
+                                           en: "Browser URL Access · \(browserName)"),
+                description: status == .indeterminate
+                    ? Localization.string(
+                        zh: "\(browserName) 当前未运行，无法确认；孩子下次打开它时会自动提示授权",
+                        en: "\(browserName) isn't running, so this can't be checked yet — BigDaddy will prompt when it's next opened"
+                      )
+                    : Localization.string(
+                        zh: "读取 \(browserName) 当前网址，家长端才能看到可点击的访问记录",
+                        en: "Read the current address in \(browserName) so the dashboard can show clickable links"
+                      ),
+                status: status,
+                action: #selector(authorizeAllBrowserAutomation)
             )
             container.addArrangedSubview(row)
-            parentView.frame = NSRect(x: 0, y: 0, width: 400, height: 120)
         }
 
+        // 被截掉的那些如实交代一句，而不是让家长以为清单就这么长
+        let hidden = allStates.count - min(allStates.count, Self.maxBrowserPermissionRows)
+        if hidden > 0 {
+            let more = NSTextField(labelWithString: Localization.string(
+                zh: "另有 \(hidden) 个已授权/未运行的浏览器未列出",
+                en: "\(hidden) more browser(s) already authorized or not running"
+            ))
+            more.font = NSFont.systemFont(ofSize: 11)
+            more.textColor = NSColor.secondaryLabelColor
+            container.addArrangedSubview(more)
+        }
+
+        // 行数是运行期才知道的，按实际内容定高，避免多出来的浏览器行被裁掉
+        parentView.frame = NSRect(x: 0, y: 0, width: 400, height: container.fittingSize.height)
         return parentView
     }
 
-    /// 绑定自检里"去授权"按钮：对默认浏览器走和运行期同一套引导逻辑
-    @objc private func authorizeDefaultBrowserAutomation() {
-        guard let state = defaultBrowserAutomationState() else { return }
-        automationDeniedBundleIDs.insert(state.bundleID)
+    /// 绑定自检里"去授权"按钮：把所有待办浏览器一次性交给运行期同一套引导逻辑。
+    ///
+    /// 不只处理被点的那一行：授权引导本来就是逐个浏览器串行走完的，让家长为了同一件事
+    /// 在同一张清单上点三次，纯属把实现细节转嫁给用户。
+    @objc private func authorizeAllBrowserAutomation() {
+        let pending = browserAutomationNeedingAttention()
+        guard !pending.isEmpty else { return }
+        automationDeniedBundleIDs.formUnion(pending)
         promptAutomationPermission()
     }
-    
-    private func createPermissionRow(title: String, description: String, isGranted: Bool, action: Selector) -> NSView {
+
+    /// 权限行的三态。indeterminate 是"查不出来"（浏览器没运行），必须和"没授权"分开——
+    /// 前者用户此刻做不了任何事，后者才是一条待办。
+    private enum PermissionRowStatus {
+        case granted
+        case needsAction
+        case indeterminate
+    }
+
+    private func createPermissionRow(title: String, description: String,
+                                     status: PermissionRowStatus, action: Selector) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 12
         row.alignment = .centerY
         row.translatesAutoresizingMaskIntoConstraints = false
         row.widthAnchor.constraint(equalToConstant: 380).isActive = true
-        
+
         // 1. 状态图标
-        let statusLabel = NSTextField(labelWithString: isGranted ? "✅" : "❌")
+        let symbol: String
+        switch status {
+        case .granted: symbol = "✅"
+        case .needsAction: symbol = "❌"
+        case .indeterminate: symbol = "⏸"
+        }
+        let statusLabel = NSTextField(labelWithString: symbol)
         statusLabel.font = NSFont.systemFont(ofSize: 18)
         row.addArrangedSubview(statusLabel)
-        
+
         // 2. 文本介绍
         let textStack = NSStackView()
         textStack.orientation = .vertical
@@ -2083,10 +2272,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         button.translatesAutoresizingMaskIntoConstraints = false
         button.widthAnchor.constraint(equalToConstant: 90).isActive = true
         
-        if isGranted {
+        switch status {
+        case .granted:
             button.title = Localization.string(zh: "已授权", en: "Authorized")
             button.isEnabled = false
-        } else {
+        case .indeterminate:
+            button.title = Localization.string(zh: "未运行", en: "Not running")
+            button.isEnabled = false
+        case .needsAction:
             button.title = Localization.string(zh: "去授权", en: "Authorize")
             button.target = self
             button.action = action
@@ -2108,10 +2301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     ///   的能力挡住整个绑定流程，代价和收益完全不成比例。
     private func checkAndRequestPermissions() -> Bool {
         let hasAccessibility = AXIsProcessTrustedWithOptions(nil)
-        let automation = defaultBrowserAutomationState()
-        let automationNeedsAttention = automation.map {
-            $0.permission != .granted && $0.permission != .targetNotRunning
-        } ?? false
+        let automationNeedsAttention = !browserAutomationNeedingAttention().isEmpty
 
         if hasAccessibility && !automationNeedsAttention {
             return true
@@ -2193,15 +2383,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 都不存在，把用户送过去只会让他对着一个空列表发懵。
             var denied: [String] = []      // -1743：有记录、用户拒过 → 去设置里勾
             var noRecord: [String] = []    // -1744/其他：没有记录 → 去设置没用
+            // 探测顺手读到的真实网址，用来把"已生效"从一句断言变成一个可核对的事实。
+            // 这里只留 bundle id，浏览器显示名回到主线程再解析（NSWorkspace 查询是
+            // 主线程隔离的）。
+            var evidence: [(bundleID: String, url: String)] = []
             for bundleID in targets {
                 // 用真实 Apple Event 探测：这是唯一能可靠让系统弹出授权询问、并在 TCC
-                // 里落下记录的方式（见 probeAutomationByRealEvent 的注释）。先前这里只调
+                // 里落下记录的方式（见 probeAutomation 的注释）。先前这里只调
                 // AEDeterminePermissionToAutomateTarget(askUserIfNeeded: true)，在它不弹
                 // 询问的情况下既建不出记录，又被判成"被拒"，用户就被送去一个根本没有
                 // BigDaddy 条目的自动化面板。
-                switch self?.client.probeAutomationByRealEvent(bundleID: bundleID) {
-                case .granted, .none:
-                    continue
+                guard let probe = self?.client.probeAutomation(bundleID: bundleID) else { continue }
+                switch probe.permission {
+                case .granted:
+                    if let url = probe.url {
+                        evidence.append((bundleID, url))
+                    }
                 case .targetNotRunning:
                     // 浏览器没开就无法判定，也无法授权；不算失败，等它下次开起来再说
                     continue
@@ -2214,16 +2411,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.automationDeniedBundleIDs = Set(denied + noRecord)
+                self.rebuildMenu()
                 if denied.isEmpty && noRecord.isEmpty {
-                    self.automationNoticeShownBundleIDs.removeAll()
-                    let alert = NSAlert()
-                    alert.messageText = Localization.string(zh: "网址记录已生效", en: "Website Logging Enabled")
-                    alert.informativeText = Localization.string(
-                        zh: "BigDaddy 现在可以读取浏览器当前网址了，下一次上报起家长端就能看到带链接的访问记录，不需要重启。",
-                        en: "BigDaddy can now read the browser's current address. Links will appear in the parent dashboard from the next report on — no restart needed."
-                    )
-                    self.applyShieldIcon(to: alert)
-                    alert.runModal()
+                    self.automationNoticeShownAt.removeAll()
+                    self.showAutomationGranted(evidence: evidence)
                     return
                 }
                 if !denied.isEmpty {
@@ -2233,6 +2424,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 }
             }
         }
+    }
+
+    /// 授权走通后的确认框。
+    ///
+    /// 带上刚刚**真实读到的网址**，而不是只说一句"已生效"：这是用户能当场核对的证据，
+    /// 也是最强的成功信号——他看到的就是自己浏览器里那一页。顺带堵死一类误判：读不出
+    /// 任何真实网址时（浏览器没窗口、或探测本身判错了），文案就退回成不打包票的说法，
+    /// 绝不拿一句"已生效"糊过去。此前那版无条件宣称成功，配合探测的漏判，出现过
+    /// "客户端说已生效、家长端一直显示未授权"的自相矛盾。
+    private func showAutomationGranted(evidence: [(bundleID: String, url: String)]) {
+        let alert = NSAlert()
+        applyShieldIcon(to: alert)
+        if let sample = evidence.first {
+            let browser = Self.browserDisplayName(forBundleID: sample.bundleID)
+            alert.messageText = Localization.string(zh: "网址记录已生效", en: "Website Logging Enabled")
+            // 长网址会把弹窗撑得很宽，截断到能认出是哪一页即可
+            let shown = sample.url.count > 80 ? String(sample.url.prefix(80)) + "…" : sample.url
+            alert.informativeText = Localization.string(
+                zh: "刚刚从 \(browser) 读到的网址是：\n\(shown)\n\n下一次上报起，家长端的访问记录就会带上可点击的链接，不需要重启。",
+                en: "Just read this address from \(browser):\n\(shown)\n\nFrom the next report on, the parent dashboard will show clickable links — no restart needed."
+            )
+        } else {
+            alert.messageText = Localization.string(zh: "授权已通过", en: "Authorization Granted")
+            alert.informativeText = Localization.string(
+                zh: "系统已允许 BigDaddy 读取浏览器网址，但此刻浏览器没有打开任何网页，所以还没读到具体地址。孩子下次浏览网页时，家长端就会开始出现可点击的链接。",
+                en: "macOS now allows BigDaddy to read browser addresses, but no page is open right now, so there was nothing to read yet. Clickable links will start appearing once your child browses again."
+            )
+        }
+        alert.runModal()
     }
 
     /// 当前运行的是不是一个正经的 .app（带 Info.plist 和用途说明字符串）。

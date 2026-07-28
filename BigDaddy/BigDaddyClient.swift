@@ -600,9 +600,12 @@ final class BigDaddyClient {
     /// 生成向指定浏览器一次性查询"当前标签页标题 + URL"的 AppleScript。
     ///
     /// 脚本自带 try/on error 分支并返回 "OK"/"ERR" 前缀的结构化结果：浏览器侧的错误
-    /// （典型的是 -1719 没有窗口）必须能和"权限被拒"区分开。注意 -1743 是 TCC 在脚本体
-    /// 执行**之前**就拦下的，落不进这个 on error 分支，只能由 Swift 侧读 NSAppleScript
-    /// 错误字典里的 NSAppleScriptErrorNumber——两层都要，少一层就漏一类。
+    /// （典型的是 -1719 没有窗口）必须能和"权限被拒"区分开。
+    ///
+    /// 关键：权限类错误（-1743/-1744）**两条路都可能走**——脚本里的 try 会捕获它们并
+    /// 变成一个"成功"的 ERR 字符串结果，逃不掉的那部分才落进 NSAppleScript 错误字典的
+    /// NSAppleScriptErrorNumber。所以调用方必须两层都解析，少一层就会把"被系统回绝"
+    /// 误读成"已授权"（probeAutomation 早先就栽在这里，见其注释）。
     ///
     /// 用 `application id` 而不是应用名，与 supportedBrowsers 的匹配键保持一致。
     private func browserTabCombinedScript(bundleID: String, dialect: BrowserDialect) -> String {
@@ -642,8 +645,7 @@ final class BigDaddyClient {
         return .success(result.stringValue ?? "")
     }
 
-    /// AppleScript 层面的错误码 → 原因码。-1743 只会出现在 NSAppleScript 的错误字典里，
-    /// -1719/-1728 既可能来自脚本内的 on error 分支，也可能来自这里。
+    /// AppleScript 层面的错误码 → 原因码。
     private func reason(forScriptError code: OSStatus) -> UrlUnavailableReason {
         switch code {
         case OSStatus(errAEEventNotPermitted):
@@ -657,35 +659,96 @@ final class BigDaddyClient {
         }
     }
 
-    /// 浏览器场景下的标题 + URL，一次 AppleScript 往返拿全。
-    /// 拿不到时返回具体原因，交由调用方回退到 CGWindowList/Accessibility（那两条路只有
-    /// 标题，没有 URL），并把原因随心跳上报。
-    private func browserTabInfo(bundleID: String, dialect: BrowserDialect)
-        -> (info: (title: String, url: String)?, reason: UrlUnavailableReason?) {
+    /// AppleScript 层面的错误码 → 自动化授权状态。
+    ///
+    /// 与上面的 reason(forScriptError:) 是同一批错误码的两种读法，故意分开：心跳关心的是
+    /// "这条记录为什么没有链接"，授权引导关心的是"用户还需不需要做什么"，同一个 -1719
+    /// 在前者是"没有窗口"、在后者却是**权限正常**的证据（事件能被浏览器亲自回绝，说明它
+    /// 已经送达了）。合并成一个枚举只会逼调用方在两种语义之间来回翻译。
+    private func permission(forScriptError code: OSStatus) -> AutomationPermission {
+        switch code {
+        case OSStatus(errAEEventNotPermitted):
+            return .denied
+        case BigDaddyClient.errAEEventWouldRequireUserConsentCode:
+            return .notDetermined
+        case OSStatus(errAEIllegalIndex), OSStatus(errAENoSuchObject):
+            // 浏览器亲自回的错 → 事件送达了 → 权限没问题
+            return .granted
+        case OSStatus(procNotFound):
+            return .targetNotRunning
+        default:
+            return .unknown(code)
+        }
+    }
+
+    /// 一次浏览器脚本往返的归一化结果。
+    ///
+    /// 存在的意义是把"错误码从哪一层冒出来"这件事在这里一次性抹平：脚本里的 try 会把
+    /// 权限错误捕获成一个**成功返回**的 ERR 字符串，逃得掉的那部分才落进 NSAppleScript
+    /// 的错误字典。两处调用方（心跳取 URL、引导查权限）都必须同时处理这两层，各写一遍
+    /// 就必然有一处写漏——此前 probeAutomationByRealEvent 只看 NSAppleScript 那一层，
+    /// 一见 .success 就判 granted，于是把"被系统回绝"的 ERR␣-1743 当成了授权成功，
+    /// 对着一台完全没有权限的机器弹出"网址记录已生效"。
+    private enum BrowserQueryOutcome {
+        case tab(title: String, url: String)
+        /// 浏览器在跑但没有可脚本窗口，或当前标签页尚未导航到任何地址
+        case noWindow
+        /// 归一化后的错误码，无论它来自脚本内的 on error 还是 NSAppleScript 错误字典
+        case error(OSStatus)
+        /// 脚本返回了预期之外的内容
+        case malformed(String)
+    }
+
+    private func queryBrowserTab(bundleID: String, dialect: BrowserDialect) -> BrowserQueryOutcome {
         let script = browserTabCombinedScript(bundleID: bundleID, dialect: dialect)
         switch runAppleScript(script) {
         case .failure(let code):
-            let reason = reason(forScriptError: code)
-            NSLog("BigDaddy: AppleScript to \(bundleID) failed, OSStatus=\(code), reason=\(reason.rawValue)")
-            return (nil, reason)
+            return .error(code)
         case .success(let raw):
             let parts = raw.components(separatedBy: BigDaddyClient.browserFieldSeparator)
             if parts.first == "OK", parts.count == 3 {
                 // 极少数情况下浏览器会回一个空 URL（如刚打开、尚未导航的标签页），
                 // 这不算失败，但也没有链接可展示，按"没有窗口内容"归类。
-                guard !parts[2].isEmpty else { return (nil, .noWindow) }
-                return ((title: parts[1], url: parts[2]), nil)
+                guard !parts[2].isEmpty else { return .noWindow }
+                return .tab(title: parts[1], url: parts[2])
             }
             if parts.first == "ERR", parts.count == 2 {
-                if parts[1] == "NO_WINDOW" { return (nil, .noWindow) }
-                let code = OSStatus(parts[1]) ?? OSStatus(errOSAScriptError)
-                let reason = reason(forScriptError: code)
-                NSLog("BigDaddy: \(bundleID) reported script error \(code), reason=\(reason.rawValue)")
-                return (nil, reason)
+                if parts[1] == "NO_WINDOW" { return .noWindow }
+                return .error(OSStatus(parts[1]) ?? OSStatus(errOSAScriptError))
             }
+            return .malformed(raw)
+        }
+    }
+
+    /// 浏览器场景下的标题 + URL，一次 AppleScript 往返拿全。
+    /// 拿不到时返回具体原因，交由调用方回退到 CGWindowList/Accessibility（那两条路只有
+    /// 标题，没有 URL），并把原因随心跳上报。
+    private func browserTabInfo(bundleID: String, dialect: BrowserDialect)
+        -> (info: (title: String, url: String)?, reason: UrlUnavailableReason?) {
+        switch queryBrowserTab(bundleID: bundleID, dialect: dialect) {
+        case .tab(let title, let url):
+            return ((title: title, url: url), nil)
+        case .noWindow:
+            return (nil, .noWindow)
+        case .error(let code):
+            let reason = reason(forScriptError: code)
+            NSLog("BigDaddy: browser query to \(bundleID) failed, OSStatus=\(code), reason=\(reason.rawValue)")
+            return (nil, reason)
+        case .malformed(let raw):
             NSLog("BigDaddy: unexpected AppleScript payload from \(bundleID): \(raw.prefix(120))")
             return (nil, .scriptFailed)
         }
+    }
+
+    /// 一次授权探测的结果：状态 + 顺带读到的当前网址。
+    ///
+    /// 带上 url 是为了让引导流程能拿**事实**而不是断言去回复用户——"现在读到的是
+    /// https://…" 比"网址记录已生效"强得多，而且顺手堵死了误判：读不出真实网址就不
+    /// 允许宣称成功。url 为 nil 只说明这一刻没有可读的地址（浏览器没开窗口等），
+    /// 不代表权限有问题，两者由 permission 分别表达。
+    struct AutomationProbe {
+        let permission: AutomationPermission
+        let url: String?
     }
 
     /// 用**真实的 Apple Event** 探测某个浏览器的自动化授权状态。
@@ -696,34 +759,45 @@ final class BigDaddyClient {
     /// 用户拒绝过。而真正能可靠让系统弹出询问、并在 TCC 里落下记录的，就是老老实实发
     /// 一个真实事件（正是每次心跳在做的事）。
     ///
-    /// 返回码也比 AEDetermine 更准：浏览器回 -1719/-1728（没有窗口、对象不存在）恰恰
-    /// 证明事件**已经送达浏览器**，也就是权限是通的——这种情况必须判成 granted，
-    /// 否则会把一台权限完全正常、只是当时没开窗口的设备误报成"未授权"。
-    func probeAutomationByRealEvent(bundleID: String) -> AutomationPermission {
+    /// 注意 notDetermined 状态下本调用会**同步阻塞到用户点选为止**（系统授权框），
+    /// 因此只能在后台线程调用。
+    func probeAutomation(bundleID: String) -> AutomationProbe {
         guard let dialect = BigDaddyClient.supportedBrowsers[bundleID] else {
-            return .unknown(OSStatus(errOSAScriptError))
+            return AutomationProbe(permission: .unknown(OSStatus(errOSAScriptError)), url: nil)
         }
-        let script = browserTabCombinedScript(bundleID: bundleID, dialect: dialect)
-        switch runAppleScript(script) {
-        case .success:
-            // 脚本跑通了（不管拿没拿到 URL），说明事件被允许送达
-            return .granted
-        case .failure(let code):
-            switch code {
-            case OSStatus(errAEEventNotPermitted):
-                return .denied
-            case BigDaddyClient.errAEEventWouldRequireUserConsentCode:
-                return .notDetermined
-            case OSStatus(errAEIllegalIndex), OSStatus(errAENoSuchObject):
-                // 浏览器亲自回的错 → 事件送达了 → 权限没问题
-                return .granted
-            case OSStatus(procNotFound):
-                return .targetNotRunning
-            default:
+        switch queryBrowserTab(bundleID: bundleID, dialect: dialect) {
+        case .tab(_, let url):
+            return AutomationProbe(permission: .granted, url: url)
+        case .noWindow:
+            // 事件送达了浏览器、只是这一刻没有地址可读 → 权限是通的
+            return AutomationProbe(permission: .granted, url: nil)
+        case .error(let code):
+            let permission = permission(forScriptError: code)
+            if case .unknown = permission {
                 NSLog("BigDaddy: automation probe to \(bundleID) got OSStatus=\(code)")
-                return .unknown(code)
             }
+            return AutomationProbe(permission: permission, url: nil)
+        case .malformed(let raw):
+            NSLog("BigDaddy: unexpected probe payload from \(bundleID): \(raw.prefix(120))")
+            return AutomationProbe(permission: .unknown(OSStatus(errOSAScriptError)), url: nil)
         }
+    }
+
+    /// 本机已安装、且 BigDaddy 能读出网址的浏览器（bundle id）。
+    ///
+    /// 正在运行的排在前面：授权引导只对运行中的浏览器有意义（自动化授权框需要目标 App
+    /// 在跑），而"已安装但没在跑"的仍要出现在自检清单里——孩子下次打开它就会用到，
+    /// 家长在绑定那一刻把四个浏览器一次性看全，好过日后被四次零散提醒逐个打断。
+    static func installedSupportedBrowsers() -> [String] {
+        let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+        return supportedBrowsers.keys
+            .filter { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil }
+            .sorted { lhs, rhs in
+                let lRunning = running.contains(lhs), rRunning = running.contains(rhs)
+                // 运行中的优先；同组内按 bundle id 排序，保证每次渲染的顺序稳定
+                // （supportedBrowsers 是字典，keys 的遍历顺序本身没有保证）。
+                return lRunning == rRunning ? lhs < rhs : lRunning
+            }
     }
 
     /// 已经记过一笔的前台应用 bundle id，避免每次心跳都刷同一行日志

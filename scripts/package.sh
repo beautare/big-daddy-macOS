@@ -76,15 +76,34 @@ install_name_tool -add_rpath @executable_path/../Frameworks "${APP_DIR}/Contents
 /usr/libexec/PlistBuddy -c "Set :BigDaddyDashboardBaseURL ${BIGDADDY_DASHBOARD_BASE_URL:-https://dashboard.bigdaddy.mom}" "${APP_DIR}/Contents/Info.plist"
 
 # 签名顺序：先签内嵌的 framework（含其内部 XPC Services），再签外层 app bundle
+#
+# --options runtime（Hardened Runtime）是公证的硬性要求，同时它会**默认禁止本 App 发送
+# Apple Event**——除非 entitlements.plist 里带着 com.apple.security.automation.apple-events。
+# 缺了那一条的表现极具迷惑性：读浏览器网址的 NSAppleScript 每次都立刻收到 -1743，系统连
+# 授权询问框都不弹，「隐私与安全性 → 自动化」里也永远不会出现 BigDaddy，而本地 swift run
+# （ad-hoc 签名、没有 Hardened Runtime）却一切正常。改这个文件时别把那一条删掉。
+#
+# 另注：entitlements.plist 里**不能写 XML 注释**。codesign 会把它交给 AMFI 的严格解析器，
+# 遇到注释直接 "AMFIUnserializeXML: syntax error" 整个打包失败，所以说明都写在这里。
 if [[ "${CODESIGN_IDENTITY}" == "-" ]]; then
   codesign --force --deep --sign "-" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
-  codesign --force --sign "-" "${APP_DIR}"
+  codesign --force --sign "-" --entitlements "${ROOT_DIR}/entitlements.plist" "${APP_DIR}"
 else
   codesign --force --deep --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
   codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" --entitlements "${ROOT_DIR}/entitlements.plist" "${APP_DIR}"
 fi
 
 codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
+
+# 签完立刻回读一次：这条 entitlement 一旦丢失，症状要等到用户装上正式版、家长在仪表盘上
+# 看到"网址未授权"才暴露，代价太高。构建期一行断言就能挡住。
+if ! codesign -d --entitlements - --xml "${APP_DIR}" 2>/dev/null \
+    | plutil -p - 2>/dev/null \
+    | grep -q '"com.apple.security.automation.apple-events" => true'; then
+  echo "ERROR: com.apple.security.automation.apple-events missing from the signed app;" >&2
+  echo "       browser URL capture would silently fail in the released build." >&2
+  exit 1
+fi
 
 mkdir -p "${STAGING_DIR}"
 cp -R "${APP_DIR}" "${STAGING_DIR}/BigDaddy.app"
