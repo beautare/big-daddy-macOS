@@ -2206,6 +2206,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             container.addArrangedSubview(more)
         }
 
+        // 强制先跑一次真实的 Auto Layout：换行文本框（descLabel）的 intrinsicContentSize
+        // 在没有真正参与过布局时永远按"单行"计算高度（AppKit 不知道它最终会被约束到多宽，
+        // 因而算不出要换几行）——所以"冷"读 fittingSize 会把每一处两行说明都按一行的
+        // 高度计入，行数一多，缺口累计起来就是家长截图里那种下一行文字压住上一行的重叠。
+        // 跑一次真实布局后，每个 descLabel 已经有了实际解出来的宽度，intrinsicContentSize
+        // 才会算出正确的换行高度，fittingSize 也就跟着准了。
+        container.layoutSubtreeIfNeeded()
         // 行数是运行期才知道的，按实际内容定高，避免多出来的浏览器行被裁掉
         parentView.frame = NSRect(x: 0, y: 0, width: 400, height: container.fittingSize.height)
         return parentView
