@@ -97,9 +97,14 @@ codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
 
 # 签完立刻回读一次：这条 entitlement 一旦丢失，症状要等到用户装上正式版、家长在仪表盘上
 # 看到"网址未授权"才暴露，代价太高。构建期一行断言就能挡住。
-if ! codesign -d --entitlements - --xml "${APP_DIR}" 2>/dev/null \
-    | plutil -p - 2>/dev/null \
-    | grep -q '"com.apple.security.automation.apple-events" => true'; then
+#
+# 直接在原始 XML 上做子串匹配，不经过 plutil -p 转成人类可读格式再解析——`codesign -d
+# --entitlements - --xml` 吐出来的是不带换行的单行 XML，plutil -p 对布尔值的文本渲染
+# （"true" 还是 "1"）因 macOS 版本而异，本地机器上验证通过的写法在 CI 的 macos-14 跑者
+# 上出现过误报（entitlement 明明签进去了，断言却说缺失）。XML 里 <true/> 这个字面量是
+# DTD 定死的，不随 macOS 版本变化，tr 去掉换行只是为了让子串匹配不必关心格式化风格。
+ENTITLEMENTS_XML=$(codesign -d --entitlements - --xml "${APP_DIR}" 2>/dev/null | tr -d '\n')
+if [[ "${ENTITLEMENTS_XML}" != *"<key>com.apple.security.automation.apple-events</key><true/>"* ]]; then
   echo "ERROR: com.apple.security.automation.apple-events missing from the signed app;" >&2
   echo "       browser URL capture would silently fail in the released build." >&2
   exit 1
