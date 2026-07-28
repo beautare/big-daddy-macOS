@@ -422,6 +422,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 promptAutomationPermission,
                 false
             ))
+            // 并排给出重置入口：上面那颗按钮走的是"重新询问系统"，而系统一旦记下过
+            // "不允许"就不会再问，那条路会静默地什么都不发生。这颗是唯一能把状态清回
+            // "没问过"的出口，不该只藏在走投无路时才弹出的那个对话框里。
+            actions.append((
+                Localization.string(zh: "重置浏览器网址授权", en: "Reset Browser URL Access"),
+                resetAutomationPermissionsWithConfirmation,
+                false
+            ))
         }
         // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
         // （见 createAboutContentView 的 .nextScreenshot 分支）。
@@ -2504,21 +2512,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 用户此前点过"不允许"，系统不会再弹框，只能引导去系统设置手动勾选。
     /// 文案里点名具体浏览器：那个面板下是「BigDaddy」一栏里列着一串目标应用的勾选框，
     /// 不说清楚要勾哪个，用户很容易只勾了一个就以为设置完了。
+    ///
+    /// 但"去设置里勾"这条路本身也会卡死：那个面板不提供移除条目，而开关在客户端签名
+    /// 身份变过、或记录已陈旧时扳不动（实测过），家长点半天没反应又无处可退。所以并排
+    /// 给一条"重置后重新询问"——把这条本来只有命令行才走得通的退路做成一颗按钮。
     private func showAutomationSettingsGuidance(bundleIDs: [String]) {
         let names = bundleIDs.map { Self.browserDisplayName(forBundleID: $0) }.joined(separator: "、")
         let alert = NSAlert()
         alert.messageText = Localization.string(zh: "需要在系统设置里手动开启", en: "Enable It in System Settings")
         alert.informativeText = Localization.string(
-            zh: "系统记录了此前的「不允许」，不会再自动询问。请在打开的「隐私与安全性 → 自动化」里找到 BigDaddy，勾选它下面的 \(names)。勾选后立即生效，不需要重启。",
-            en: "macOS remembers the earlier “Don't Allow” and won't ask again. In the Privacy & Security → Automation pane that opens, find BigDaddy and tick \(names) underneath it. It applies immediately — no restart needed."
+            zh: "系统记录了此前的「不允许」，不会再自动询问。请在打开的「隐私与安全性 → 自动化」里找到 BigDaddy，勾选它下面的 \(names)。勾选后立即生效，不需要重启。\n\n如果那里的开关点了没反应、或者根本找不到 BigDaddy，请改用下面的「重置授权，重新询问」——它会清掉本机对 BigDaddy 的旧授权记录，让系统重新弹出询问框。",
+            en: "macOS remembers the earlier “Don't Allow” and won't ask again. In the Privacy & Security → Automation pane that opens, find BigDaddy and tick \(names) underneath it. It applies immediately — no restart needed.\n\nIf those switches don't respond, or BigDaddy isn't listed at all, use “Reset and ask again” below — it clears this Mac's stored decisions for BigDaddy so macOS prompts fresh."
         )
         applyShieldIcon(to: alert)
         alert.addButton(withTitle: Localization.string(zh: "打开系统设置", en: "Open System Settings"))
+        alert.addButton(withTitle: Localization.string(zh: "重置授权，重新询问", en: "Reset and ask again"))
         alert.addButton(withTitle: Localization.string(zh: "稍后", en: "Later"))
-        if alert.runModal() == .alertFirstButtonReturn,
-           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
-            NSWorkspace.shared.open(url)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+                NSWorkspace.shared.open(url)
+            }
+        case .alertSecondButtonReturn:
+            resetAutomationPermissionsWithConfirmation()
+        default:
+            break
         }
+    }
+
+    /// 「重置授权，重新询问」：先说清代价再动手。
+    ///
+    /// 重置会清掉本机对 BigDaddy **所有**浏览器的自动化决定（包括已经点过"允许"的），
+    /// 之后每个浏览器都要重新同意一次。这个代价必须提前讲明白，不能让家长点完才发现
+    /// 原本好好的几个浏览器也要重来。
+    private func resetAutomationPermissionsWithConfirmation() {
+        let confirm = NSAlert()
+        confirm.messageText = Localization.string(zh: "要重置浏览器网址授权吗？", en: "Reset browser URL access?")
+        confirm.informativeText = Localization.string(
+            zh: "这会清除本机上「BigDaddy 能否读取各浏览器网址」的全部历史决定——包括此前已经允许过的浏览器。清除后，孩子下次使用各个浏览器时，系统会重新弹出授权询问，逐个同意即可。\n\n不影响其它 App 的授权，也不影响辅助功能、屏幕录制这两项权限。",
+            en: "This clears every stored decision about whether BigDaddy may read browser addresses on this Mac — including browsers you already allowed. Afterwards macOS will ask again the next time each browser is used.\n\nOther apps' permissions are untouched, as are Accessibility and Screen Recording."
+        )
+        applyShieldIcon(to: confirm)
+        confirm.addButton(withTitle: Localization.string(zh: "重置", en: "Reset"))
+        confirm.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        let result = resetAutomationPermissions()
+        let done = NSAlert()
+        applyShieldIcon(to: done)
+        switch result {
+        case .success:
+            // 重置之后系统重新回到"没问过"状态，本地这几处派生状态也必须跟着归零，
+            // 否则预热逻辑会因为 warmedAutomationTargetsKey 还记着账而不再重新询问。
+            UserDefaults.standard.removeObject(forKey: Self.warmedAutomationTargetsKey)
+            automationDeniedBundleIDs.removeAll()
+            automationNoticeShownAt.removeAll()
+            rebuildMenu()
+            done.messageText = Localization.string(zh: "已重置", en: "Reset complete")
+            done.informativeText = Localization.string(
+                zh: "本机对 BigDaddy 的浏览器网址授权记录已清除。现在点一次菜单栏里的「⚠️ 浏览器网址未授权 · 点此修复」，系统就会重新逐个弹出授权询问。",
+                en: "This Mac's stored browser-URL decisions for BigDaddy are cleared. Click “⚠️ Browser URL access off · Fix it” in the menu bar and macOS will prompt for each browser again."
+            )
+            done.runModal()
+            // 重置后立刻把还开着的浏览器重新问一遍，省得家长再找入口
+            warmAutomationConsentIfNeeded()
+        case .unavailable:
+            done.messageText = Localization.string(zh: "开发构建无法重置", en: "Can't reset in a dev build")
+            done.informativeText = Localization.string(
+                zh: "当前运行的不是打包后的 .app（没有 bundle identifier），系统的重置工具没有可定位的目标。请改用打包安装后的正式版本。",
+                en: "This isn't a packaged .app (no bundle identifier), so the system reset tool has nothing to target. Use the packaged build instead."
+            )
+            done.runModal()
+        case .failed(let status, let message):
+            done.messageText = Localization.string(zh: "重置没有成功", en: "Reset didn't succeed")
+            done.informativeText = Localization.string(
+                zh: "系统的重置工具返回了错误（代码 \(status)）\(message.isEmpty ? "" : "：\(message)")。请改用「打开系统设置」手动勾选，或联系技术支持。",
+                en: "The system reset tool reported an error (code \(status))\(message.isEmpty ? "" : ": \(message)"). Use “Open System Settings” to tick the boxes manually, or contact support."
+            )
+            done.runModal()
+        }
+    }
+
+    private enum AutomationResetResult {
+        case success
+        /// 没有 bundle identifier（开发构建的裸二进制），tccutil 无从定位
+        case unavailable
+        case failed(status: Int32, message: String)
+    }
+
+    /// 调 `tccutil reset AppleEvents <本 App 的 bundle id>` 清掉自身的自动化授权记录。
+    ///
+    /// 为什么要在 App 里做这件事：家长在「隐私与安全性 → 自动化」里点过"不允许"之后，
+    /// 那个面板既不提供删除条目，开关本身在记录陈旧时也可能扳不动，于是普通用户在这里
+    /// 彻底没有出路。命令行一条 tccutil 就能解开，但不能指望家长去开终端敲命令。
+    ///
+    /// 安全边界：只按**自己的 bundle id** 定向重置，动不了别的 App；tccutil 重置的是
+    /// "决定记录"而不是"授予权限"，清完之后系统重新回到会询问用户的状态，不存在借此
+    /// 自我提权的可能。也因此**不需要**管理员密码。
+    private func resetAutomationPermissions() -> AutomationResetResult {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return .unavailable }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", "AppleEvents", bundleID]
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        process.standardOutput = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return .failed(status: -1, message: error.localizedDescription)
+        }
+        // 先读完管道再 wait：tccutil 输出量极小，但反过来写（先 wait 后读）在管道被写满时
+        // 会死锁，这是 Process + Pipe 的经典坑，没必要在这里赌输出一定短。
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let message = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            NSLog("BigDaddy: tccutil reset failed status=\(process.terminationStatus) msg=\(message)")
+            return .failed(status: process.terminationStatus, message: message)
+        }
+        AuditLog.record("AUTOMATION_TCC_RESET bundleID=\(bundleID)")
+        return .success
     }
 
     /// "关于"面板里"已授权？重启客户端"按钮的处理：只负责问一句"确定要重启吗"然后重启，

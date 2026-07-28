@@ -852,6 +852,13 @@ final class BigDaddyClient {
             }
         } else if BigDaddyClient.knownUnscriptableBrowsers.contains(bundleID) {
             lastBrowserBundleID = bundleID
+            // 没有 AppleScript 网址接口，但地址栏在辅助功能树里是可读的（见该方法注释）。
+            // 拿得到就当作正常记录，拿不到才退回"能力边界"。
+            if let url = addressBarURLViaAccessibility(pid: frontApp.processIdentifier) {
+                lastUrlUnavailableReason = .notApplicable
+                let title = windowTitle(pid: frontApp.processIdentifier)
+                return (title, url)
+            }
             lastUrlUnavailableReason = .unsupportedBrowser
             logUnsupportedFrontAppOnce(bundleID: bundleID, appName: frontApp.localizedName, known: true)
         } else {
@@ -860,21 +867,88 @@ final class BigDaddyClient {
             logUnsupportedFrontAppOnce(bundleID: bundleID, appName: frontApp.localizedName, known: false)
         }
 
-        let pid = frontApp.processIdentifier
-        // 非浏览器 / AppleScript 失败：首选 CGWindowList 的 kCGWindowName，但该字段自
-        // macOS 10.15 起仅对持有屏幕录制权限的进程返回，未授权时恒为空——此时回落到
-        // Accessibility API。这两条路都没有 URL。
+        return (windowTitle(pid: frontApp.processIdentifier), "")
+    }
+
+    /// 前台窗口标题。首选 CGWindowList 的 kCGWindowName，但该字段自 macOS 10.15 起仅对
+    /// 持有屏幕录制权限的进程返回，未授权时恒为空——此时回落到 Accessibility API。
+    /// 两条路都只有标题，没有 URL。
+    private func windowTitle(pid: pid_t) -> String {
         let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
         if let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
             for info in windowListInfo {
                 if let windowOwnerPID = info[kCGWindowOwnerPID as String] as? Int, windowOwnerPID == pid,
                    let layer = info[kCGWindowLayer as String] as? Int, layer == 0,
                    let title = info[kCGWindowName as String] as? String, !title.isEmpty {
-                    return (title, "")
+                    return title
                 }
             }
         }
-        return (accessibilityWindowTitle(pid: pid), "")
+        return accessibilityWindowTitle(pid: pid)
+    }
+
+    /// Firefox 内部给地址栏输入框的元素 id。与界面语言无关（AXDescription 那一路是
+    /// 本地化的，中文版 Firefox 上是"使用 Google 搜索，或者输入网址"，拿它做匹配换个
+    /// 语言就失效），实测在 Firefox 上稳定返回 "urlbar-input"。
+    private static let firefoxURLBarDOMIdentifier = "urlbar-input"
+
+    /// 从辅助功能树里读 Firefox 系浏览器的地址栏。
+    ///
+    /// **只对没有 AppleScript 网址接口的浏览器使用**（knownUnscriptableBrowsers）。
+    /// Firefox 从来就没有提供过一个可供用户拒绝的自动化开关，所以这里不存在绕过任何
+    /// 用户决定的问题，用的是家庭已经知情并授予的辅助功能权限。
+    ///
+    /// 反过来，**绝不能**把这条路当作 Chromium 系浏览器的兜底：那边用户如果在系统
+    /// 授权框上点了"不允许"，那是一次明确的拒绝，换一条通道去取同样的数据就是在
+    /// 规避用户刚刚做出的安全决定——那已经不是守护，是欺骗。
+    private func addressBarURLViaAccessibility(pid: pid_t) -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+        let axApp = AXUIElementCreateApplication(pid)
+
+        // 广度优先，但把深度和访问节点数都卡死：地址栏固定在窗口 → 工具栏这几层里
+        // （实测 depth 6），而网页内容的辅助功能树可以有成千上万个节点，不设上限的话
+        // 每分钟一次心跳都要为此空跑一遍整棵 DOM。
+        var queue: [(element: AXUIElement, depth: Int)] = [(axApp, 0)]
+        var visited = 0
+        while !queue.isEmpty {
+            let (element, depth) = queue.removeFirst()
+            visited += 1
+            if depth > 8 || visited > 400 { continue }
+            if axAttribute(element, "AXDOMIdentifier") as? String == Self.firefoxURLBarDOMIdentifier {
+                guard let raw = axAttribute(element, kAXValueAttribute as String) as? String else { return nil }
+                return normalizedAddressBarURL(raw)
+            }
+            if let children = axAttribute(element, kAXChildrenAttribute as String) as? [AXUIElement] {
+                for child in children { queue.append((child, depth + 1)) }
+            }
+        }
+        return nil
+    }
+
+    private func axAttribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success ? value : nil
+    }
+
+    /// 地址栏里显示的文本 → 可以当链接用的 URL；判断不了就返回 nil。
+    ///
+    /// 两件事必须处理，否则家长端会渲染出点不开的假链接：
+    /// 1. Firefox 显示时会把 `https://` 前缀藏起来，读出来的是 `zh.wikipedia.org/...`，
+    ///    要把 scheme 补回去（补 https，今天绝大多数站点如此；补错也只是链接跳一次转）；
+    /// 2. 用户正在地址栏里打字时，这里读到的是半截搜索词而不是网址——带空格、或者
+    ///    既没有点号也没有 scheme 的，一律当作"还不是网址"丢弃。
+    private func normalizedAddressBarURL(_ raw: String) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !text.contains(" ") else { return nil }
+        // about:/file:/view-source: 这类本身就是完整位置，原样保留
+        if let scheme = text.range(of: "://")?.lowerBound, text.distance(from: text.startIndex, to: scheme) > 0 {
+            return text
+        }
+        if text.hasPrefix("about:") || text.hasPrefix("file:") || text.hasPrefix("view-source:") {
+            return text
+        }
+        guard text.contains(".") else { return nil }   // 没有点号 → 多半是正在输入的搜索词
+        return "https://" + text
     }
 
     /// 有 AppleScript 字典但没有 URL 接口的浏览器：明确归类成"能力边界"而不是
