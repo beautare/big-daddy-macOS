@@ -418,8 +418,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// "关于"窗口：把版本、当前配置摘要、心跳、截图倒计时等只读信息，以及守护说明/
-    /// 检查更新等次要操作集中在一处，而不是平铺成一堆一级菜单项（"导出本机守护记录"
-    /// 嵌在"守护说明与采集内容"弹窗里，不在这里单独占一个按钮，避免两处重复入口）。
+    /// 检查更新等次要操作集中在一处，而不是平铺成一堆一级菜单项（"看看它都记了什么"
+    /// 那个导出记录按钮嵌在"守护说明"弹窗里，不在这里单独占一个按钮，避免两处重复入口）。
     ///
     /// 改用普通 NSWindow 而不是 NSAlert：NSAlert 的图标+标题是钉死在左上角的固定布局
     /// 区块，就算把 icon 换成透明占位图、messageText 清空，那块区域仍然会保留原本的
@@ -462,8 +462,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
         // （见 createAboutContentView 的 .nextScreenshot 分支）。
         actions.append((Localization.string(zh: "守护说明", en: "Guardian Info"), showTransparencyInfo, false))
-        // 注：“导出本机守护记录”不再单独占一个按钮——“守护说明”弹窗里已有同样的
-        // 导出入口，避免重复。
+        // 注：导出记录（“看看它都记了什么”）不再单独占一个按钮——“守护说明”弹窗里
+        // 已有同样的导出入口，避免重复。
         // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字），
         // 点击复用 checkForUpdates()——文件已经下载好，Sparkle 会直接跳到"安装并重启"确认。
         if updateReadyToInstall {
@@ -2077,6 +2077,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 纠错就得走仪表盘解绑（会永久删除该设备历史），那条路必须由家长在仪表盘上走，
     /// 这里给不了捷径。
     @objc private func showWrongMacHelp() {
+        // dashboardBaseURL 指向的是 dashboard 子域名（默认 dashboard.bigdaddy.mom），
+        // 那里的根路径会直接 302 到登录页，没有下载入口——家长照着这段文字去孩子的
+        // Mac 上打开它，看到的只会是一个登录表单，不是下载按钮，白跑一趟还更困惑。
+        // 下载页在营销站根域名（bigdaddy.mom）上，从 dashboard 子域名剥掉 "dashboard."
+        // 前缀就是它；剥不掉时（本地开发环境用的是不分域名的 localhost，没有这个前缀）
+        // 原样使用——开发环境本来就不分家，dashboardBaseURL 本身已经是对的地址。
+        let dashboardHost = client.dashboardBaseURL.host ?? "dashboard.bigdaddy.mom"
+        let dashboardPrefix = "dashboard."
+        let marketingHost = dashboardHost.hasPrefix(dashboardPrefix)
+            ? String(dashboardHost.dropFirst(dashboardPrefix.count))
+            : dashboardHost
+        let marketingURL = URL(string: "https://\(marketingHost)") ?? client.dashboardBaseURL
+
         let alert = NSAlert()
         alert.messageText = Localization.string(
             zh: "BigDaddy 要装在孩子的电脑上",
@@ -2088,7 +2101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
             正确的做法是：
             1. 在这台（你自己的）电脑上，把 BigDaddy 从「应用程序」里删掉就行。
-            2. 到孩子的那台 Mac 上打开 \(client.dashboardBaseURL.host ?? "bigdaddy.mom")，在那台电脑上下载安装。
+            2. 到孩子的那台 Mac 上打开 \(marketingHost)，在那台电脑上下载安装。
             3. 装好后点它的菜单栏图标，拿到 6 位数字。
             4. 回到你自己的设备上，登录仪表盘，把那 6 位数字输进去。
 
@@ -2099,7 +2112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
             Here's what to do instead:
             1. On this computer — your own — just drag BigDaddy out of Applications.
-            2. Go to your child's Mac and open \(client.dashboardBaseURL.host ?? "bigdaddy.mom") there to download and install it.
+            2. Go to your child's Mac and open \(marketingHost) there to download and install it.
             3. Once it's running, click its menu bar icon to get a 6-digit number.
             4. Back on your own device, sign in to the dashboard and type those 6 digits in.
 
@@ -2109,7 +2122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.addButton(withTitle: Localization.string(zh: "知道了", en: "Got it"))
         alert.addButton(withTitle: Localization.string(zh: "打开官网", en: "Open the website"))
         if alert.runModal() == .alertSecondButtonReturn {
-            NSWorkspace.shared.open(client.dashboardBaseURL)
+            NSWorkspace.shared.open(marketingURL)
         }
     }
 
