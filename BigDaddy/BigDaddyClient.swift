@@ -34,6 +34,28 @@ struct DeviceIdentity {
     let secretHash: String
 }
 
+/// 时间约定：家长在仪表盘给孩子设定的一段可用时长，权威状态随 ConfigResponse.timeSession
+/// 下发（nil = 当前没有进行中的约定）。只做墙钟模式——remainingSeconds 是**服务端在响应
+/// 那一刻**算出的剩余秒数，客户端把它加到本机单调时钟（ProcessInfo.systemUptime）上得出
+/// 本地截止点，孩子改系统时间不影响倒计时。客户端不上报任何计时事件，"到点"完全由服务端
+/// 判定；这里只负责按快照在本地把旗帜渲染出来。
+struct TimeSession: Codable {
+    let sessionId: String
+    let grantedSeconds: Int
+    let remainingSeconds: Int
+    let note: String?
+}
+
+extension TimeSession: Equatable {
+    /// 只比 sessionId：remainingSeconds 每次配置轮询都在变，若参与相等性比较，
+    /// ClientConfig 的 `config != previous` 在约定进行期间会永远判定"有变化"，让
+    /// pollConfigForChildVisibility 里"只在真正变化时才做的事"（rebuildMenu、发
+    /// CONFIG_UPDATED 心跳等）在每一次 60 秒轮询都被误触发。
+    static func == (lhs: TimeSession, rhs: TimeSession) -> Bool {
+        lhs.sessionId == rhs.sessionId
+    }
+}
+
 /// 应用版本的单一来源：正式 .app 读打包时由 CI/package.sh 写入的 CFBundleShortVersionString；
 /// 裸二进制（swift run / Xcode 直接运行）没有 Info.plist，统一返回 "dev"——
 /// 菜单栏和上报后端必须用同一个值，此前分别兜底成 "?" 和假版本号 "1.0.0"，造成三处版本各说各话。
@@ -72,6 +94,9 @@ struct ClientConfig: Codable, Equatable {
     var heartbeatIdleSeconds: Int = 900
     var idleThresholdSeconds: Int = 180
     var hasPendingCommand: Bool = false
+    /// 当前活跃的时间约定（nil = 没有）。这是客户端获取会话状态的**唯一权威来源**：
+    /// SYNC_TIME_SESSION 命令只是门铃，冷启动、断网恢复、睡眠唤醒全部走这条路恢复。
+    var timeSession: TimeSession? = nil
 
     init() {
     }
@@ -92,6 +117,7 @@ struct ClientConfig: Codable, Equatable {
         heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 900
         idleThresholdSeconds = try container.decodeIfPresent(Int.self, forKey: .idleThresholdSeconds) ?? 180
         hasPendingCommand = try container.decodeIfPresent(Bool.self, forKey: .hasPendingCommand) ?? false
+        timeSession = try container.decodeIfPresent(TimeSession.self, forKey: .timeSession)
     }
 }
 
@@ -1250,6 +1276,9 @@ final class BigDaddyClient {
     /// （关于面板里点"测试截图"）不广播这个——用户当时就看着"关于"面板，⚠️ 按钮本身
     /// 已经是最直接的提示，不需要再额外弹一条本机通知重复同一件事。
     static let screenshotMissingPermissionNotification = Notification.Name("BigDaddyScreenshotMissingPermission")
+    /// 时间约定状态已随一次 SYNC_TIME_SESSION 门铃刷新（config.timeSession 可能变了），
+    /// 供 AppDelegate 立即重新计算旗帜/菜单，不必等到下一次 60 秒配置轮询的对比。
+    static let timeSessionSyncedNotification = Notification.Name("BigDaddyTimeSessionSynced")
 
     /// 把截图按"最大宽度"等比缩小到严格的目标像素尺寸，只缩不放。
     ///
@@ -1457,10 +1486,15 @@ final class BigDaddyClient {
         }
         guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
         let screenshotCommands = response.data.filter { $0.type == "TAKE_SCREENSHOT_NOW" }
+        // SYNC_TIME_SESSION 是"门铃"，不携带会话状态本身——不解析 payload，收到就统一
+        // 去刷新配置，权威状态在 ConfigResponse.timeSession 里（见 TimeSession 注释）。
+        // 一次 poll 可能同时取回多条这样的门铃（家长连续操作了几次"改约/中断"），
+        // 逐条 ack 但只需要刷新一次配置，不必每条各刷一次。
+        let timeSessionCommands = response.data.filter { $0.type == "SYNC_TIME_SESSION" }
         // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在仪表盘改完压缩质量/
         // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
         // 可能落后 60 秒配置轮询）的旧配置，家长对比时就会觉得"改了质量没区别/压缩没生效"。
-        if !screenshotCommands.isEmpty {
+        if !screenshotCommands.isEmpty || !timeSessionCommands.isEmpty {
             _ = await refreshConfig()
         }
         for command in screenshotCommands {
@@ -1473,6 +1507,21 @@ final class BigDaddyClient {
                 message: succeeded ? "Screenshot command processed" : "Screenshot not captured (disabled, missing permission, or upload failed)"
             )
         }
+        if !timeSessionCommands.isEmpty {
+            for command in timeSessionCommands {
+                await ack(commandId: command.commandId, status: "SUCCEEDED", message: "Time session synced")
+            }
+            NotificationCenter.default.post(name: Self.timeSessionSyncedNotification, object: nil)
+        }
+    }
+
+    /// 旗帜首次在孩子屏幕上下拉展示后的回执，供家长在仪表盘确认"孩子真的看到了"
+    /// （三步走的第三步）。刻意 fire-and-forget：不解析响应、失败也不重试——旗帜每次
+    /// 下拉都会打一发（见 AppDelegate 的里程碑排程），单次没送达不影响后续里程碑
+    /// 继续尝试，且后端只记第一次，多打几次并无副作用。
+    func reportTimeSessionShown(_ sessionId: String) async {
+        let body: [String: Any] = ["sessionId": sessionId]
+        _ = try? await request(path: "/bigdaddy/client/time-session/shown", method: "POST", body: body, signed: true)
     }
 
     func verifyExitPassword(_ value: String) async -> Bool {

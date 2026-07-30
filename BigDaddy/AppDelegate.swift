@@ -174,6 +174,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private weak var aboutCountdownField: NSTextField?
     /// 驱动上面字段每秒倒计时的定时器，只在"关于"窗口开着期间存活。
     private var aboutCountdownTimer: Timer?
+    /// "关于"窗口里"时间约定"行的剩余时间字段，与 aboutCountdownField 共用同一个
+    /// aboutCountdownTimer 每秒刷新；仅在渲染了该行（有进行中的约定）时非空。
+    private weak var aboutTimeSessionField: NSTextField?
+
+    // MARK: - 时间约定（家长设定的可用时长）
+
+    /// 下拉旗帜面板，懒加载（首次需要展示时才创建 NSPanel）。
+    private var timeFlag: TimeAgreementFlag?
+    /// 驱动倒计时/里程碑检查的 1 秒定时器，仅在有进行中的约定时存活。
+    private var timeSessionTimer: Timer?
+    /// 本地单调时钟截止点：`ProcessInfo.systemUptime`（收到这份会话快照那一刻） +
+    /// remainingSeconds。用单调时钟而不是墙钟——孩子改系统时间不影响倒计时；服务端仍是
+    /// 唯一权威，每次 syncTimeSessionState 都会用服务端最新值重新定锚这个值。
+    private var timeSessionDeadline: TimeInterval?
+    /// 当前正在跟踪的会话 id，用于识别"变了"（新开/被替换/被中断/到点清空）。
+    private var trackedTimeSessionId: String?
+    /// 里程碑触发记录，换一个新会话（sessionId 变化）时清空重来。
+    private var timeSessionMilestonesFired: Set<TimeSessionMilestone> = []
+    /// 菜单里"⏳ 剩余 …"这一条的引用，供 menuWillOpen 每次打开菜单时刷新文字，
+    /// 不必为了刷新一个数字就整个 rebuildMenu()。
+    private var timeSessionMenuItem: NSMenuItem?
+
+    private enum TimeSessionMilestone: Hashable {
+        case started, halfway, fiveMinutes, oneMinute, thirtySeconds
+    }
     // startingUpdater: true 后立即开始按 SUScheduledCheckInterval（Info.plist，当前 1 天）
     // 后台检查；SUEnableAutomaticChecks/SUAutomaticallyUpdate 已在 Info.plist 里直接置为
     // true，跳过 Sparkle 首次运行询问用户的对话框，检查与静默下载都无条件自动进行。
@@ -229,6 +254,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self, selector: #selector(onBrowserAutomationBlocked),
             name: BigDaddyClient.browserAutomationBlockedNotification, object: nil
         )
+        // 时间约定的门铃：命令轮询里一旦发现 SYNC_TIME_SESSION 就已经 refreshConfig 过，
+        // 这里只需要把最新状态同步进旗帜/菜单/计时器，把感知延迟从 60 秒配置轮询压到
+        // 命令轮询的 0~30 秒。
+        NotificationCenter.default.addObserver(
+            forName: BigDaddyClient.timeSessionSyncedNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.syncTimeSessionState() }
+        }
         installPowerAndSessionObservers()
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
@@ -264,6 +297,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 已绑定的机器上装了新浏览器时，这里补一次预热——每个 bundle id 一生
                 // 只会走到一次，已经预热过的启动不会有任何动静（见方法注释）
                 warmAutomationConsentIfNeeded()
+                // 冷启动时如果家长设定的约定还在进行中（客户端在中途被重启/崩溃后拉起），
+                // 这里负责发现它并补上旗帜/计时器——trackedTimeSessionId 此刻恒为 nil，
+                // 只要 config.timeSession 非空就会被 syncTimeSessionState 判定为"新会话"。
+                syncTimeSessionState()
             }
         }
     }
@@ -342,6 +379,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(.separator())
         }
 
+        // 时间约定：有进行中的约定时常驻展示剩余时间，紧跟在绑定状态之后——这是家长
+        // "现在正在发生"的一件事，比下面的浏览器警示/关于/开机自启这些次要项更该被
+        // 第一眼看到。菜单每次打开都会刷新这一条的文字（见 menuWillOpen），这里只
+        // 负责渲染初始文案。
+        //
+        // 判据特意用 trackedTimeSessionId/timeSessionDeadline（客户端自己已经权威更新的
+        // 本地状态），而不是直接查 client.config.timeSession：本地倒计时归零那一刻，
+        // handleTimeSessionReachedZero 已经把这两者清空、旗帜也已经在闪烁，但服务端的
+        // 30 秒扫描器还没确认到点，client.config.timeSession 这时仍是"看起来还在进行"的
+        // 陈旧快照——直接用它会让这一项在旗帜已经闪烁提醒时，还显示着一个不会再变的
+        // 陈旧非零读数，与旗帜的状态互相矛盾。
+        if let session = client.config.timeSession, let deadline = timeSessionDeadline,
+           trackedTimeSessionId == session.sessionId {
+            let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+            let item = NSMenuItem(
+                title: Self.timeSessionMenuTitle(remaining: remaining, grantedSeconds: session.grantedSeconds),
+                action: nil, keyEquivalent: ""
+            )
+            item.isEnabled = false
+            menu.addItem(item)
+            menu.addItem(.separator())
+            timeSessionMenuItem = item
+        } else {
+            timeSessionMenuItem = nil
+        }
+
         // 浏览器网址未授权：这是一条**可点即修**的待办，必须留在一级菜单。
         //
         // 之前它只存在于两个地方：一次性的本机通知（错过就没了）和「关于 BigDaddy…」
@@ -389,6 +452,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 完成，状态变化后就地重建菜单即可。
     func menuWillOpen(_ menu: NSMenu) {
         syncBindingStateIfStale()
+        // 不必等 syncBindingStateIfStale 的 5 秒网络节流：剩余时间是纯本地计算，
+        // 每次打开菜单都能免费刷新成当下最新的数字。
+        refreshTimeSessionMenuItemText()
     }
 
     /// "关于"窗口：把版本、当前配置摘要、心跳、截图倒计时等只读信息，以及守护说明/
@@ -476,16 +542,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         aboutCountdownTimer?.invalidate()
         aboutCountdownTimer = nil
         aboutCountdownField = nil
+        aboutTimeSessionField = nil
     }
 
-    /// 只在"关于"窗口里渲染了"下次截屏"行（aboutCountdownField 非空）时才起定时器。
+    /// 只在"关于"窗口里渲染了"下次截屏"或"时间约定"任一行时才起定时器，两个字段
+    /// 各自按是否非空刷新，互不影响。
     private func startAboutCountdownTimerIfNeeded() {
         aboutCountdownTimer?.invalidate()
         aboutCountdownTimer = nil
-        guard aboutCountdownField != nil else { return }
+        guard aboutCountdownField != nil || aboutTimeSessionField != nil else { return }
         aboutCountdownTimer = scheduleCommonModeTimer(interval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.aboutCountdownField?.stringValue = self?.nextScreenshotRemainingText() ?? ""
+                guard let self else { return }
+                self.aboutCountdownField?.stringValue = self.nextScreenshotRemainingText()
+                if let text = self.currentTimeSessionRemainingText() {
+                    self.aboutTimeSessionField?.stringValue = text
+                }
             }
         }
     }
@@ -554,12 +626,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         container.setCustomSpacing(18, after: titleLabel)
 
         aboutCountdownField = nil // 每次重建窗口都重置，只有真的渲染了倒计时行才会被赋值
+        aboutTimeSessionField = nil
         for row in aboutInfoRows() {
             switch row {
             case let .text(label, value):
                 container.addArrangedSubview(makeInfoRow(label: label, value: value, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
             case let .nextScreenshot(initialValue):
                 container.addArrangedSubview(makeNextScreenshotRow(initialValue: initialValue, width: width, labelWidth: labelWidth))
+            case let .timeSession(initialValue):
+                container.addArrangedSubview(makeTimeSessionRow(initialValue: initialValue, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
             }
         }
         if let lastRow = container.arrangedSubviews.last {
@@ -607,6 +682,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private enum AboutInfoRow {
         case text(label: String, value: String)
         case nextScreenshot(initialValue: String)
+        case timeSession(initialValue: String)
     }
 
     /// "关于"面板只读信息行的数据源：每一行只在对应信息"当下有意义"时才加入。
@@ -615,6 +691,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if client.config.bound {
             rows.append(.text(label: Localization.string(zh: "状态", en: "Status"),
                               value: Localization.string(zh: "已受保护", en: "Protected")))
+            // 有进行中的约定时排在"状态"之后：这是家长"现在正在发生"的一件事，
+            // 比下面截图/通知渠道这些长期不变的配置摘要更值得靠前看到。
+            if let timeSessionText = currentTimeSessionRemainingText() {
+                rows.append(.timeSession(initialValue: timeSessionText))
+            }
             rows.append(.text(
                 label: Localization.string(zh: "截图", en: "Screenshots"),
                 value: client.config.screenshotEnabled
@@ -727,6 +808,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         row.addArrangedSubview(labelField)
         row.addArrangedSubview(valueField)
         row.addArrangedSubview(testButton)
+        return row
+    }
+
+    /// "时间约定"信息行：与普通 label:value 行（makeInfoRow）结构一致，只是把 value
+    /// 字段交给 aboutCountdownTimer 每秒刷新，不需要行内按钮。
+    private func makeTimeSessionRow(initialValue: String, width: CGFloat, labelWidth: CGFloat, rowHeight: CGFloat) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
+        row.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
+
+        let labelField = NSTextField(labelWithString: Localization.string(zh: "时间约定", en: "Time left"))
+        labelField.font = NSFont.systemFont(ofSize: 12)
+        labelField.textColor = .secondaryLabelColor
+        labelField.alignment = .right
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        labelField.widthAnchor.constraint(equalToConstant: labelWidth).isActive = true
+
+        let valueField = NSTextField(labelWithString: initialValue)
+        valueField.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        valueField.textColor = .labelColor
+        valueField.alignment = .left
+        valueField.lineBreakMode = .byTruncatingTail
+        valueField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        aboutTimeSessionField = valueField // 交给 aboutCountdownTimer 每秒刷新
+
+        row.addArrangedSubview(labelField)
+        row.addArrangedSubview(valueField)
         return row
     }
 
@@ -1126,11 +1238,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 唤醒 / 解锁的共同处理：这两件事都意味着有人回到了机器前。
     ///
-    /// 三件事必须一起做，少任何一件都会留下"家长端显示空闲、孩子其实已经在用"的窗口：
+    /// 四件事必须一起做，少任何一件都会留下"家长端显示空闲、孩子其实已经在用"的窗口，
+    /// 或时间约定倒计时算错：
     /// 1. 重置空闲计时起点——否则 `isIdle` 会把睡眠期间累积的无输入时长算成空闲；
     /// 2. 把 wasIdle 归位并按活跃节奏重排心跳——否则下一次心跳还排在 15 分钟之后；
     /// 3. 顺手推一次补发——睡眠期间积压的队列正等着一个触发点，而网络路径可能并未翻转
-    ///    （唤醒后 Wi-Fi 自动重连通常会翻转，但有线网络/一直可达的情况不会）。
+    ///    （唤醒后 Wi-Fi 自动重连通常会翻转，但有线网络/一直可达的情况不会）；
+    /// 4. 重新拉一次配置并重新校准时间约定的本地截止点——`ProcessInfo.systemUptime`
+    ///    的定义是"系统保持唤醒的时长"，不计入睡眠时长。若不在这里重新定锚，孩子合盖
+    ///    10 分钟对本地倒计时零消耗，与"墙钟到点"的设计矛盾（家长设定的是真实时间，
+    ///    不是"孩子清醒使用电脑的时间"）。screenUnlock 场景机器全程醒着，这一步是
+    ///    无害的冗余刷新，不必单独判断 event 类型来跳过。
     private func handleResumeFromSystemEvent(event: EventType, auditLine: String) {
         AuditLog.record(auditLine)
         client.noteActivityFloor()
@@ -1140,6 +1258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         Task {
             await client.sendHeartbeat(event: event)
             await client.startBackfillIfNeeded()
+            _ = await client.refreshConfig()
+            await MainActor.run { [weak self] in self?.syncTimeSessionState() }
         }
     }
 
@@ -1276,6 +1396,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard changed || boundChanged || credentialsChanged else { return }
         let after = client.config.screenshotEnabled
         await MainActor.run {
+            // 60 秒配置轮询是时间约定的兜底同步路径——门铃丢失、或家长在设备离线期间
+            // 操作过（改约/中断）都靠它最终追上。syncTimeSessionState 内部会自行判断
+            // sessionId 是否真的变了，这里无脑调用即可。
+            syncTimeSessionState()
             rebuildMenu()
             updateStatusItemAppearance()
             triggerImmediateCommandPollIfNeeded()
@@ -1335,6 +1459,159 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 )
             }
         }
+    }
+
+    // MARK: - 时间约定（家长设定的可用时长）
+
+    /// 时间约定状态同步的统一入口。三处调用：60 秒配置轮询的兜底对比（changed 为真时）、
+    /// SYNC_TIME_SESSION 门铃触发的即时刷新、系统唤醒后的强制重新校准。
+    ///
+    /// 无论 sessionId 是否变化，都会用当前 config.timeSession.remainingSeconds 重新计算
+    /// timeSessionDeadline——这是"唤醒后重新定锚"那条路径真正需要的效果（见
+    /// handleResumeFromSystemEvent 的注释）。只有 sessionId 确实变化（新开/被替换/
+    /// 被中断/清空）时，才触发里程碑重置、计时器重启、旗帜展示/隐藏、本机审计记录这些
+    /// "一次性"副作用，避免每次配置轮询都重复播放"会话开始"的下拉动画。
+    private func syncTimeSessionState() {
+        let current = client.config.timeSession
+        let sessionChanged = current?.sessionId != trackedTimeSessionId
+
+        if let session = current {
+            timeSessionDeadline = ProcessInfo.processInfo.systemUptime + Double(session.remainingSeconds)
+        } else {
+            timeSessionDeadline = nil
+        }
+
+        guard sessionChanged else {
+            // 会话身份没变——多半是唤醒后的重新定锚，或一次无关变化触发的兜底轮询。
+            // 计时器按幂等方式重新确保仍在运行；菜单项文字顺手刷新一次。
+            if timeSessionDeadline != nil {
+                scheduleTimeSessionTimer()
+            }
+            refreshTimeSessionMenuItemText()
+            return
+        }
+
+        let hadPreviousSession = trackedTimeSessionId != nil
+        trackedTimeSessionId = current?.sessionId
+        timeSessionMilestonesFired.removeAll()
+        timeSessionTimer?.invalidate()
+        timeSessionTimer = nil
+
+        if let session = current {
+            AuditLog.record("TIME_SESSION_STARTED grantedSeconds=\(session.grantedSeconds)")
+            timeSessionMilestonesFired.insert(.started)
+            scheduleTimeSessionTimer()
+            presentTimeSessionFlag(session: session, autoDismissAfter: 4)
+        } else {
+            timeFlag?.stopFlashingAndDismiss()
+            // hadPreviousSession 为真但走到这个分支，说明是家长在仪表盘主动中断——
+            // 若是本地倒计时自己归零，handleTimeSessionReachedZero 早已把
+            // trackedTimeSessionId 清成 nil，根本不会落到这个 sessionChanged 分支。
+            if hadPreviousSession {
+                AuditLog.record("TIME_SESSION_CANCELLED source=remote")
+            }
+        }
+        rebuildMenu()
+    }
+
+    /// 本地倒计时到 0 时触发：不等服务端确认，直接进入"到点"视觉状态。真正的到点判定
+    /// 在服务端（BigDaddyTimeSessionScheduler 每 30 秒扫一次并通知家长），这里只是本地
+    /// 渲染跟上——提前把 trackedTimeSessionId 清空，是为了让随后服务端确认到点的那次
+    /// 轮询在 syncTimeSessionState 里直接判定"身份没变"（nil == nil）而短路返回，
+    /// 不会重复走一遍"清空"分支、把这次自然到点误记成 TIME_SESSION_CANCELLED。
+    private func handleTimeSessionReachedZero() {
+        timeSessionTimer?.invalidate()
+        timeSessionTimer = nil
+        timeSessionDeadline = nil
+        trackedTimeSessionId = nil
+        AuditLog.record("TIME_SESSION_EXPIRED")
+        timeFlag?.startFlashing(duration: 5 * 60)
+        rebuildMenu()
+    }
+
+    /// 驱动倒计时/里程碑检查的 1 秒计时器。用 .common 模式的手动 Timer（原因见
+    /// scheduleCommonModeTimer 的注释）：家长弹出的弹窗不该让倒计时的最后 30 秒 sticky
+    /// 显示停摆。
+    private func scheduleTimeSessionTimer() {
+        timeSessionTimer?.invalidate()
+        guard timeSessionDeadline != nil else { return }
+        timeSessionTimer = scheduleCommonModeTimer(interval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.timeSessionTick() }
+        }
+    }
+
+    private func timeSessionTick() {
+        guard let deadline = timeSessionDeadline, let session = client.config.timeSession else { return }
+        let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+        refreshTimeSessionMenuItemText()
+
+        if remaining <= 0 {
+            handleTimeSessionReachedZero()
+            return
+        }
+
+        // 每个里程碑只在"约定本身够长、这个提前量才有意义"时才生效：一个 3 分钟的约定
+        // 不该在开始没多久就弹出"剩余 5 分钟"的提醒——那从来就不是它的剩余量。
+        let granted = session.grantedSeconds
+        if granted >= 600, !timeSessionMilestonesFired.contains(.halfway), remaining <= granted / 2 {
+            timeSessionMilestonesFired.insert(.halfway)
+            presentTimeSessionFlag(session: session, remainingOverride: remaining, autoDismissAfter: 3)
+        }
+        if granted > 300, !timeSessionMilestonesFired.contains(.fiveMinutes), remaining <= 300 {
+            timeSessionMilestonesFired.insert(.fiveMinutes)
+            presentTimeSessionFlag(session: session, remainingOverride: remaining, autoDismissAfter: 3)
+        }
+        if granted > 60, !timeSessionMilestonesFired.contains(.oneMinute), remaining <= 60 {
+            timeSessionMilestonesFired.insert(.oneMinute)
+            presentTimeSessionFlag(session: session, remainingOverride: remaining, autoDismissAfter: 3)
+        }
+        if !timeSessionMilestonesFired.contains(.thirtySeconds), remaining <= 30 {
+            timeSessionMilestonesFired.insert(.thirtySeconds)
+            // sticky：autoDismissAfter 传 nil，一直显示到归零
+            presentTimeSessionFlag(session: session, remainingOverride: remaining, autoDismissAfter: nil)
+        } else if timeSessionMilestonesFired.contains(.thirtySeconds) {
+            // 已经进入 sticky 阶段：面板保持展示，仍需要每秒把数字刷新掉
+            timeFlag?.update(remainingSeconds: remaining, note: session.note)
+        }
+    }
+
+    /// 展示旗帜并顺带上报"孩子已看到"。每个里程碑都会调用一次——重复上报无害
+    /// （后端 markTimeSessionShown 只记第一次），换来的是代码不必特判"只在第一次上报"。
+    private func presentTimeSessionFlag(session: TimeSession, remainingOverride: Int? = nil, autoDismissAfter: TimeInterval?) {
+        guard let statusItem else { return }
+        let remaining = remainingOverride ?? session.remainingSeconds
+        let flag = timeFlag ?? TimeAgreementFlag()
+        timeFlag = flag
+        flag.present(anchor: statusItem, remainingSeconds: remaining, note: session.note, autoDismissAfter: autoDismissAfter)
+        let sessionId = session.sessionId
+        Task { await client.reportTimeSessionShown(sessionId) }
+    }
+
+    private func refreshTimeSessionMenuItemText() {
+        guard let item = timeSessionMenuItem, let session = client.config.timeSession,
+              let deadline = timeSessionDeadline else { return }
+        let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+        item.title = Self.timeSessionMenuTitle(remaining: remaining, grantedSeconds: session.grantedSeconds)
+    }
+
+    private static func timeSessionMenuTitle(remaining: Int, grantedSeconds: Int) -> String {
+        let clock = String(format: "%d:%02d", remaining / 60, remaining % 60)
+        let grantedMinutes = grantedSeconds / 60
+        return Localization.string(
+            zh: "⏳ 时间约定剩余 \(clock)（共 \(grantedMinutes) 分钟）",
+            en: "⏳ Time left: \(clock) (of \(grantedMinutes) min)"
+        )
+    }
+
+    /// "关于"窗口"时间约定"行的当前文案，nil 表示当下没有进行中的约定（该行不渲染）。
+    private func currentTimeSessionRemainingText() -> String? {
+        guard let session = client.config.timeSession, let deadline = timeSessionDeadline else { return nil }
+        let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+        let clock = String(format: "%d:%02d", remaining / 60, remaining % 60)
+        return Localization.string(
+            zh: "\(clock)（共 \(session.grantedSeconds / 60) 分钟）",
+            en: "\(clock) (of \(session.grantedSeconds / 60) min)"
+        )
     }
 
     private func performScheduledScreenshot() {
