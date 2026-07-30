@@ -378,6 +378,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             hintItem.isEnabled = false
             menu.addItem(hintItem)
 
+            // 装错机器的出口。家长在自己的电脑上浏览官网时，"下载"的默认语义就是"下到这台
+            // 机器"，所以把 BigDaddy 装到家长自己的 Mac 上是个高频误操作——而它一旦被绑定，
+            // 纠错就得走"解绑（永久删除该设备全部历史）→ 换机器重装"这条贵的路。未绑定态
+            // 是拦下这个错误最省事的时机，所以这条提示只在这里出现。
+            let wrongMacItem = NSMenuItem(
+                title: Localization.string(
+                    zh: "🙋 我是家长，这是我自己的电脑——该怎么办？",
+                    en: "🙋 I'm the parent and this is my own Mac — now what?"
+                ),
+                action: #selector(showWrongMacHelp), keyEquivalent: ""
+            )
+            menu.addItem(wrongMacItem)
+
             // 之前拆成"显示本机绑定码"和"输入家长给的码"两条平行菜单项，两者都叫"绑定"，
             // 孩子分不清该点哪个。改成一条入口，点开后再用弹窗把两种方式说清楚。
             menu.addItem(NSMenuItem(
@@ -2059,42 +2072,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停
+    /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停。
+    ///
+    /// 这个弹窗的受众其实有两个：首次启动时读它的是孩子，但家长刚在孩子机器上装完、
+    /// 人就站在旁边，所以家长也会读到。原先的文案是从隐私政策搬来的措辞（"法定监护人"
+    /// "在你知情的前提下""你的知情权"）加上一串技术名词（"采集内容""活动应用"
+    /// "使用摘要""只做中转""截图原图"），结果对两边都不好读——家长反馈"太专业看不懂"。
+    /// 现在改成"孩子会问的问题 + 大白话回答"，术语全部换成日常说法。
     @objc private func showTransparencyInfo() {
         let alert = NSAlert()
         alert.messageText = Localization.string(
-            zh: "关于本机的家庭守护",
-            en: "About the Family Guardian on This Mac"
+            zh: "这台电脑上装了什么？",
+            en: "What's running on this Mac?"
         )
         // 采集说明随当前真实状态变化，避免"文案说没开、实际已开"的表里不一
         let shotStatusZh = client.config.screenshotEnabled
-            ? "截图当前【已开启】：家长可远程截屏，每一张都会记录在本机。"
-            : "截图当前【未开启】：仅生成活动应用与窗口标题的使用摘要，不截屏。"
+            ? "截图现在是开着的——家长可以看到你的屏幕画面。每拍一次，这台电脑上都会弹通知告诉你，并且记进下面说的那个文件里。"
+            : "截图现在是关着的，只记上面这些文字，不会拍你的屏幕。"
         let shotStatusEn = client.config.screenshotEnabled
-            ? "Screenshots are currently ON: your parent can capture the screen; every capture is logged here."
-            : "Screenshots are currently OFF: only usage summaries of the active app/window are collected, no screen capture."
+            ? "Screenshots are on right now — your parent can see your screen. Every time one is taken, this Mac pops up a notice to tell you, and writes it into the file mentioned below."
+            : "Screenshots are off right now. It only notes the text above; it does not capture your screen."
         alert.informativeText = Localization.string(
             zh: """
-            这台 Mac 正在运行 BigDaddy 家庭守护，由你的家长（法定监护人）在你知情的前提下与你共同使用。
+            爸爸妈妈在这台电脑上装了 BigDaddy。这不是偷偷装的——所以现在这个窗口才会弹出来告诉你。
 
-            • 采集内容：当前活动应用与窗口标题的使用摘要。\(shotStatusZh)
-            • 谁能看到：仅与本设备完成绑定的家长本人。服务器只做中转，不保存截图原图。
-            • 你的知情权：菜单栏图标会随截图开关变化；开启后菜单会常驻显示提示，每次实际截图都会弹出通知并写入“本机守护记录”，你可以随时导出查看。
-            • 暂停/停止：请与家长沟通，由家长在仪表盘生成退出验证码或解除绑定。
+            它记什么？
+            你现在开着哪个应用、窗口标题上写着什么，比如"Safari — 某某网站"。它不看你打的字，也不读你的聊天内容。\(shotStatusZh)
+
+            谁能看到？
+            只有绑定这台电脑的那位家长。截图路过服务器的时候立刻就转走了，服务器上不留。
+
+            你怎么知道它在干什么？
+            屏幕最上面那一排里的那个图标一直都在，你随时能点开。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
+
+            想暂停或者卸载？
+            跟家长说一声。家长会在他那边生成一个一次性的数字码，你输进去就能退出。
+
+            ——如果你是家长，而这就是你自己的电脑：BigDaddy 应该装在孩子的电脑上，装在这里不会有任何用。
             """,
             en: """
-            This Mac runs BigDaddy Family Guardian, used with your knowledge by your parent (legal guardian).
+            Your parent installed BigDaddy on this Mac. It wasn't done behind your back — that's why this window is showing up right now.
 
-            • What it collects: usage summaries of the active app and window title. \(shotStatusEn)
-            • Who can see it: only the parent bound to this device. The server relays and never stores screenshots.
-            • Your visibility: the menu bar icon changes with the screenshot switch; when on, the menu shows a standing notice, and every capture pops a notification and is written to the local Guardian Log you can export anytime.
-            • Pause/stop: talk to your parent, who can issue an exit code or unbind the device in the dashboard.
+            What does it note down?
+            Which app you have open and what the window is called, like "Safari — some website". It doesn't see what you type, and it doesn't read your chats. \(shotStatusEn)
+
+            Who can see it?
+            Only the parent this Mac is linked to. Screenshots pass through the server and are sent straight on — nothing is kept there.
+
+            How do you know what it's doing?
+            That icon in the strip along the very top of the screen is always there, and you can open it any time. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.
+
+            Want to pause it or take it off?
+            Talk to your parent. They can generate a one-time code on their side, and typing it in lets you quit.
+
+            — If you're a parent and this is your own computer: BigDaddy belongs on your child's computer. Installed here, it won't do anything useful.
             """
         )
-        alert.addButton(withTitle: Localization.string(zh: "我知道了", en: "Got it"))
-        alert.addButton(withTitle: Localization.string(zh: "导出本机守护记录", en: "Export Local Guardian Log"))
+        alert.addButton(withTitle: Localization.string(zh: "知道了", en: "Got it"))
+        alert.addButton(withTitle: Localization.string(zh: "看看它都记了什么", en: "See what it has noted"))
         if alert.runModal() == .alertSecondButtonReturn {
             exportAuditLog()
+        }
+    }
+
+    /// 家长把客户端装到了自己的电脑上时的自助纠错。只在未绑定态提供——一旦绑定过，
+    /// 纠错就得走仪表盘解绑（会永久删除该设备历史），那条路必须由家长在仪表盘上走，
+    /// 这里给不了捷径。
+    @objc private func showWrongMacHelp() {
+        let alert = NSAlert()
+        alert.messageText = Localization.string(
+            zh: "BigDaddy 要装在孩子的电脑上",
+            en: "BigDaddy belongs on your child's computer"
+        )
+        alert.informativeText = Localization.string(
+            zh: """
+            这台电脑上的 BigDaddy 还没有绑定，也就还没有开始记录任何东西——现在退出、删掉它，不会留下任何痕迹。
+
+            正确的做法是：
+            1. 在这台（你自己的）电脑上，把 BigDaddy 从「应用程序」里删掉就行。
+            2. 到孩子的那台 Mac 上打开 \(client.dashboardBaseURL.host ?? "bigdaddy.mom")，在那台电脑上下载安装。
+            3. 装好后点它的菜单栏图标，拿到 6 位数字。
+            4. 回到你自己的设备上，登录仪表盘，把那 6 位数字输进去。
+
+            简单说：软件装在被守护的那台电脑上，你自己只要能打开仪表盘就够了。
+            """,
+            en: """
+            BigDaddy on this Mac isn't linked to anyone yet, so it hasn't recorded a thing. Quit it and delete it now and nothing is left behind.
+
+            Here's what to do instead:
+            1. On this computer — your own — just drag BigDaddy out of Applications.
+            2. Go to your child's Mac and open \(client.dashboardBaseURL.host ?? "bigdaddy.mom") there to download and install it.
+            3. Once it's running, click its menu bar icon to get a 6-digit number.
+            4. Back on your own device, sign in to the dashboard and type those 6 digits in.
+
+            In short: the app goes on the computer being looked after. All you need on your own device is the dashboard.
+            """
+        )
+        alert.addButton(withTitle: Localization.string(zh: "知道了", en: "Got it"))
+        alert.addButton(withTitle: Localization.string(zh: "打开官网", en: "Open the website"))
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSWorkspace.shared.open(client.dashboardBaseURL)
         }
     }
 
