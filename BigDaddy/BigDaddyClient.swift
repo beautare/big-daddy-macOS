@@ -18,6 +18,15 @@ enum EventType: String, Codable {
     case configUpdated = "CONFIG_UPDATED"
     case commandAck = "COMMAND_ACK"
     case appSwitch = "APP_SWITCH"
+    /// 系统即将休眠（合盖、菜单里选睡眠、电源策略自动睡）。在 NSWorkspace.willSleep 的
+    /// 同步窗口里抢发——不发这一条的话，"孩子合上了 MacBook"在家长端与"断网了""关机了"
+    /// "客户端被强杀了"完全同形，而这几种情况该做的事完全不同。
+    case sleep = "SLEEP"
+    /// 系统已唤醒。除了补上时间线，它还是"结束睡眠状态"的唯一信号。
+    case wake = "WAKE"
+    /// 锁屏（机器仍在运行）。与 IDLE 的区别是它由系统事件确定，不靠"多久没输入"推断。
+    case screenLock = "SCREEN_LOCK"
+    case screenUnlock = "SCREEN_UNLOCK"
 }
 
 struct DeviceIdentity {
@@ -122,7 +131,11 @@ final class BigDaddyClient {
     /// register 响应报告本机 secret 与后端存档不一致（设备已绑定、后端拒绝换钥）。
     /// 此状态下所有签名接口都会验签失败，必须在 UI 上明确警示，引导解绑后重新绑定。
     var credentialsInvalid = false
+    /// 上一次运行留下的墓碑时间戳（"上次运行没有正常结束"），由 prepareRuntime 在启动时读入。
+    /// prepareRuntime 在主线程写、sendHeartbeat 在（可能是后台的）Task 里取走，与 SwitchCounter
+    /// 是同一类读写竞争，一律经 previousCrashLock 访问。
     private var previousCrashAt: Date?
+    private let previousCrashLock = NSLock()
     private let switchCounter = SwitchCounter()
     private var switchObserver: NSObjectProtocol?
     /// 切换 App 后"即时上报"的防抖任务：把快速连切合并成一次发送
@@ -153,22 +166,46 @@ final class BigDaddyClient {
         CGPreflightScreenCaptureAccess()
     }
 
+    /// "从这一刻起重新开始计算空闲"的时间下限。唤醒/解锁时被推到当下（见 noteActivityFloor）。
+    ///
+    /// 为什么需要它：`CGEventSource.secondsSinceLastEventType` 返回的是**墙钟**意义上
+    /// "距上次输入过了多久"，睡眠时间也照算。合盖一夜再打开，这个值是 10 小时，于是唤醒后
+    /// 立刻触发的那次心跳会判定 IDLE 并把下一次心跳排到 15 分钟后——孩子这时候已经在用
+    /// 电脑了，家长端却显示"空闲"，而且要等最长 15 分钟才纠正。这正是产品设计文档里
+    /// "一旦检测到用户输入，立刻恢复常规节奏"承诺过、但此前并未实现的那一段。
+    private var activityFloor = Date()
+
+    /// 把"空闲计时"的起点重置到当下。唤醒、解锁这类系统事件意味着有人回到了机器前，
+    /// 即便此刻还没有产生第一个键鼠事件，也不该继续沿用睡眠期间累积的空闲时长。
+    func noteActivityFloor() {
+        activityFloor = Date()
+    }
+
     var isIdle: Bool {
         // 之前只看 .mouseMoved，只打字不动鼠标会被误判为空闲。改用 kCGAnyInputEventType
         // （rawValue ~0，即 CGEventSourceSecondsSinceLastInputEvent 的语义）覆盖键盘/
         // 鼠标/触控板等全部输入类型。
         let anyInputEventType = CGEventType(rawValue: ~UInt32(0))!
-        let idleSeconds = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: anyInputEventType)
+        let sinceLastInput = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: anyInputEventType)
+        // 取两者较小值：睡眠/锁屏期间累积的"无输入"时长不该在唤醒后立刻算成空闲，
+        // 但唤醒后如果确实一直没人动，过了 idleThresholdSeconds 依然会正常转入空闲。
+        let sinceFloor = Date().timeIntervalSince(activityFloor)
+        let idleSeconds = min(sinceLastInput, sinceFloor)
         return idleSeconds > Double(config.idleThresholdSeconds)
     }
 
     func prepareRuntime() {
-        let lock = Self.lockFileURL
-        if let data = try? Data(contentsOf: lock), let value = String(data: data, encoding: .utf8), let timestamp = TimeInterval(value) {
+        // 墓碑还在 ⇒ 上一次运行没走到"退休墓碑"那一步（正常退出和已确认上报的强杀都会退休它），
+        // 也就是没有正常结束。文件里的时间戳是上次运行最后一次刷新的时刻（见 touchRuntimeLock），
+        // 即"最后一次确认在线"，据此向后端补报。
+        if let data = try? Data(contentsOf: Self.lockFileURL),
+           let value = String(data: data, encoding: .utf8),
+           let timestamp = TimeInterval(value) {
+            previousCrashLock.lock()
             previousCrashAt = Date(timeIntervalSince1970: timestamp)
+            previousCrashLock.unlock()
         }
-        try? FileManager.default.createDirectory(at: lock.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
+        Self.touchRuntimeLock()
         startActivitySwitchTracking()
     }
 
@@ -210,14 +247,42 @@ final class BigDaddyClient {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
     }
 
-    /// 非破坏性读取：调用方据此判断"上次是否异常终止"，不清空状态。
-    /// 清空由 clearPreviousCrash() 单独负责，必须在 previousCrashAt 已经通过
-    /// sendHeartbeat 上报给后端之后才调用——此前的实现把"读取"和"清空"合并成一步，
-    /// 导致上报心跳时 previousCrashAt 已经被清空，后端永远收不到崩溃时间戳。
-    var detectedPreviousCrash: Date? { previousCrashAt }
+    /// 非破坏性读取：调用方据此判断"上次是否异常终止"（例如写一条本机审计日志），不改变状态。
+    /// 注意不要用它去组装上报字段——那要走 takePreviousCrashForReporting()。
+    var detectedPreviousCrash: Date? {
+        previousCrashLock.lock()
+        defer { previousCrashLock.unlock() }
+        return previousCrashAt
+    }
 
-    func clearPreviousCrash() {
+    /// 取走墓碑时间戳，交给这一次心跳携带。
+    ///
+    /// 是"取走"而不是"读取"：同一时刻可能有好几条心跳在飞（启动那一刻的 START、周期心跳、
+    /// 切换应用的即时上报），谁都读得到的话同一次异常终止会被上报好几遍，库里堆出一串
+    /// previous_crash_at 相同的记录。取走之后只有这一条心跳带着它。
+    ///
+    /// 清空的时机也随之定死在 sendHeartbeat 内部：**送达后端或写入补发队列都算已经持久
+    /// 记录**（PendingQueue 是落盘的加密队列，见其注释），只有被后端明确拒绝、既没落库
+    /// 也没进队列时才放回去重试（见 restorePreviousCrash）。此前是由调用方"仅在心跳成功
+    /// 时清空"，离线启动时这个时间戳会一直留在内存里，被本次会话往后的每一条心跳反复带上。
+    private func takePreviousCrashForReporting() -> Date? {
+        previousCrashLock.lock()
+        defer { previousCrashLock.unlock() }
+        let value = previousCrashAt
         previousCrashAt = nil
+        return value
+    }
+
+    /// 这条心跳被后端明确拒绝（401），既没落库也没进补发队列——把墓碑时间戳放回去，交给
+    /// 下一条心跳重试，否则这次异常终止就被无声丢弃了（它只存在于内存里：启动时读出后，
+    /// 磁盘上的墓碑已经被本次运行的时间戳覆盖）。
+    private func restorePreviousCrash(_ crashedAt: Date) {
+        previousCrashLock.lock()
+        defer { previousCrashLock.unlock() }
+        // 正常情况下一次运行只会有一个墓碑时间戳；万一期间已经写进了别的值，以新值为准。
+        if previousCrashAt == nil {
+            previousCrashAt = crashedAt
+        }
     }
 
     /// 签名接口（心跳/config/commands/verify-exit/screenshot）收到 401 时调用：说明本机
@@ -301,6 +366,10 @@ final class BigDaddyClient {
     /// 发送心跳。返回是否成功送达后端，供强杀/退出等需要"确认上报后才清理本地状态"的调用方判断。
     @discardableResult
     func sendHeartbeat(event: EventType) async -> Bool {
+        // 墓碑刷成"此刻仍然在线"。放在函数最前面（第一个 await 之前）是刻意的：正常退出/
+        // 强杀路径会在发完这条心跳后退休墓碑，刷新必须发生在退休之前，不能被下面那些
+        // 可能很慢的采集调用推到退休之后（真会推过去时由退休标记兜底，见 touchRuntimeLock）。
+        Self.touchRuntimeLock()
         let version = AppVersion.current
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         // activeWindowInfo 浏览器场景下靠 NSAppleScript 给目标浏览器发 Apple Event 并同步
@@ -316,6 +385,8 @@ final class BigDaddyClient {
         // 先取走计数并清零，即便这次心跳发送失败被塞进 PendingQueue 重试，这个区间的
         // 切换次数也已经落进这份 body 里，不会因为重试而重复计数或者丢失。
         let switchCount = switchCounter.takeAndReset()
+        // 同理取走墓碑时间戳：这条心跳是它唯一的携带者（见 takePreviousCrashForReporting）
+        let reportedCrashAt = takePreviousCrashForReporting()
 
         var body: [String: Any] = [
             "appVersion": version,
@@ -325,7 +396,7 @@ final class BigDaddyClient {
             "activeWindowTitle": windowTitle,
             "activeUrl": activeUrl,
             "switchCount": switchCount,
-            "previousCrashAt": previousCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
+            "previousCrashAt": reportedCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
             "reportedAt": ISO8601DateFormatter().string(from: Date()),
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
@@ -343,7 +414,11 @@ final class BigDaddyClient {
                 // 系统设置的登录项里手动关掉了自启——这是 App 内验证码开关拦不住的绕过，
                 // 家长端应据此告警。
                 "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled,
-                "launchAtLoginOsStatus": LaunchAtLoginController.osLevelStatusDescription
+                "launchAtLoginOsStatus": LaunchAtLoginController.osLevelStatusDescription,
+                // 还有多少条断网期间的记录尚未补传。家长端据此显示"正在补传 N 条"——
+                // 限速补发要花几十分钟，没有这个数字的话家长只会看到时间线在自己眼前
+                // 不断长出新内容，读起来像系统在乱跳。
+                "pendingQueueDepth": PendingQueue.depth
             ]
         ]
         // 如果有截图记录，一并上报
@@ -359,12 +434,28 @@ final class BigDaddyClient {
                 config.hasPendingCommand = pending
             }
             lastHeartbeatDescription = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+            // 实时心跳刚刚成功 ⇒ 通往后端的整条链路此刻是通的。这是补发最可靠的触发点：
+            // 强制门户、DNS 黑洞、后端 5xx 这些"网络路径始终 satisfied"的故障恢复时，
+            // NWPathMonitor 不会给出任何信号，只有这里能发现"可以开始补了"。
+            // 补发是独立任务，不阻塞本次心跳返回。
+            if event != .sleep && PendingQueue.depth > 0 {
+                Task { await self.startBackfillIfNeeded() }
+            }
             return true
         } catch let error as BigDaddyAPIError where error.isAuthFailure {
             // 服务器明确拒绝（设备已不存在/签名过不了），不是网络抖动，
             // 重试也不会成功——不进补发队列，改走 credentialsInvalid 恢复路径。
             NSLog("BigDaddy: heartbeat rejected (401): \(error.errorDescription ?? "")")
             markCredentialsInvalid()
+            // 这条 body 被丢弃了，墓碑时间戳还没有任何持久记录：放回去交给下一条心跳
+            if let reportedCrashAt { restorePreviousCrash(reportedCrashAt) }
+            return false
+        } catch let error as BigDaddyAPIError where error.isRateLimited {
+            // 被限流：这条事件照样要进队列（不能丢），但要顺带让补发一起退避——
+            // 实时上报的优先级高于补发历史，撞到 429 说明当下额度已经吃紧了。
+            NSLog("BigDaddy: heartbeat rate limited, queuing for backfill: \(error.errorDescription ?? "")")
+            noteRateLimited(retryAfter: error.retryAfterSeconds)
+            PendingQueue.enqueue(body)
             return false
         } catch {
             NSLog("BigDaddy: heartbeat failed, queuing for retry: \(error.localizedDescription)")
@@ -377,6 +468,11 @@ final class BigDaddyClient {
     private var lastPathSatisfied = false
 
     /// 用 NWPathMonitor 监听网络恢复：一旦从"不可达"变为"可达"，尝试补发积压的心跳。
+    ///
+    /// 注意这**不是**唯一的触发点，而只是最快的那个。"网络不畅"里最常见的几种场景恰好
+    /// 不改变 path.status（酒店/学校的强制门户、DNS 黑洞、后端 5xx、被限流），此时 Wi-Fi
+    /// 始终是 .satisfied，路径永远不翻转。所以补发还有另外两个触发点：每次实时心跳成功后
+    /// （见 sendHeartbeat），以及 60 秒配置轮询的兜底（见 AppDelegate）。
     func startNetworkMonitoring() {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
@@ -384,7 +480,7 @@ final class BigDaddyClient {
             guard let self else { return }
             let satisfied = path.status == .satisfied
             if satisfied && !self.lastPathSatisfied {
-                Task { await self.flushPendingQueue() }
+                Task { await self.startBackfillIfNeeded() }
             }
             self.lastPathSatisfied = satisfied
         }
@@ -392,18 +488,120 @@ final class BigDaddyClient {
         pathMonitor = monitor
     }
 
-    /// 补发断网期间积压的心跳；单条失败则重新入队，等待下一次网络恢复。
-    func flushPendingQueue() async {
-        let pending = PendingQueue.drainAll()
-        guard !pending.isEmpty else { return }
-        NSLog("BigDaddy: network recovered, flushing \(pending.count) queued heartbeat(s)")
-        for body in pending {
+    // MARK: - 限速补发
+
+    private let backfillLock = NSLock()
+    private var backfillRunning = false
+    /// 被服务端限流后，不早于这个时刻再发补发请求。实时心跳撞到 429 时也会写这个值，
+    /// 让补发一起退避——实时上报的优先级高于补发历史，不能让补发把当下的心跳挤掉。
+    private var rateLimitedUntil: Date?
+
+    /// 两条补发之间的间隔。约合 15 次/分钟，与后端给每台设备的 60 次/分钟额度之间
+    /// 刻意留出大片余量：同一分钟里还要容纳 1 次周期心跳和最多约 20 次 APP_SWITCH
+    /// 即时上报（防抖窗口 2 秒）。宁可补得慢一点，也不要让补发把实时上报挤成 429。
+    /// 真实节奏由服务端的 Retry-After 兜底校正，这个常量只是起步值。
+    private let backfillInterval: TimeInterval = 4.0
+    /// 同一条记录连续被限流这么多次就收手，把机会让给下一个触发点，避免在长时间限流下
+    /// 空转（每次循环都要等一个退避窗口，虽不是忙等，但也没有继续下去的意义）。
+    private let maxConsecutiveRateLimits = 5
+
+    /// 启动限速补发（幂等）：已经在补的时候直接返回，队列空时什么都不做。
+    ///
+    /// 之所以是"限速"而不是一股脑发完：后端按设备限流，一次长时间断网可能积压上千条，
+    /// 全速灌进去只会让前几十条成功、其余全部 429——而 429 在客户端和网络故障走同一条
+    /// 路径（重新入队），结果就是补发在最需要它的时候原地失效。
+    /// 抢占"补发进行中"标记。拿到返回 true，已有补发在跑返回 false。
+    ///
+    /// 刻意做成同步方法而不是在 async 函数里直接持锁：NSLock 在异步上下文里加解锁
+    /// 会跨越潜在的挂起点（Swift 6 里直接是错误），而这里加锁与解锁之间没有任何 await，
+    /// 封成同步调用既正确又能消掉那条诊断。
+    private func beginBackfill() -> Bool {
+        backfillLock.lock()
+        defer { backfillLock.unlock() }
+        if backfillRunning { return false }
+        backfillRunning = true
+        return true
+    }
+
+    private func endBackfill() {
+        backfillLock.lock()
+        defer { backfillLock.unlock() }
+        backfillRunning = false
+    }
+
+    func startBackfillIfNeeded() async {
+        guard beginBackfill() else { return }
+        defer { endBackfill() }
+
+        let depth = PendingQueue.depth
+        guard depth > 0 else { return }
+        NSLog("BigDaddy: starting paced backfill of \(depth) queued heartbeat(s)")
+        await drainPendingQueue()
+    }
+
+    private func drainPendingQueue() async {
+        var sent = 0
+        var consecutiveRateLimits = 0
+
+        while true {
+            if Task.isCancelled { return }
+
+            // 退避窗口内先睡够，再取队首——睡醒之后队列可能已经被实时心跳追加了新条目，
+            // 但队首（最老的那条）不会变，取的顺序依然是从旧到新。
+            if let until = rateLimitedUntil, until > Date() {
+                let seconds = until.timeIntervalSinceNow
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            }
+
+            guard let body = PendingQueue.peekOldest(limit: 1).first else { break }
+
             do {
                 _ = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
+                PendingQueue.removeFirst(1)
+                sent += 1
+                consecutiveRateLimits = 0
+            } catch let error as BigDaddyAPIError where error.isRateLimited {
+                consecutiveRateLimits += 1
+                noteRateLimited(retryAfter: error.retryAfterSeconds)
+                if consecutiveRateLimits >= maxConsecutiveRateLimits {
+                    NSLog("BigDaddy: backfill paused after \(consecutiveRateLimits) rate limits, \(PendingQueue.depth) left")
+                    return
+                }
+                continue    // 不摘除队首，退避结束后重试同一条
+            } catch let error as BigDaddyAPIError where error.isAuthFailure {
+                // 凭据失效：整个补发都过不了验签，继续下去毫无意义
+                NSLog("BigDaddy: backfill aborted, credentials rejected (401)")
+                markCredentialsInvalid()
+                return
+            } catch let error as BigDaddyAPIError where (400..<500).contains(error.statusCode) {
+                // 4xx（非 401/429）说明**这一条**的内容被服务端明确拒绝，重试多少次都一样。
+                // 必须丢掉它，否则这条"毒丸"会永远卡在队首，把它后面所有正常记录一起堵死
+                // （典型来源：旧版客户端写下的、字段已经不兼容的队列条目）。
+                NSLog("BigDaddy: dropping unacceptable queued entry (HTTP \(error.statusCode)): \(error.errorDescription ?? "")")
+                PendingQueue.removeFirst(1)
+                continue
             } catch {
-                PendingQueue.enqueue(body)
+                // 网络又断了：队列原样保留，等下一个触发点
+                NSLog("BigDaddy: backfill interrupted (\(error.localizedDescription)), \(PendingQueue.depth) left")
+                return
             }
+
+            try? await Task.sleep(nanoseconds: UInt64(backfillInterval * 1_000_000_000))
         }
+
+        if sent > 0 {
+            NSLog("BigDaddy: backfill complete, \(sent) heartbeat(s) delivered")
+            AuditLog.record("BACKFILL_COMPLETED count=\(sent)")
+        }
+    }
+
+    /// 记下限流退避截止时刻。服务端带了 Retry-After 就听它的，没带则保守退避一分钟
+    /// （限流桶是整分钟一次性补满的，等满一分钟一定拿得到令牌）。
+    private func noteRateLimited(retryAfter: Int?) {
+        let seconds = TimeInterval(retryAfter ?? 60)
+        let until = Date().addingTimeInterval(seconds)
+        if let current = rateLimitedUntil, current > until { return }
+        rateLimitedUntil = until
     }
 
     /// 正常退出（已通过远程验证码确认）：同步阻塞发送 SHUTDOWN 心跳，确保 HTTP 请求
@@ -415,13 +613,23 @@ final class BigDaddyClient {
     /// 注意：全局只应在这一处（quitWithPassword 校验通过后）调用一次；
     /// applicationWillTerminate 不再重复调用，避免 SHUTDOWN 被重复上报两次。
     func sendShutdownSync(timeout: TimeInterval = 2.5) {
+        sendEventSync(event: .shutdown, timeout: timeout)
+        Self.retireRuntimeLock()
+    }
+
+    /// 同步阻塞发送一条事件，用于"进程/系统马上就要停下来，必须先把请求发出去"的场合
+    /// （正常退出、系统休眠）。用信号量把异步请求桥接成同步，并设较短超时防止网络异常时
+    /// 卡死调用方——不强求等到服务端响应，只保证请求已经发出或已经写入补发队列。
+    ///
+    /// 休眠场景尤其依赖这个同步语义：macOS 在 willSleep 通知里只给应用几秒钟，
+    /// 异步发起后立刻返回的话，进程往往在请求真正上路之前就被冻结了。
+    func sendEventSync(event: EventType, timeout: TimeInterval = 2.5) {
         let semaphore = DispatchSemaphore(value: 0)
         Task.detached {
-            await self.sendHeartbeat(event: .shutdown)
+            await self.sendHeartbeat(event: event)
             semaphore.signal()
         }
         _ = semaphore.wait(timeout: .now() + timeout)
-        try? FileManager.default.removeItem(at: Self.lockFileURL)
     }
 
     /// 限时上报，用于信号处理场景：绝不无限等待网络，避免拖着进程迟迟无法退出。
@@ -452,7 +660,7 @@ final class BigDaddyClient {
         Task {
             let reported = await instance.sendForceKillHeartbeatWithTimeout()
             if reported {
-                try? FileManager.default.removeItem(at: lockFileURL)
+                retireRuntimeLock()
             }
             completion()
         }
@@ -1020,7 +1228,9 @@ final class BigDaddyClient {
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data)
-            throw BigDaddyAPIError(statusCode: http.statusCode, serverMessage: envelope?.message)
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0) }
+            throw BigDaddyAPIError(
+                statusCode: http.statusCode, serverMessage: envelope?.message, retryAfterSeconds: retryAfter)
         }
         return data
     }
@@ -1319,7 +1529,9 @@ final class BigDaddyClient {
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data)
-            throw BigDaddyAPIError(statusCode: http.statusCode, serverMessage: envelope?.message)
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0) }
+            throw BigDaddyAPIError(
+                statusCode: http.statusCode, serverMessage: envelope?.message, retryAfterSeconds: retryAfter)
         }
         return data
     }
@@ -1365,6 +1577,38 @@ final class BigDaddyClient {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/runtime.lock")
     }
+
+    /// 墓碑文件的串行化锁，以及"已退休"标记：进程走到正常结束（或强杀已确认上报）之后，
+    /// 任何迟到的心跳都不许再把墓碑写回来——否则进程已经退出、磁盘上却留着一个活墓碑，
+    /// 下次启动会凭空补报一次并不存在的异常终止。这不是假想的顺序：sendEventSync 只等
+    /// 2.5 秒就返回去删墓碑，超时后那条心跳仍在后台跑着。
+    private static let runtimeLockGuard = NSLock()
+    private static var runtimeLockRetired = false
+
+    /// 把墓碑刷成"此刻仍然在线"。
+    ///
+    /// 每次心跳都刷，于是文件里记的是**上次运行最后一次还活着的时刻**，而不是上次运行的
+    /// 启动时刻。只在启动时写一次的话，一台连开三天的机器被强杀后，补报上去的
+    /// previousCrashAt 会指向三天前——家长端会看到"上次异常终止发生在三天前"，可那三天里
+    /// 明明有连续的正常记录，自相矛盾，等于把这个信号变成噪音。按心跳刷新之后，这个值与
+    /// 真实终止时刻的误差不超过一个心跳间隔（活跃时 60 秒，空闲时 15 分钟）。
+    private static func touchRuntimeLock() {
+        runtimeLockGuard.lock()
+        defer { runtimeLockGuard.unlock() }
+        guard !runtimeLockRetired else { return }
+        let lock = lockFileURL
+        try? FileManager.default.createDirectory(at: lock.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
+    }
+
+    /// 移除墓碑，并从此不再刷新它：本次运行已经如实报告过自己的结束（SHUTDOWN，或已确认
+    /// 送达的 FORCE_KILL），下次启动不该再补报一次异常终止。
+    private static func retireRuntimeLock() {
+        runtimeLockGuard.lock()
+        defer { runtimeLockGuard.unlock() }
+        runtimeLockRetired = true
+        try? FileManager.default.removeItem(at: lockFileURL)
+    }
 }
 
 /// 本机守护记录（知情透明）：把每一次实际发生的采集/上报动作追加到本地明文日志，
@@ -1406,13 +1650,30 @@ enum PendingQueue {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/pending-heartbeats.jsonl")
     }
-    /// 上限保护，避免长期离线导致队列文件无限增长
-    private static let maxEntries = 200
+
+    /// 队列的保留窗口：**按时长**而不是按条数裁剪。
+    ///
+    /// 此前是"最多 200 条，超了丢最老的"。200 条在中度使用下只够 30 多分钟——一次晚饭时间
+    /// 的断网就开始静默丢数据，而且丢的是最早那批（最该保留的断网起点）。限速补发把排水
+    /// 速度控制住了，但水池太小的话再优雅的排水也没有意义，所以这里必须一起改。
+    ///
+    /// 24 小时覆盖了"周末外出一天""家里宽带故障一晚"这类真实场景；再长的断网（如寒假旅行）
+    /// 补回来的价值已经很低，而且补发本身要占用当下的额度。
+    private static let maxAge: TimeInterval = 24 * 60 * 60
+    /// 文件体积的硬上限，防止极端高频事件在 24 小时里堆出一个巨大的文件。
+    /// 按"1 分钟心跳 + 密集应用切换"估算，正常一天远到不了这个量级。
+    private static let maxEntries = 5000
+
+    /// 队列文件的串行化锁：补发循环在后台任务里读写，实时心跳失败时会从别的线程追加，
+    /// 两者都是"整份读出→改→整份写回"，不加锁会互相覆盖（丢事件或写出坏行）。
+    private static let lock = NSLock()
 
     static func enqueue(_ body: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: body),
               let line = String(data: data, encoding: .utf8) else { return }
-        var lines = readLines()
+        lock.lock()
+        defer { lock.unlock() }
+        var lines = prunedLines()
         lines.append(line)
         if lines.count > maxEntries {
             lines.removeFirst(lines.count - maxEntries)
@@ -1420,14 +1681,53 @@ enum PendingQueue {
         write(lines)
     }
 
-    /// 取出全部积压条目并清空队列文件；补发失败的条目由调用方重新 enqueue。
-    static func drainAll() -> [[String: Any]] {
-        let lines = readLines()
-        write([])
-        return lines.compactMap { line in
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            return obj
+    /// 当前积压条数。随心跳上报给后端（metadata.pendingQueueDepth），家长端据此显示
+    /// "正在补传 N 条"——补发要花几十分钟，没有这个数字的话家长只会看到时间线在自己
+    /// 眼前不断长出新内容，读起来像系统不可靠。
+    static var depth: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return prunedLines().count
+    }
+
+    /// 读取**最老的** limit 条但不移除。补发成功后由调用方调 removeFirst 摘掉。
+    ///
+    /// 不用"全取出→失败再塞回"的老写法：那样一旦补发中途失败（限流、网络再断），
+    /// 塞回去的顺序和原始顺序就不一致了，而家长端的连续折叠依赖时间有序。
+    /// 保持"读→确认成功→再摘除"的顺序，失败时队列原样不动。
+    static func peekOldest(limit: Int) -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return prunedLines().prefix(limit).compactMap(decode)
+    }
+
+    /// 摘掉队首 count 条（已确认送达的）。
+    static func removeFirst(_ count: Int) {
+        guard count > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        var lines = prunedLines()
+        lines.removeFirst(min(count, lines.count))
+        write(lines)
+    }
+
+    private static func decode(_ line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return obj
+    }
+
+    /// 读盘并丢掉超出保留窗口的条目。按 body 里的 reportedAt 判龄——那是事件真正发生的
+    /// 时刻，也正是补发上去之后家长在时间线上看到的时刻；用文件写入时间无法区分同一个
+    /// 文件里新旧混杂的条目。解析不出 reportedAt 的条目保留（宁可多补一条，不要静默丢）。
+    private static func prunedLines() -> [String] {
+        let cutoff = Date().addingTimeInterval(-maxAge)
+        let formatter = ISO8601DateFormatter()
+        return readLines().filter { line in
+            guard let obj = decode(line),
+                  let stamp = obj["reportedAt"] as? String,
+                  let reportedAt = formatter.date(from: stamp) else { return true }
+            return reportedAt > cutoff
         }
     }
 
@@ -1670,11 +1970,24 @@ struct ApiEnvelope: Codable {
 struct BigDaddyAPIError: LocalizedError {
     let statusCode: Int
     let serverMessage: String?
+    /// 服务端 Retry-After 响应头（秒）。限流过滤器在 429 时会带上它，补发循环据此
+    /// 自适应节奏，而不是靠客户端写死的常量猜服务端还剩多少额度。
+    let retryAfterSeconds: Int?
+
+    init(statusCode: Int, serverMessage: String?, retryAfterSeconds: Int? = nil) {
+        self.statusCode = statusCode
+        self.serverMessage = serverMessage
+        self.retryAfterSeconds = retryAfterSeconds
+    }
+
     var errorDescription: String? { serverMessage ?? "HTTP \(statusCode)" }
     /// 签名接口返回 401 只可能是 BigDaddyDeviceAuthService 里的认证失败
     /// （设备未注册/无 secret/签名不对/时间戳超窗），语义上等价于 register() 报告的
     /// credentialsValid=false，都意味着本机手上的凭据当下用不了。
     var isAuthFailure: Bool { statusCode == 401 }
+    /// 被限流。与网络故障的处理必须分开：事件照样要进补发队列（不能丢），但重试节奏
+    /// 得听服务端的，而且不该像网络恢复那样立刻重试。
+    var isRateLimited: Bool { statusCode == 429 }
 }
 
 /// 携带后端 message 的业务错误，让弹窗能直接展示真实原因而不是笼统的"绑定码无效"

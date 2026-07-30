@@ -229,6 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self, selector: #selector(onBrowserAutomationBlocked),
             name: BigDaddyClient.browserAutomationBlockedNotification, object: nil
         )
+        installPowerAndSessionObservers()
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
         presentFirstRunDisclosureIfNeeded()
@@ -241,13 +242,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 本次启动永远是 START 事件；如果检测到上次异常终止，通过
             // previousCrashAt 字段"如实补报"，而不是把这次正常启动本身
             // 标记成 FORCE_KILL（那样会让后端把重启误判成刚刚发生的强杀）。
+            //
+            // 时间戳的取走与清空都在 sendHeartbeat 内部完成（送达或写入补发队列都算已持久
+            // 记录），这里不再"仅在心跳成功时清空"：离线启动时那样会让它留在内存里，被本次
+            // 会话往后的每一条心跳反复带上，库里堆出一串 previous_crash_at 相同的记录。
             if let crashedAt = client.detectedPreviousCrash {
                 AuditLog.record("PREVIOUS_CRASH_DETECTED at=\(ISO8601DateFormatter().string(from: crashedAt))")
             }
-            let reported = await client.sendHeartbeat(event: .start)
-            if reported {
-                client.clearPreviousCrash()
-            }
+            await client.sendHeartbeat(event: .start)
             // 如果配置有变化，额外发送 CONFIG_UPDATED 事件
             if configChanged {
                 await client.sendHeartbeat(event: .configUpdated)
@@ -1065,6 +1067,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     // 跟踪 IDLE/RESUME 状态转换
     private var wasIdle = false
 
+    /// 电源与登录会话事件的监听。
+    ///
+    /// 没有这四个事件时，"孩子合上了 MacBook""孩子锁屏去吃饭了""家里断网了""客户端被强杀"
+    /// 在家长端全部收敛成同一个 OFFLINE——而这几种情况家长该做的事完全不同。
+    ///
+    /// 两套通知中心不能混：睡眠/唤醒走 NSWorkspace 的通知中心，锁屏/解锁只在
+    /// **DistributedNotificationCenter** 上以 `com.apple.screenIsLocked` /
+    /// `com.apple.screenIsUnlocked` 广播（没有对应的 NSWorkspace 常量）。
+    private func installPowerAndSessionObservers() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+
+        // willSleep 的处理块是**同步**执行的，系统会等它返回（只给几秒）才真正睡下去。
+        // 这正是唯一能在睡眠前把 SLEEP 发出去的窗口，所以这里刻意用同步发送。
+        workspaceCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            AuditLog.record("SYSTEM_WILL_SLEEP")
+            self.client.sendEventSync(event: .sleep, timeout: 2.0)
+        }
+
+        workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleResumeFromSystemEvent(event: .wake, auditLine: "SYSTEM_DID_WAKE")
+        }
+
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            AuditLog.record("SCREEN_LOCKED")
+            Task { await self.client.sendHeartbeat(event: .screenLock) }
+        }
+
+        distributed.addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.handleResumeFromSystemEvent(event: .screenUnlock, auditLine: "SCREEN_UNLOCKED")
+        }
+    }
+
+    /// 唤醒 / 解锁的共同处理：这两件事都意味着有人回到了机器前。
+    ///
+    /// 三件事必须一起做，少任何一件都会留下"家长端显示空闲、孩子其实已经在用"的窗口：
+    /// 1. 重置空闲计时起点——否则 `isIdle` 会把睡眠期间累积的无输入时长算成空闲；
+    /// 2. 把 wasIdle 归位并按活跃节奏重排心跳——否则下一次心跳还排在 15 分钟之后；
+    /// 3. 顺手推一次补发——睡眠期间积压的队列正等着一个触发点，而网络路径可能并未翻转
+    ///    （唤醒后 Wi-Fi 自动重连通常会翻转，但有线网络/一直可达的情况不会）。
+    private func handleResumeFromSystemEvent(event: EventType, auditLine: String) {
+        AuditLog.record(auditLine)
+        client.noteActivityFloor()
+        wasIdle = false
+        scheduleNextHeartbeat()
+        scheduleNextCommandPoll()
+        Task {
+            await client.sendHeartbeat(event: event)
+            await client.startBackfillIfNeeded()
+        }
+    }
+
     /// `Timer.scheduledTimer(withTimeInterval:repeats:block:)` 只把计时器加入当前
     /// RunLoop 的 `.default` 模式。任何 NSAlert.runModal() 打开期间，RunLoop 会切到
     /// `.modalPanel` 模式，`.default` 模式的计时器完全不会触发——心跳/命令轮询/配置
@@ -1172,6 +1236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 近实时拉取配置：一旦家长开启或撤销截图，立即更新常驻指示并通知孩子端。
     private func pollConfigForChildVisibility() async {
+        // 补发的兜底触发点（每 60 秒一次）。前两个触发点是网络路径翻转和实时心跳成功，
+        // 但两者都可能长时间不发生：路径一直 satisfied（强制门户/后端故障），而心跳如果
+        // 也一直失败就永远没有"成功"可言。有这一条兜底，队列不会因为错过某个边沿而
+        // 无限期滞留——这是旧实现最主要的缺陷（补发只挂在 NWPathMonitor 一个触发点上）。
+        Task { await client.startBackfillIfNeeded() }
+
         let boundBefore = client.config.bound
         let invalidBefore = client.credentialsInvalid
         let before = client.config.screenshotEnabled
