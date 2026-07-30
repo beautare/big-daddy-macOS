@@ -1079,7 +1079,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let workspaceCenter = NSWorkspace.shared.notificationCenter
 
         // willSleep 的处理块是**同步**执行的，系统会等它返回（只给几秒）才真正睡下去。
-        // 这正是唯一能在睡眠前把 SLEEP 发出去的窗口，所以这里刻意用同步发送。
+        // 这正是唯一能在睡眠前把 SLEEP 发出去的窗口，所以这里刻意用同步发送——
+        // 编译器会警告"不能从 Sendable 闭包引用 MainActor 隔离的 client 属性"（queue: nil
+        // 意味着这个闭包可能在任意线程同步执行，不保证是主线程），但这里**不能**用
+        // `Task { @MainActor in ... }` 包一层去满足它：那样这次调用会变成排到下一轮主
+        // 循环才执行的异步任务，闭包本身立即返回、系统立刻继续休眠流程，等于完全废掉
+        // "同步阻塞、确保这条心跳已经发出"这个设计的全部意义。`client` 是一个不涉及
+        // AppDelegate 自身状态、专为跨线程调用设计的普通类实例，这里保留警告、不做处理。
         workspaceCenter.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
         ) { [weak self] _ in
@@ -1091,7 +1097,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         workspaceCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.handleResumeFromSystemEvent(event: .wake, auditLine: "SYSTEM_DID_WAKE")
+            // queue: .main 保证这个闭包本来就跑在主线程上，但闭包类型本身仍是非隔离的
+            // Sendable 闭包，编译器看不出"主线程"和"MainActor"这里其实是同一回事——
+            // 包一层 Task { @MainActor in } 是本文件里 scheduleNextHeartbeat 等处已经在用
+            // 的标准写法，让编译器认可这次调用合法，运行时行为不变（下一轮主循环立即执行）。
+            Task { @MainActor [weak self] in
+                self?.handleResumeFromSystemEvent(event: .wake, auditLine: "SYSTEM_DID_WAKE")
+            }
         }
 
         let distributed = DistributedNotificationCenter.default()
@@ -1106,7 +1118,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         distributed.addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
         ) { [weak self] _ in
-            self?.handleResumeFromSystemEvent(event: .screenUnlock, auditLine: "SCREEN_UNLOCKED")
+            Task { @MainActor [weak self] in
+                self?.handleResumeFromSystemEvent(event: .screenUnlock, auditLine: "SCREEN_UNLOCKED")
+            }
         }
     }
 

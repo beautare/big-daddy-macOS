@@ -173,7 +173,16 @@ final class BigDaddyClient {
     /// 立刻触发的那次心跳会判定 IDLE 并把下一次心跳排到 15 分钟后——孩子这时候已经在用
     /// 电脑了，家长端却显示"空闲"，而且要等最长 15 分钟才纠正。这正是产品设计文档里
     /// "一旦检测到用户输入，立刻恢复常规节奏"承诺过、但此前并未实现的那一段。
-    private var activityFloor = Date()
+    ///
+    /// 初值必须是 `.distantPast` 而不是 `Date()`：这个下限只该在"刚发生过一次唤醒/解锁"
+    /// 时才生效。如果初始化成"此刻"，会让**任何一次进程启动**（不只是睡眠唤醒——崩溃后
+    /// 自动重启、Sparkle 更新后重开、单纯的开机自启）在最初 idleThresholdSeconds 内把
+    /// `isIdle` 恒判定为 false：哪怕孩子已经离开了一整夜、进程是凌晨自动重启的，`sinceFloor`
+    /// （刚启动，几乎是 0）会在 min() 里压过真实的 `sinceLastInput`，让"分明空闲"的这段
+    /// 时间被误报成"活跃"。用 `.distantPast` 做哨兵值，`sinceFloor` 在从未唤醒过的整个
+    /// 进程生命周期里恒为一个天文数字，min() 永远退化成单纯的 `sinceLastInput`——直到
+    /// 真的发生一次 noteActivityFloor() 调用，这个下限才第一次有意义。
+    private var activityFloor = Date.distantPast
 
     /// 把"空闲计时"的起点重置到当下。唤醒、解锁这类系统事件意味着有人回到了机器前，
     /// 即便此刻还没有产生第一个键鼠事件，也不该继续沿用睡眠期间累积的空闲时长。
