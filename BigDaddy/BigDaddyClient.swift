@@ -169,7 +169,22 @@ final class BigDaddyClient {
 
     init() {
         self.identity = IdentityStore.load()
-        self.config = ConfigStore.load() ?? ClientConfig()
+        var restored = ConfigStore.load() ?? ClientConfig()
+        // 磁盘上存下来的 timeSession 一律作废。
+        //
+        // ConfigStore 持久化的是整个 ClientConfig，timeSession 会连着它那个"服务端在响应
+        // 那一刻算出的" remainingSeconds 一起落盘，而这个数字**只在落盘那一瞬间成立**。
+        // 从落盘到下次冷启动之间会流逝任意长的墙钟时间（关机一整晚很常见），复用它就等于
+        // 凭空复活一个早已到点的约定：家长昨晚 20:00 设了 30 分钟，孩子 20:10 合盖关机
+        // （落盘 remainingSeconds=1200），次日早上 7:00 开机、Wi-Fi 还没连上导致
+        // refreshConfig() 失败——若不清掉，客户端会拿着这份隔夜快照下拉旗帜、显示"剩余
+        // 20:00"并开始倒数，而服务端早在昨晚就把它判成 EXPIRED 了。
+        //
+        // 只清磁盘这一条路径，不动内存：进程运行期间 refreshConfig() 失败时保留内存里的
+        // 上一份 timeSession 是**正确**的（墙钟语义下时间照流，断网不该让倒计时暂停），
+        // 有问题的只是磁盘往返跨越的那段不可知时长。
+        restored.timeSession = nil
+        self.config = restored
         BigDaddyClient.lastSharedInstance = self
     }
 

@@ -190,6 +190,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var timeSessionDeadline: TimeInterval?
     /// 当前正在跟踪的会话 id，用于识别"变了"（新开/被替换/被中断/到点清空）。
     private var trackedTimeSessionId: String?
+    /// 本地倒计时已经判过到点、但服务端还没确认的那个会话 id。
+    ///
+    /// 服务端的到点扫描器每 30 秒跑一次，在"本地归零"到"服务端确认"之间存在一个最长
+    /// 30 秒的窗口。这段时间里 GET /client/config 仍会返回**这个会话本身**（status 还是
+    /// ACTIVE），只是 remainingSeconds 已被服务端算成 0（见后端 remainingSeconds：
+    /// endsAt 已过但 status 未翻转时返回 0）。必须能识别出"这个会话我本地已经处理完了"，
+    /// 否则窗口内任何一次配置轮询都会把它当成一个全新会话重新开始（见 syncTimeSessionState）。
+    private var locallyExpiredSessionId: String?
     /// 里程碑触发记录，换一个新会话（sessionId 变化）时清空重来。
     private var timeSessionMilestonesFired: Set<TimeSessionMilestone> = []
     /// 菜单里"⏳ 剩余 …"这一条的引用，供 menuWillOpen 每次打开菜单时刷新文字，
@@ -1474,12 +1482,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func syncTimeSessionState() {
         let current = client.config.timeSession
         let sessionChanged = current?.sessionId != trackedTimeSessionId
+        // 本地已判过到点、服务端尚未确认的那个会话：它在配置里仍然存在（remainingSeconds=0），
+        // 但对客户端来说已经处理完毕，不能再被当成"还在进行"去重新定锚或重启计时器。
+        let awaitingExpiryConfirmation = current != nil && current?.sessionId == locallyExpiredSessionId
 
-        if let session = current {
+        if let session = current, !awaitingExpiryConfirmation {
             timeSessionDeadline = ProcessInfo.processInfo.systemUptime + Double(session.remainingSeconds)
-        } else {
+        } else if current == nil {
             timeSessionDeadline = nil
         }
+        // awaitingExpiryConfirmation 时刻意不动 timeSessionDeadline：
+        // handleTimeSessionReachedZero 已经把它清成 nil，重新按 remainingSeconds=0 定锚会
+        // 让它变成"此刻就到点"的非 nil 值，下一次 tick 又触发一遍到点处理。
 
         guard sessionChanged else {
             // 会话身份没变——多半是唤醒后的重新定锚，或一次无关变化触发的兜底轮询。
@@ -1491,24 +1505,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             return
         }
 
-        let hadPreviousSession = trackedTimeSessionId != nil
+        let previousSessionId = trackedTimeSessionId
+        // 服务端刚刚确认了本地早已判过的那次自然到点：这不是家长中断，闪烁提醒也正在
+        // 进行中，两者都不该被下面的"清空"分支按中断处理。
+        let confirmingLocalExpiry = current == nil
+            && previousSessionId != nil
+            && previousSessionId == locallyExpiredSessionId
         trackedTimeSessionId = current?.sessionId
         timeSessionMilestonesFired.removeAll()
         timeSessionTimer?.invalidate()
         timeSessionTimer = nil
 
         if let session = current {
+            // 新会话（含"旧的还在闪烁时家长又设了一段"）：本地到点标记随之作废
+            locallyExpiredSessionId = nil
             AuditLog.record("TIME_SESSION_STARTED grantedSeconds=\(session.grantedSeconds)")
             timeSessionMilestonesFired.insert(.started)
             scheduleTimeSessionTimer()
+            // present 内部会先 stopFlashing，接替上一次约定还没走完的闪烁
             presentTimeSessionFlag(session: session, autoDismissAfter: 4)
+        } else if confirmingLocalExpiry {
+            // 让归零时启动的那 5 分钟闪烁自然走完：既不在这里打断，也不记 CANCELLED
+            // （那会把一次自然到点误报成家长中断，本机守护记录里就多出一条假事件）。
+            locallyExpiredSessionId = nil
         } else {
             timeFlag?.stopFlashingAndDismiss()
-            // hadPreviousSession 为真但走到这个分支，说明是家长在仪表盘主动中断——
-            // 若是本地倒计时自己归零，handleTimeSessionReachedZero 早已把
-            // trackedTimeSessionId 清成 nil，根本不会落到这个 sessionChanged 分支。
-            if hadPreviousSession {
-                AuditLog.record("TIME_SESSION_CANCELLED source=remote")
+            locallyExpiredSessionId = nil
+            if previousSessionId != nil {
+                // 只记"服务端已不再报告这个约定"这个客户端真正观测到的事实，不写原因。
+                //
+                // 客户端在这里**无法区分**两种成因，它们在本地看来完全同形（会话凭空消失、
+                // 且没有本地归零事件）：① 家长在仪表盘主动中断；② 约定在 Mac 睡眠期间
+                // 自然到点——睡眠时 1 秒 tick 不运行，本地永远没机会判归零，醒来时服务端
+                // 早已清掉了它。此前这里写死 CANCELLED，等于把情况 ② 在孩子可见的守护记录
+                // 里谎报成"家长中断了约定"。准确的成因（TIMER_EXPIRED / TIMER_CANCELLED）
+                // 由服务端审计流水记录、在家长仪表盘里可查，本机记录只需诚实描述所见。
+                AuditLog.record("TIME_SESSION_ENDED source=remote 服务端已不再报告进行中的约定")
             }
         }
         rebuildMenu()
@@ -1516,14 +1548,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 本地倒计时到 0 时触发：不等服务端确认，直接进入"到点"视觉状态。真正的到点判定
     /// 在服务端（BigDaddyTimeSessionScheduler 每 30 秒扫一次并通知家长），这里只是本地
-    /// 渲染跟上——提前把 trackedTimeSessionId 清空，是为了让随后服务端确认到点的那次
-    /// 轮询在 syncTimeSessionState 里直接判定"身份没变"（nil == nil）而短路返回，
-    /// 不会重复走一遍"清空"分支、把这次自然到点误记成 TIME_SESSION_CANCELLED。
+    /// 渲染先跟上，好让孩子在归零那一秒就看到提醒，而不是等最多 30 秒。
+    ///
+    /// **保留** trackedTimeSessionId、另记一个 locallyExpiredSessionId：这两件事一起，
+    /// 才能让接下来最长 30 秒窗口内的每一次配置轮询都识别出"这个会话我已经处理完了"。
+    /// 曾经的写法是在这里把 trackedTimeSessionId 清成 nil，指望服务端确认时按
+    /// "nil == nil 身份没变"短路——但那个窗口里服务端返回的**仍是这个会话本身**
+    /// （status 还是 ACTIVE、remainingSeconds 被算成 0），于是 sessionChanged 判定为真，
+    /// 走进"新会话"分支：记一条假的 TIME_SESSION_STARTED、掐掉正在进行的闪烁、
+    /// 换成一个 0:00 的倒计时旗帜，下一次 tick 又归零一次、再记一条 TIME_SESSION_EXPIRED
+    /// 并把 5 分钟闪烁重新计时。
     private func handleTimeSessionReachedZero() {
         timeSessionTimer?.invalidate()
         timeSessionTimer = nil
         timeSessionDeadline = nil
-        trackedTimeSessionId = nil
+        locallyExpiredSessionId = trackedTimeSessionId
         AuditLog.record("TIME_SESSION_EXPIRED")
         timeFlag?.startFlashing(duration: 5 * 60)
         rebuildMenu()

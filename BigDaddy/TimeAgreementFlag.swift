@@ -161,6 +161,26 @@ final class TimeAgreementFlag {
         return String(format: "%d:%02d", safe / 60, safe % 60)
     }
 
+    /// NSVisualEffectView 的圆角遮罩。
+    ///
+    /// 只画一个刚好够容纳四个圆角的小图（2r+1 边长），靠 `capInsets` + `.stretch` 把
+    /// 中间那 1×1 像素拉伸到实际面板尺寸——四角保持原样不被拉变形。这样遮罩与
+    /// panelSize 解耦，改面板尺寸不需要重画遮罩。
+    ///
+    /// `NSImage(size:flipped:drawingHandler:)` 的绘制块在每次需要该图时按当时尺寸重新
+    /// 执行，因此这里画的是"当前请求的 rect"而不是写死的常量。
+    private static func roundedMaskImage(cornerRadius radius: CGFloat) -> NSImage {
+        let side = radius * 2 + 1
+        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
+    }
+
     // MARK: - 面板构建与定位
 
     private func ensurePanel() -> NSPanel {
@@ -194,9 +214,14 @@ final class TimeAgreementFlag {
         container.material = .hudWindow
         container.state = .active
         container.blendingMode = .behindWindow
-        container.wantsLayer = true
-        container.layer?.cornerRadius = Self.cornerRadius
-        container.layer?.masksToBounds = true
+        // 圆角必须用 maskImage，不能用 layer.cornerRadius + masksToBounds。
+        //
+        // NSVisualEffectView 的毛玻璃是由窗口服务器在**这个视图的图层之外**合成的，
+        // CALayer 的裁剪管不到它：四角会照旧露出材质的直角，而 borderless 窗口的
+        // hasShadow 阴影轮廓又是按不透明区域计算的，于是尖角会在阴影上再现一次——
+        // 表现就是"设了圆角但四个角仍能看到矩形尖角"。maskImage 是 AppKit 为这个视图
+        // 专门提供的裁剪入口，材质与阴影都会遵循它。
+        container.maskImage = Self.roundedMaskImage(cornerRadius: Self.cornerRadius)
 
         let icon = NSImageView()
         icon.image = NSImage(systemSymbolName: "hourglass", accessibilityDescription: nil)
@@ -264,6 +289,9 @@ final class TimeAgreementFlag {
                 panel.animator().setFrame(targetFrame, display: true)
             }
         }
+        // borderless 窗口的阴影是按不透明区域缓存的，而遮罩生效的时机可能晚于窗口首次
+        // 上屏；不主动作废一次，第一次展示时可能留下一圈按未裁剪的直角算出来的旧阴影。
+        panel.invalidateShadow()
     }
 
     /// 计算面板应处的屏幕坐标。三个兜底场景（对应 anchorScreenAndButtonFrame 的注释）
