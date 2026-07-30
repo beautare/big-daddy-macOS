@@ -51,7 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var commandTimer: Timer?
     private var configTimer: Timer?
     /// 屏幕录制权限的授予/撤回都发生在系统设置里，没有公开的变更通知 API 可订阅，只能
-    /// 轮询；这个定时器让菜单栏图标（缺权限的感叹号内胆 ⇄ 截图开启的实心盾牌）在用户刚授权/撤权后近乎实时地跟上，
+    /// 轮询；这个定时器让菜单栏图标（盾牌旁的三角感叹号 ⇄ 眼睛）在用户刚授权/撤权后近乎实时地跟上，
     /// 不用等到下一次远端配置轮询（60 秒）。见 refreshIconIfPermissionChanged。
     private var permissionPollTimer: Timer?
     /// 上一次观测到的屏幕录制权限状态，nil 表示"还没观测过"或"截图关闭、不关心"。
@@ -880,12 +880,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 让菜单栏图标反映当前"截图是否开启 / 是否正在截图 / 权限是否缺失"，作为孩子端常驻可见指示。
     ///
-    /// 四种状态全部是**同一副盾牌轮廓**的不同内胆（见 ShieldIcon.Variant）：空心棋盘格=守护中
-    /// 未截图，实心=截图已开启，实心带孔=此刻正在截图，空心带感叹号=缺权限。此前这三种非默认
-    /// 状态借用的是 eye / exclamationmark.triangle / camera 三个互不相干的系统符号，家长看到
-    /// 三角感叹号根本认不出那还是 BigDaddy。
+    /// 四种状态**共用同一个满尺寸的品牌盾牌**，状态由盾牌右侧一个并排的符号承担（见
+    /// ShieldIcon.Variant）：没有符号=守护中未截图，空心眼睛=截图已开启，实心眼睛=此刻正在
+    /// 截图，三角感叹号=缺权限。为什么是并排而不是换图标、改内胆或压角标，见 ShieldIcon
+    /// 里那段记录。
     ///
-    /// 浏览器网址未授权也走同一个 warning 内胆：两者是同一类问题（配置了但实际不生效），
+    /// 浏览器网址未授权也走同一个 warning 符号：两者是同一类问题（配置了但实际不生效），
     /// 用同一套视觉语言，点开菜单第一眼就能看到对应那条待办。屏幕录制排在前面——
     /// 它缺失时家长一张截图都收不到，比"有标题没链接"更严重。
     private func updateStatusItemAppearance(capturing: Bool = false) {
@@ -2041,7 +2041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             只有绑定这台电脑的那位家长。截图路过服务器的时候立刻就转走了，服务器上不留。
 
             你怎么知道它在干什么？
-            屏幕最上面那一排里有个小盾牌，一直都在，你随时能点开。盾牌是空心的就是没在截图，整个填成实心就是截图开着——扫一眼就知道现在是哪种。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
+            屏幕最上面那一排里有个小盾牌，一直都在，你随时能点开。盾牌旁边什么都没有，就是没在截图；多出一只小眼睛，就是截图开着——扫一眼就知道现在是哪种。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
 
             想暂停或者卸载？
             跟家长说一声。家长会在他那边生成一个一次性的数字码，你输进去就能退出。
@@ -2058,7 +2058,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             Only the parent this Mac is linked to. Screenshots pass through the server and are sent straight on — nothing is kept there.
 
             How do you know what it's doing?
-            There's a small shield in the strip along the very top of the screen. It's always there, and you can open it any time. A hollow shield means no screenshots are being taken; a solid, filled-in shield means they are — one glance tells you which. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.
+            There's a small shield in the strip along the very top of the screen. It's always there, and you can open it any time. Nothing next to the shield means no screenshots are being taken; a small eye beside it means they are — one glance tells you which. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.
 
             Want to pause it or take it off?
             Talk to your parent. They can generate a one-time code on their side, and typing it in lets you quit.
