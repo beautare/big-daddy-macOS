@@ -32,7 +32,12 @@ jobs:
         id: version
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          BUILD_NUMBER=$(git rev-list --count HEAD)
+          # 构建号做法与 scripts/package.sh 里同名变量的注释一致（那边写了完整原因，
+          # 包括为什么不能直接拿 VERSION 字符串本身当构建号——会导致存量安装收不到
+          # 任何更新提示）：派生成扁平整数 MAJOR*1000000+MINOR*1000+PATCH，不再用
+          # git rev-list --count HEAD 数提交数。
+          IFS='.' read -r _VER_MAJOR _VER_MINOR _VER_PATCH <<< "${VERSION}"
+          BUILD_NUMBER=$((_VER_MAJOR * 1000000 + _VER_MINOR * 1000 + _VER_PATCH))
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" BigDaddy/Info.plist

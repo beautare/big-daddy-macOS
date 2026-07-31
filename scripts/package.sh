@@ -41,7 +41,25 @@ VERSION="${VERSION:-$(git -C "${ROOT_DIR}" describe --tags --abbrev=0 2>/dev/nul
 if [[ -z "${VERSION}" ]]; then
   VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "${ROOT_DIR}/BigDaddy/Info.plist")
 fi
-BUILD_NUMBER=$(git -C "${ROOT_DIR}" rev-list --count HEAD 2>/dev/null || echo "1")
+# 构建号从版本号派生成一个不含句点的扁平整数：MAJOR*1000000 + MINOR*1000 + PATCH，
+# 不再用 git rev-list --count HEAD 数提交数。
+#
+# 换掉 git 计数的原因：v0.10.4 和 v0.10.5 两个 tag 曾经被打在同一个 commit 上，
+# rev-list --count 对两者算出同一个值（81），appcast 里这两条 item 的 sparkle:version
+# 因此相同——Sparkle 靠这个字段判断"有没有更新"，判成了"没有"，装着 0.10.4 的用户从此
+# 收不到 0.10.5 的提示，没有任何报错，线上 appcast.xml 里这条坏记录留到现在才被发现。
+#
+# 没有直接拿 VERSION 字符串本身（"0.11.0"）当构建号，是因为验证过行不通：Sparkle 的
+# SUStandardVersionComparator 按句点拆成 ["0",".","11",".","0"] 逐段比较，第一段"0"
+# 跟线上现存的纯数字旧构建号（比如"81"）比时，0 < 81，新版本反而被判成"比已装的旧版本
+# 还旧"——所有存量安装在这次切换后会再也收不到任何更新提示，比原来的 bug 更隐蔽也更
+# 严重。扁平整数没有句点，跟"81"一样只有一段，直接按数值比大小：11000 > 81。
+#
+# MINOR/PATCH 留了三位数（0~999）的余量，按这个项目的发版节奏（当前 MINOR=11、单个
+# MINOR 下最多发过 6 个 PATCH）近乎不可能触顶；真触顶了也只是构建号不再精确对应版本号，
+# 不会重新引入"构建号撞车"这个当前在修的 bug。
+IFS='.' read -r _VER_MAJOR _VER_MINOR _VER_PATCH <<< "${VERSION}"
+BUILD_NUMBER=$((_VER_MAJOR * 1000000 + _VER_MINOR * 1000 + _VER_PATCH))
 echo "Building BigDaddy version ${VERSION} (Build ${BUILD_NUMBER}, arch=${ARCH})..."
 
 rm -rf "${BUILD_DIR}" "${DIST_DIR}"
