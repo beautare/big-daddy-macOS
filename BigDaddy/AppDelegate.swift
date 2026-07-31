@@ -43,7 +43,7 @@ final class BindTokenMailbox: @unchecked Sendable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, NSWindowDelegate, SPUStandardUserDriverDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, NSWindowDelegate, SPUUpdaterDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private var screenshotTimer: Timer?
@@ -99,10 +99,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var lastBindingSyncAt: Date = .distantPast
     /// 绑定检测快轮询任务（展示绑定码/二维码后启动的一段高频探测），持有引用以便取消
     private var bindDetectionTask: Task<Void, Never>?
-    /// 后台静默发现并下载完成的更新是否已就绪：SPUStandardUserDriverDelegate 在后台
-    /// 检查命中新版本时置位（见 standardUserDriverWillHandleShowingUpdate），驱动"关于"
-    /// 面板里额外冒出的高亮"立即安装"按钮；本身不弹任何窗口。
-    private var updateReadyToInstall = false
+    /// 后台已静默下载完毕、等着安装的更新版本号（非空即代表"有更新就绪"），用于弹窗
+    /// 和"关于"面板里那个高亮按钮的文案。
+    private var pendingUpdateVersion: String?
+    /// 与之配套的"立即安装并重启"动作：Sparkle 把它以闭包形式交给我们（见
+    /// updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)），什么时候调用
+    /// 就什么时候装好并重启。Sparkle 2.3 起该闭包允许重复调用，用户点过"稍后"之后再从
+    /// "关于"面板点"立即安装"依然有效。
+    private var pendingUpdateInstall: (() -> Void)?
+    /// "稍后再说"之后重新提醒的一次性计时器；也用于把首次提醒从主队列上挪开
+    /// （原因见 presentUpdateReadyPrompt）。
+    private var updateReminderTimer: Timer?
+    /// 两次"新版本已就绪"提醒之间的间隔
+    private static let updateReminderInterval: TimeInterval = 4 * 60 * 60
     /// "关于"窗口（自绘 NSWindow，见 showAboutWindow）当前是否已打开，再次点击菜单项时
     /// 先关掉旧的再重建，避免残留一个数据已过期的旧窗口。
     private weak var aboutWindow: NSWindow?
@@ -152,15 +161,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private enum TimeSessionMilestone: Hashable {
         case started, halfway, fiveMinutes, oneMinute, thirtySeconds
     }
-    // startingUpdater: true 后立即开始按 SUScheduledCheckInterval（Info.plist，当前 1 天）
+    // startingUpdater: true 后立即开始按 SUScheduledCheckInterval（Info.plist，当前 4 小时）
     // 后台检查；SUEnableAutomaticChecks/SUAutomaticallyUpdate 已在 Info.plist 里直接置为
     // true，跳过 Sparkle 首次运行询问用户的对话框，检查与静默下载都无条件自动进行。
-    // userDriverDelegate 指向 self：实现 SPUStandardUserDriverDelegate 的"gentle reminders"
-    // 接口（standardUserDriverShouldHandleShowingScheduledUpdate 等），让后台发现/下载
-    // 更新的过程完全不弹窗，只在 standardUserDriverWillHandleShowingUpdate 里记录"已就绪"
-    // 状态；用户手动点"检查更新…"时不受此限，Sparkle 保证照常展示标准安装流程。
+    //
+    // updaterDelegate 指向 self 是"下载好之后弹窗问用户"的唯一入口。这里曾经挂的是
+    // userDriverDelegate（SPUStandardUserDriverDelegate 的 gentle reminders 那套接口），
+    // 那段代码从未生效过：SUAutomaticallyUpdate=true 时 Sparkle 选的是
+    // SPUAutomaticUpdateDriver，它的 showingUpdate 恒为 NO、从头到尾不调用 user driver，
+    // 于是 standardUserDriverShouldHandleShowingScheduledUpdate /
+    // standardUserDriverWillHandleShowingUpdate 在后台检查里一次都不会被回调，
+    // 更新只会悄悄下载、等 App 下次退出时静默装上，用户全程无感。真正会被回调的是
+    // SPUUpdaterDelegate 的 updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)。
+    //
+    // userDriverDelegate 留 nil：用户手动点"检查更新…"照常走 Sparkle 的标准界面。
     private lazy var updaterController = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: self
+        startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil
     )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -518,10 +534,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         actions.append((Localization.string(zh: "守护说明", en: "Guardian Info"), showTransparencyInfo, false))
         // 注：导出记录（“看看它都记了什么”）不再单独占一个按钮——“守护说明”弹窗里
         // 已有同样的导出入口，避免重复。
-        // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字），
-        // 点击复用 checkForUpdates()——文件已经下载好，Sparkle 会直接跳到"安装并重启"确认。
-        if updateReadyToInstall {
-            actions.append((Localization.string(zh: "发现新版本", en: "Update Ready"), checkForUpdates, true))
+        // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字）。
+        // 点击直接调用 Sparkle 交给我们的安装闭包（installPendingUpdate），不走
+        // checkForUpdates()——文件已经下载好、安装器也已就绪，再发起一次检查是多余的往返。
+        // 用户在弹窗里点过"稍后再说"之后，这里就是他改主意时的入口。
+        if let version = pendingUpdateVersion {
+            actions.append((
+                Localization.string(zh: "安装新版本 \(version) 并重启", en: "Install \(version) & Restart"),
+                installPendingUpdate,
+                true
+            ))
         }
         actions.append((Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates, false))
         actions.append((Localization.string(zh: "关闭", en: "Close"), {}, false))
@@ -2070,39 +2092,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         updaterController.checkForUpdates(nil)
     }
 
-    // MARK: - SPUStandardUserDriverDelegate（后台静默更新的 gentle reminders）
+    // MARK: - SPUUpdaterDelegate（静默下载完成后，由本 App 自己弹框询问）
     //
-    // Sparkle 从任意线程回调这几个方法，协议要求因此是 nonisolated；AppDelegate 整体是
-    // @MainActor，nonisolated 方法不能直接读写 @MainActor 隔离的存储属性，需要状态变更的
-    // 那个方法用 Task { @MainActor in } 跳回主线程再赋值（见 standardUserDriverWillHandleShowingUpdate）。
-    // （这里不用 Swift 较新版本才支持的"隔离一致性"写法 `@MainActor SPUStandardUserDriverDelegate`，
-    // 是因为 CI 的工具链版本还不认识这个语法，会直接编译失败——nonisolated + Task 跳转是
-    // 更通用、旧工具链也能编译的做法。）
+    // Sparkle 的协议不带 actor 隔离，而 AppDelegate 整体是 @MainActor，实现只能声明成
+    // nonisolated；要读写 @MainActor 状态就用 Task { @MainActor in } 跳回主线程。
+    // （不用 `@MainActor SPUUpdaterDelegate` 那种隔离一致性写法，CI 的工具链版本还不认识
+    // 这个语法，会直接编译失败。）
 
-    nonisolated var supportsGentleScheduledUpdateReminders: Bool { true }
-
-    /// 后台/计划内检查发现新版本时，是否交给 Sparkle 标准界面弹窗展示——返回 false，
-    /// 改由下面的 standardUserDriverWillHandleShowingUpdate 自行处理（也就是什么都不弹）。
-    /// 这个开关只对后台触发的检查生效，用户手动点"检查更新…"永远走标准弹窗（Sparkle 保证，
-    /// 见该方法文档：This method is not called for user-initiated update checks）。
-    nonisolated func standardUserDriverShouldHandleShowingScheduledUpdate(
-        _ update: SUAppcastItem, andInImmediateFocus immediateFocus: Bool
+    /// 后台已经静默下载好一个更新、Sparkle 准备把它排进"等 App 退出时再装"时回调。
+    ///
+    /// 返回 true = 安装这一步由我们接管：Sparkle 停掉当前及后续的检查周期，把
+    /// immediateInstallHandler 交给我们，什么时候调它就什么时候装好并重启，全程不出现
+    /// Sparkle 自己的任何界面。这正是"后台自动下载 + 自己弹框问用户"要的语义。
+    ///
+    /// 代价是"停掉后续检查周期"：用户点了"稍后再说"之后不会再有新的回调，重新提醒必须
+    /// 由我们自己排（见 scheduleUpdatePrompt）。但兜底始终存在——文件已经在本机下载好了，
+    /// 这台机器任何一次退出/关机，Sparkle 都会把它装上（见该方法文档：In either case
+    /// Sparkle will always attempt to install the update when the app terminates）。
+    nonisolated func updater(
+        _ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem,
+        immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
     ) -> Bool {
-        false
+        let version = item.displayVersionString
+        Task { @MainActor in
+            self.noteUpdateDownloaded(version: version, install: immediateInstallHandler)
+        }
+        return true
     }
 
-    /// 上面返回 false 后，Sparkle 在这里告知"这次不由它弹窗"：下载完成（.downloaded）
-    /// 或已开始静默安装（.installing）时置位 updateReadyToInstall，下次打开"关于"面板
-    /// 就会多出一个高亮的"发现新版本，点击安装"按钮；点击后复用 checkForUpdates()，
-    /// 因为文件已经下载好，Sparkle 会直接跳到"安装并重启"确认，不会重新下载。
-    nonisolated func standardUserDriverWillHandleShowingUpdate(
-        _ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem, state: SPUUserUpdateState
-    ) {
-        guard !handleShowingUpdate else { return }
-        guard state.stage == .downloaded || state.stage == .installing else { return }
-        Task { @MainActor in
-            self.updateReadyToInstall = true
+    /// Sparkle 已经装好新版本、马上要重启本 App 前的最后一次回调（此刻本进程还活着）。
+    ///
+    /// 必须在这里退休"墓碑"文件。Sparkle 结束本进程用的是 Apple Event quit，不是信号——
+    /// installSignalHandlers 里那条 FORCE_KILL 路径不会被触发，走的是 applicationWillTerminate，
+    /// 而那里是刻意留空的（SHUTDOWN 只在 quitWithPassword 里发），墓碑没人清。于是下次
+    /// 启动时 prepareRuntime() 读到残留的墓碑，把这次**正常的更新重启**当成上次异常终止，
+    /// 心跳带上 previousCrashAt，家长端凭空多出一条"守护进程异常退出"。
+    ///
+    /// 这里只退休墓碑、不补发心跳：更新重启既不是孩子走验证码的正常退出（SHUTDOWN），
+    /// 也不是被强制关闭（FORCE_KILL），套用任何一个都是在向家长谎报。家长端看到的就是
+    /// 十几秒的心跳间隔，随后新版本发来 START——如实反映"它重启了一次"。
+    nonisolated func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        AuditLog.record("UPDATE_INSTALL_RELAUNCH")
+        BigDaddyClient.noteUpdateRestart()
+    }
+
+    /// 新版本已下载完毕：记下待安装状态，并立刻安排一次弹框。
+    private func noteUpdateDownloaded(version: String, install: @escaping () -> Void) {
+        pendingUpdateVersion = version
+        pendingUpdateInstall = install
+        AuditLog.record("UPDATE_DOWNLOADED version=\(version)")
+        scheduleUpdatePrompt(after: 0)
+    }
+
+    /// 安排 delay 秒后弹一次"新版本已就绪"。
+    ///
+    /// 首次提醒也要绕这个计时器（delay 0），不能在 noteUpdateDownloaded 里直接 runModal：
+    /// 那条调用链源头是 Task { @MainActor }，也就是一个**正在执行中的主队列 block**，从
+    /// 里面 runModal 会让主队列在整个弹窗期间无法继续排空（同 BindTokenMailbox 那段注释
+    /// 记录的现象）。这个 App 是常驻守护进程，心跳/命令轮询/配置轮询的计时器回调最终全都
+    /// 要经由 Task { @MainActor } 落到主队列上——弹窗若无人理会挂上几小时，家长端就会看到
+    /// 设备离线。而计时器回调是运行循环直接驱动的、不占着主队列的坑，用 target/selector
+    /// 形式（不再套一层 Task）就能在主线程直接进入 runModal，弹窗期间主队列照常排空，
+    /// 守护进程一切如常。
+    private func scheduleUpdatePrompt(after delay: TimeInterval) {
+        updateReminderTimer?.invalidate()
+        let timer = Timer(
+            timeInterval: delay, target: self,
+            selector: #selector(updatePromptTimerFired), userInfo: nil, repeats: false
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        updateReminderTimer = timer
+    }
+
+    @objc private func updatePromptTimerFired() {
+        updateReminderTimer = nil
+        presentUpdateReadyPrompt()
+    }
+
+    /// 「发现新版本 x.y.z，是否立即安装并重启？」
+    ///
+    /// NSApp.activate 是必须的：本 App 是 LSUIElement 后台应用（.accessory 激活策略），
+    /// 不抢一次焦点的话这个窗口会开在当前所有窗口后面，孩子根本看不到。
+    private func presentUpdateReadyPrompt() {
+        guard let version = pendingUpdateVersion else { return }
+        // 已经有别的模态窗口开着（绑定码、退出验证码、凭据失效…）时不叠第二层：嵌套的
+        // modal session 会把先开的那个锁死到我们这个关掉为止，孩子看到的是"点谁都没反应"。
+        // 计时器挂在 .common 模式上，另一个 runModal 期间照样会触发（这正是它能在主队列被
+        // 弹窗占住时仍然工作的原因），所以这个撞车是必然会遇到的，不是理论情况。
+        // 往后挪一分钟再试——那些对话框都是用户当面几十秒内就会处理掉的。
+        guard NSApp.modalWindow == nil else {
+            scheduleUpdatePrompt(after: 60)
+            return
         }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = Localization.string(
+            zh: "BigDaddy 有新版本 \(version)",
+            en: "BigDaddy \(version) is available"
+        )
+        alert.informativeText = Localization.string(
+            zh: "新版本已经下载好了，安装只需要几秒钟，装完 BigDaddy 会自动重新启动。\n\n现在不方便的话可以稍后再说，\(Int(Self.updateReminderInterval / 3600)) 小时后会再问一次；这台电脑下次关机或退出 BigDaddy 时也会自动装上。",
+            en: "The update is already downloaded. Installing takes a few seconds, and BigDaddy will restart itself afterwards.\n\nYou can postpone it — you'll be asked again in \(Int(Self.updateReminderInterval / 3600)) hours, and it will install automatically the next time this Mac shuts down or BigDaddy quits."
+        )
+        alert.addButton(withTitle: Localization.string(zh: "立即安装并重启", en: "Install & Restart"))
+        alert.addButton(withTitle: Localization.string(zh: "稍后再说", en: "Later"))
+
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            installPendingUpdate()
+        } else {
+            AuditLog.record("UPDATE_POSTPONED version=\(version)")
+            scheduleUpdatePrompt(after: Self.updateReminderInterval)
+        }
+    }
+
+    /// 装上已下载好的更新并重启本 App。弹窗的"立即安装并重启"和"关于"面板里那个
+    /// 高亮按钮共用这一条路径。
+    private func installPendingUpdate() {
+        guard let install = pendingUpdateInstall else { return }
+        updateReminderTimer?.invalidate()
+        updateReminderTimer = nil
+        install()
     }
 
     /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停。

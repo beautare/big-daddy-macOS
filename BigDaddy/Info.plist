@@ -35,11 +35,18 @@
   <string>https://beautare.github.io/big-daddy-macOS/appcast.xml</string>
   <key>SUPublicEDKey</key>
   <string>+LI1alzpb3qC3FratMxA0qd+C4cDw4ElhV0NPh1U/+4=</string>
+  <!-- 4 小时检查一次。Sparkle 对这个值有 1 小时的硬性下限
+       （SPUUpdaterSettings.minimumUpdateCheckInterval），写得比 3600 小也会被抬回去。 -->
   <key>SUScheduledCheckInterval</key>
-  <integer>86400</integer>
-  <!-- 显式声明这两项，跳过 Sparkle 首次运行时"是否自动检查更新"的系统询问对话框，
-       后台按 SUScheduledCheckInterval 无条件检查并静默下载；是否弹窗展示由
-       AppDelegate 里的 SPUStandardUserDriverDelegate（gentle reminders）接管。 -->
+  <integer>14400</integer>
+  <!-- 显式声明这两项，跳过 Sparkle 首次运行时"是否自动检查更新"的系统询问对话框：
+       后台按 SUScheduledCheckInterval 无条件检查并静默下载。
+
+       SUAutomaticallyUpdate=true 决定了 Sparkle 走 SPUAutomaticUpdateDriver 而不是
+       SPUScheduledUpdateDriver——前者的 showingUpdate 恒为 NO、全程不碰 user driver，
+       下载完就把安装权交给安装器进程"等 App 退出时再装"，默认对用户零提示。
+       "问用户要不要现在装并重启"这一步因此不能挂在 user driver 上，由 AppDelegate 的
+       SPUUpdaterDelegate 接管，见 updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)。 -->
   <key>SUEnableAutomaticChecks</key>
   <true/>
   <key>SUAutomaticallyUpdate</key>

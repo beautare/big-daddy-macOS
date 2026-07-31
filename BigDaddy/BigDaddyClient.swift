@@ -1777,6 +1777,16 @@ final class BigDaddyClient {
         runtimeLockRetired = true
         try? FileManager.default.removeItem(at: lockFileURL)
     }
+
+    /// Sparkle 装好新版本、即将结束本进程并重启本 App（见 AppDelegate 的
+    /// updaterWillRelaunchApplication）。这次终止是我们自己促成的正常重启，退休墓碑，
+    /// 免得下次启动被 prepareRuntime() 当成"上次异常终止"补报给家长。
+    ///
+    /// 只清墓碑、不发心跳：更新重启既不是走验证码的正常退出（SHUTDOWN），也不是被强制
+    /// 关闭（FORCE_KILL），套用哪一个都是谎报。
+    static func noteUpdateRestart() {
+        retireRuntimeLock()
+    }
 }
 
 /// 本机守护记录（知情透明）：把每一次实际发生的采集/上报动作追加到本地明文日志，

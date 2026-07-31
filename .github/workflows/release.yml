@@ -62,6 +62,14 @@ jobs:
 
       - name: Build, sign, notarize, package DMG (${{ matrix.arch }})
         env:
+          # 必须显式传 VERSION。不传的话 package.sh 会退回到
+          # `git describe --tags --abbrev=0`，而那条命令在"同一个 commit 上打了多个 tag"
+          # 时返回的不一定是本次触发的那个：v0.10.4 和 v0.10.5 都指向 f780d03，于是
+          # v0.10.5 那次发布产出的文件叫 BigDaddy-v0.10.4.dmg，包里的
+          # CFBundleShortVersionString 也被写成了 0.10.4——appcast 里至今留着这条
+          # `v0.10.5/BigDaddy-v0.10.4.dmg` 的记录。上面那步已经从 GITHUB_REF_NAME
+          # 精确解出了版本号，直接用它。
+          VERSION: ${{ steps.version.outputs.version }}
           ARCH: ${{ matrix.arch }}
           CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
           APPLE_API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
