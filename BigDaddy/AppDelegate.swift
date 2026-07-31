@@ -142,6 +142,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 菜单里"⏳ 剩余 …"这一条的引用，供 menuWillOpen 每次打开菜单时刷新文字，
     /// 不必为了刷新一个数字就整个 rebuildMenu()。
     private var timeSessionMenuItem: NSMenuItem?
+    /// 菜单当前是否展开着（menuWillOpen ⇄ menuDidClose）。
+    private var menuIsOpen = false
+    /// 菜单展开期间收到的重建请求，等菜单关掉再补做一次（原因见 rebuildMenu 的注释）。
+    private var menuRebuildPending = false
+    /// 菜单展开期间每秒刷新剩余时间的定时器，关菜单即停。
+    private var openMenuTickTimer: Timer?
 
     private enum TimeSessionMilestone: Hashable {
         case started, halfway, fiveMinutes, oneMinute, thirtySeconds
@@ -275,7 +281,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // installSignalHandlers 里的 FORCE_KILL 上报负责如实反映。
     }
 
+    /// 重建整张菜单。
+    ///
+    /// **菜单展开期间一律不重建**，改为记一笔待办、等 menuDidClose 再补做。
+    ///
+    /// 这不是性能顾虑，而是"菜单里的剩余时间时走时不走"那个 bug 的正身：本方法每次都
+    /// `NSMenu()` 造一张全新的菜单并赋回 statusItem，而屏幕上正显示着的是**旧**那张——
+    /// AppKit 在 tracking 期间会把它一直留在屏幕上。赋值之后 timeSessionMenuItem 指向了
+    /// 新菜单里那条离屏的项，于是每秒 tick 忠实地刷新着一条谁也看不见的文字，孩子/家长
+    /// 眼前那条就此冻结。而重建的触发点（menuWillOpen 里那次配置同步、浏览器授权状态
+    /// 变化等）本身是零星发生的，于是表现成"有时候不倒数，关掉重开又好了，过一会又不走"。
     private func rebuildMenu() {
+        guard !menuIsOpen else {
+            menuRebuildPending = true
+            // 菜单内容整体延后，但那条剩余时间是纯本地计算、就地改 title 即可，
+            // 不必让家长盯着一个停住的数字等到菜单关闭。
+            refreshTimeSessionMenuItemText()
+            return
+        }
+        menuRebuildPending = false
         let menu = NSMenu()
         menu.delegate = self
 
@@ -411,10 +435,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 5 秒，避免频繁点开时的网络风暴；不加"正在检查"占位项，本地同步在一秒内
     /// 完成，状态变化后就地重建菜单即可。
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
         syncBindingStateIfStale()
         // 不必等 syncBindingStateIfStale 的 5 秒网络节流：剩余时间是纯本地计算，
         // 每次打开菜单都能免费刷新成当下最新的数字。
         refreshTimeSessionMenuItemText()
+        startOpenMenuTicking()
+    }
+
+    /// 菜单收起：停掉展开期间的每秒刷新，并把期间被推迟的重建补上。
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+        openMenuTickTimer?.invalidate()
+        openMenuTickTimer = nil
+        if menuRebuildPending {
+            rebuildMenu()
+        }
+    }
+
+    /// 菜单展开期间，每秒把剩余时间刷成当下的数字。
+    ///
+    /// 不复用 timeSessionTimer 是因为职责不同：那颗计时器只在"有进行中的约定"时存活，
+    /// 而且它同时还在跑里程碑判定；这里要的仅仅是"菜单开着的这几秒内数字别停"。单独
+    /// 一颗生命周期严格等于菜单展开期的计时器，比给那颗塞进一个额外职责更容易讲清楚。
+    /// 显式登记 .eventTracking：菜单 tracking 期间运行循环跑在该模式下，只挂 .default
+    /// 的计时器在菜单展开的整段时间里一次都不会触发。
+    private func startOpenMenuTicking() {
+        openMenuTickTimer?.invalidate()
+        guard timeSessionMenuItem != nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refreshTimeSessionMenuItemText() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        openMenuTickTimer = timer
     }
 
     /// "关于"窗口：把版本、当前配置摘要、心跳、截图倒计时等只读信息，以及守护说明/
@@ -1064,15 +1118,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let warmedKey = Self.warmedAutomationTargetsKey
         let warmed = Set(UserDefaults.standard.stringArray(forKey: warmedKey) ?? [])
         let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
-        let targets = BigDaddyClient.installedSupportedBrowsers()
+        let urlTargets = BigDaddyClient.installedSupportedBrowsers()
             .filter { running.contains($0) && !warmed.contains($0) }
-        guard !targets.isEmpty else { return }
+        // Firefox 系也要问一次授权：它给不出网址，但**窗口标题**恰恰要靠同一套自动化
+        // 权限才读得到（见 BigDaddyClient.installedTitleOnlyBrowsers）。不在家长在场时
+        // 问掉，孩子第一次打开 Firefox 时家长端就会先收到一条既没标题也没链接的空记录。
+        let titleTargets = BigDaddyClient.installedTitleOnlyBrowsers()
+            .filter { running.contains($0) && !warmed.contains($0) }
+        guard !urlTargets.isEmpty || !titleTargets.isEmpty else { return }
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             // 每次调用都会同步阻塞到用户在系统授权框上点选为止——这正是我们要的效果，
             // 但因此绝不能放在主线程上，否则菜单栏图标在用户做决定之前整个僵住。
             var stillBlocked: [String] = []
-            for bundleID in targets {
+            for bundleID in urlTargets {
                 guard let probe = self?.client.probeAutomation(bundleID: bundleID) else { return }
                 switch probe.permission {
                 case .granted, .targetNotRunning:
@@ -1081,9 +1140,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     stillBlocked.append(bundleID)
                 }
             }
+            // 标题型浏览器只负责把授权框问出来，**不参与** stillBlocked 的判定：
+            // automationDeniedBundleIDs 驱动的是「浏览器网址未授权」那条待办，而
+            // Firefox 无论授权与否都给不出网址，混进去就是给家长派一件做不完的活。
+            for bundleID in titleTargets {
+                self?.client.warmTitleAutomation(bundleID: bundleID)
+            }
             // 记账放在探测之后：中途进程被杀的话，这些浏览器下次启动还会再预热一次，
             // 比"记了账却没真发出去、从此再也不预热"要好。
-            UserDefaults.standard.set(Array(warmed.union(targets)), forKey: warmedKey)
+            UserDefaults.standard.set(Array(warmed.union(urlTargets).union(titleTargets)), forKey: warmedKey)
             // 跨线程边界前定格成不可变副本：直接捕获上面那个 var，编译器无法证明
             // "派发之后不会再被改"，Swift 6 下会直接判成错误（旧版编译器只给警告）。
             let blocked = stillBlocked
@@ -1480,7 +1545,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // （那会把一次自然到点误报成家长中断，本机守护记录里就多出一条假事件）。
             locallyExpiredSessionId = nil
         } else {
-            timeFlag?.stopFlashingAndDismiss()
+            timeFlag?.dismiss()
             locallyExpiredSessionId = nil
             if previousSessionId != nil {
                 // 只记"服务端已不再报告这个约定"这个客户端真正观测到的事实，不写原因。
@@ -1513,10 +1578,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         timeSessionTimer?.invalidate()
         timeSessionTimer = nil
         timeSessionDeadline = nil
-        locallyExpiredSessionId = trackedTimeSessionId
+        let expiredSessionId = trackedTimeSessionId
+        locallyExpiredSessionId = expiredSessionId
         AuditLog.record("TIME_SESSION_EXPIRED")
-        timeFlag?.startFlashing(duration: 5 * 60)
+        // 到点提醒。此前这里只是让已经在屏幕上的旗帜开始闪烁，读数停留在最后一次 tick
+        // 算出的 "0:01"（`.rounded(.up)` 让任何不足一秒的余量都进位成 1）——孩子看到的
+        // 是一个"还剩一秒"却再也不动的读数。presentTimeUp 显式写 0:00，并且在面板已被
+        // 自动收回时重新弹出来。
+        if let statusItem, let session = client.config.timeSession {
+            let flag = timeFlag ?? TimeAgreementFlag()
+            timeFlag = flag
+            bindAcknowledgeHandler(to: flag, sessionId: expiredSessionId)
+            flag.presentTimeUp(anchor: statusItem, note: session.note, duration: 5 * 60)
+        }
         rebuildMenu()
+    }
+
+    /// 把「我知道了」接到"收回提醒 + 上报回执"上。
+    ///
+    /// 这一下是整条时间约定链路里**唯一**由孩子本人发出的信号：旗帜可能弹在一台没人的
+    /// 电脑前（firstShownAt 只证明它显示过），而按钮被按下必定意味着孩子此刻就在。所以
+    /// 它值得单独走一趟回执、在家长端留一条 TIMER_ACKNOWLEDGED——不是为了监视这一下点击，
+    /// 而是让家长知道"提醒确实到人了"，不必再去猜孩子是没看见还是装作没看见。
+    private func bindAcknowledgeHandler(to flag: TimeAgreementFlag, sessionId: String?) {
+        flag.onAcknowledge = { [weak self] in
+            AuditLog.record("TIME_SESSION_ACKNOWLEDGED 孩子点了「我知道了」")
+            guard let self, let sessionId else { return }
+            Task { await self.client.reportTimeSessionAcknowledged(sessionId) }
+        }
     }
 
     /// 驱动倒计时/里程碑检查的 1 秒计时器。用 .common 模式的手动 Timer（原因见
@@ -1572,15 +1661,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let remaining = remainingOverride ?? session.remainingSeconds
         let flag = timeFlag ?? TimeAgreementFlag()
         timeFlag = flag
+        bindAcknowledgeHandler(to: flag, sessionId: session.sessionId)
         flag.present(anchor: statusItem, remainingSeconds: remaining, note: session.note, autoDismissAfter: autoDismissAfter)
         let sessionId = session.sessionId
         Task { await client.reportTimeSessionShown(sessionId) }
     }
 
     private func refreshTimeSessionMenuItemText() {
-        guard let item = timeSessionMenuItem, let session = client.config.timeSession,
-              let deadline = timeSessionDeadline else { return }
-        let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+        guard let item = timeSessionMenuItem, let session = client.config.timeSession else { return }
+        // deadline 为 nil = 本地已判过到点（handleTimeSessionReachedZero 清掉了它）。
+        // 这条菜单项本该随之消失，但如果菜单此刻正开着，重建被推迟到关闭之后——
+        // 那段时间里显示 0:00 才诚实，继续挂着最后那个非零读数会和已经弹出的到点
+        // 提醒自相矛盾。
+        let remaining = timeSessionDeadline
+            .map { max(0, Int(($0 - ProcessInfo.processInfo.systemUptime).rounded(.up))) } ?? 0
         item.title = Self.timeSessionMenuTitle(remaining: remaining, grantedSeconds: session.grantedSeconds)
     }
 

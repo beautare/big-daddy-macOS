@@ -9,22 +9,37 @@ import QuartzCore
 /// `collectionBehavior` 里的 `.fullScreenAuxiliary` 让它在孩子当前开着某个全屏 App 时也能
 /// 浮现出来，而不是被全屏空间挡住。
 ///
-/// 只做视觉提醒，不接受点击/拖拽：`ignoresMouseEvents = true`。孩子确认剩余时间的入口是
-/// 菜单栏图标本身（点开菜单能看到一条剩余时间项，见 AppDelegate.rebuildMenu），不是这面
-/// 旗帜——旗帜多做一层"点掉提前收起"的交互目前没有被明确要求，先不做，减少这一版的
-/// 状态机复杂度。
+/// 两种形态：
+/// - **倒计时中**：纯展示，`ignoresMouseEvents = true`，点不到也拖不动。孩子确认剩余
+///   时间的入口是菜单栏图标本身（点开菜单能看到一条剩余时间项，见 AppDelegate.rebuildMenu）。
+/// - **时间到**：换成琥珀色告警配色，并长出一颗「我知道了」按钮，此时才打开鼠标事件。
+///   到点提醒会一直挂在屏幕上（最长 5 分钟），如果不给一个关掉它的出口，孩子就只能
+///   眼睁睁看着它挡在那儿——那不是提醒，是惩罚。
 @MainActor
 final class TimeAgreementFlag {
     private var panel: NSPanel?
+    private var contentColumn: NSStackView?
+    private var captionLabel: NSTextField?
     private var remainingLabel: NSTextField?
     private var noteLabel: NSTextField?
+    private var iconView: NSImageView?
+    /// 到点时呼吸的那条琥珀色横杠。只让它一个人动，文字始终保持全不透明。
+    private var accentBar: NSView?
+    private var acknowledgeButton: NSButton?
 
     private var dismissTimer: Timer?
-    private var flashTimer: Timer?
+    /// 当前是否处于"时间到"形态，决定配色、按钮可见性与鼠标事件开关
+    private var isExpiredState = false
 
-    private static let panelSize = NSSize(width: 260, height: 68)
+    /// 孩子点了「我知道了」。由 AppDelegate 注入：收起面板 + 上报回执。
+    var onAcknowledge: (() -> Void)?
+
+    private static let panelWidth: CGFloat = 268
+    private static let horizontalPadding: CGFloat = 16
+    private static let verticalPadding: CGFloat = 14
     private static let cornerRadius: CGFloat = 14
     private static let gapBelowStatusItem: CGFloat = 6
+    private static let accentColor = NSColor.systemOrange
 
     // MARK: - 公开接口
 
@@ -36,28 +51,34 @@ final class TimeAgreementFlag {
         noteLabel?.isHidden = trimmedNote.isEmpty
     }
 
-    /// 下拉展示。`autoDismissAfter` 为 nil 表示常驻不收回（剩余 30 秒内的 sticky 态）。
+    /// 下拉展示（倒计时形态）。`autoDismissAfter` 为 nil 表示常驻不收回（剩余 30 秒内的 sticky 态）。
     /// 若面板已经可见（同一次里程碑内被连续调用，或 sticky 态每秒被刷新文案），只更新
     /// 文案与自动收回定时器，不重复播放滑入动画。
     func present(anchor: NSStatusItem, remainingSeconds: Int, note: String?, autoDismissAfter: TimeInterval?) {
-        stopFlashing()
-        let panel = ensurePanel()
-        update(remainingSeconds: remainingSeconds, note: note)
-
-        let targetFrame = computeFrame(anchor: anchor)
-        if panel.isVisible {
-            panel.setFrame(targetFrame, display: true)
-        } else {
-            presentWithSlideAnimation(panel: panel, targetFrame: targetFrame)
-        }
+        applyExpiredState(false)
+        showPanel(anchor: anchor, remainingSeconds: remainingSeconds, note: note)
         scheduleAutoDismiss(after: autoDismissAfter)
+    }
+
+    /// 倒计时归零：切到"时间到"形态并开始呼吸提醒，持续 `duration` 后自动收回。
+    ///
+    /// 与旧的 `startFlashing` 有两点关键差异：
+    /// 1. 面板不可见时会**自己弹出来**（孩子可能刚把上一次里程碑的旗帜等到自动收回），
+    ///    到点这一刻正是最不能沉默的时候；
+    /// 2. 读数显式写成 0:00。此前这一步只切换动画、不刷新文案，而最后一次 tick 拿到的
+    ///    剩余量经 `.rounded(.up)` 恒为 1，于是归零瞬间屏幕上冻结的是 "0:01"。
+    func presentTimeUp(anchor: NSStatusItem, note: String?, duration: TimeInterval) {
+        applyExpiredState(true)
+        showPanel(anchor: anchor, remainingSeconds: 0, note: note)
+        startAccentPulse()
+        scheduleAutoDismiss(after: duration)
     }
 
     /// 收回（滑出屏幕上方后隐藏）。对未展示的面板调用是安全的空操作。
     func dismiss() {
         dismissTimer?.invalidate()
         dismissTimer = nil
-        stopFlashing()
+        stopAccentPulse()
         guard let panel, panel.isVisible else { return }
 
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -82,67 +103,86 @@ final class TimeAgreementFlag {
         }
     }
 
-    /// 归零后开始闪烁提醒；持续 `duration` 后自动停止闪烁并收回。
-    ///
-    /// `NSWorkspace.accessibilityDisplayShouldReduceMotion` 为真时不做连续闪烁（对光敏性
-    /// 癫痫有实际风险，且使用者是孩子），改成两次温和的透明度呼吸。
-    func startFlashing(duration: TimeInterval) {
-        guard let panel, panel.isVisible else { return }
-        dismissTimer?.invalidate()
-        flashTimer?.invalidate()
+    // MARK: - 展示与形态切换
 
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            performGentleBreathing(times: 2)
+    private func showPanel(anchor: NSStatusItem, remainingSeconds: Int, note: String?) {
+        let panel = ensurePanel()
+        update(remainingSeconds: remainingSeconds, note: note)
+
+        // 内容高度随"有没有留言""是不是到点形态"变化，每次展示都按当前内容重新量一次，
+        // 而不是写死一个能装下所有情况的高度——那样没有留言时下方会空出一大块。
+        let targetFrame = computeFrame(anchor: anchor, size: currentContentSize())
+        if panel.isVisible {
+            panel.setFrame(targetFrame, display: true)
         } else {
-            var showingFull = true
-            let timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self, let panel = self.panel else { return }
-                    showingFull.toggle()
-                    NSAnimationContext.runAnimationGroup { ctx in
-                        ctx.duration = 0.25
-                        panel.animator().alphaValue = showingFull ? 1.0 : 0.55
-                    }
-                }
-            }
-            RunLoop.main.add(timer, forMode: .common)
-            flashTimer = timer
+            presentWithSlideAnimation(panel: panel, targetFrame: targetFrame)
         }
-
-        let timeout = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.stopFlashingAndDismiss() }
-        }
-        RunLoop.main.add(timeout, forMode: .common)
-        dismissTimer = timeout
     }
 
-    func stopFlashingAndDismiss() {
-        stopFlashing()
+    /// 按当前内容量出面板该有多高。宽度恒定，只有高度随"有没有留言""要不要显示按钮"变。
+    ///
+    /// 量的是竖排本身而不是容器：容器是窗口的 contentView，它的尺寸反过来由窗口 frame
+    /// 决定（autoresizing），拿它测高会绕成一个循环。
+    private func currentContentSize() -> NSSize {
+        guard let column = contentColumn else { return NSSize(width: Self.panelWidth, height: 88) }
+        column.layoutSubtreeIfNeeded()
+        return NSSize(width: Self.panelWidth, height: column.fittingSize.height + Self.verticalPadding * 2)
+    }
+
+    /// 倒计时形态 ⇄ 时间到形态。两者只差配色、图标、标题与那颗按钮，共用同一套控件。
+    private func applyExpiredState(_ expired: Bool) {
+        _ = ensurePanel()
+        isExpiredState = expired
+
+        iconView?.image = NSImage(
+            systemSymbolName: expired ? "bell.badge.fill" : "hourglass",
+            accessibilityDescription: nil
+        )
+        iconView?.contentTintColor = expired ? Self.accentColor : .labelColor
+        captionLabel?.stringValue = expired
+            ? Localization.string(zh: "约定时间到了", en: "Time's up")
+            : Localization.string(zh: "时间约定剩余", en: "Time left")
+        captionLabel?.textColor = expired ? Self.accentColor : .secondaryLabelColor
+        remainingLabel?.textColor = expired ? Self.accentColor : .labelColor
+        accentBar?.isHidden = !expired
+        acknowledgeButton?.isHidden = !expired
+        // 倒计时形态下面板必须对鼠标透明，否则它会挡住下面窗口的点击；只有长出按钮的
+        // 到点形态才需要接收事件。
+        panel?.ignoresMouseEvents = !expired
+        if !expired { stopAccentPulse() }
+    }
+
+    @objc private func acknowledgeTapped() {
         dismiss()
+        onAcknowledge?()
     }
 
-    private func stopFlashing() {
-        flashTimer?.invalidate()
-        flashTimer = nil
-        panel?.alphaValue = 1
+    // MARK: - 到点提醒的呼吸动效
+
+    /// 只让那条琥珀色横杠呼吸，文字与读数始终全不透明。
+    ///
+    /// 旧实现是每 0.5 秒把**整个面板**的 alpha 在 1.0/0.55 之间来回切：读数在半透明帧里
+    /// 直接糊进背景，孩子想看清"到底几点了"反而要等它闪回来；而"整块界面忽明忽暗"在
+    /// 观感上更像故障而不是提醒。改用 Core Animation 的 autoreverse 循环还有一个附带
+    /// 好处——不再需要一个每秒醒两次的 Timer，也不会因为忘记 invalidate 而漏动画。
+    ///
+    /// `accessibilityDisplayShouldReduceMotion` 为真时完全不动：使用者是孩子，闪烁对
+    /// 光敏性癫痫有实际风险，而此时配色和图标的变化已经足够说明"到点了"。
+    private func startAccentPulse() {
+        guard let bar = accentBar, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        bar.wantsLayer = true
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.2
+        pulse.duration = 0.75
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        bar.layer?.add(pulse, forKey: "bigdaddy.timeup.pulse")
     }
 
-    private func performGentleBreathing(times: Int, dimmed: Bool = true, completion: (() -> Void)? = nil) {
-        guard let panel, times > 0 else {
-            completion?()
-            return
-        }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.4
-            panel.animator().alphaValue = dimmed ? 0.6 : 1.0
-        }, completionHandler: { [weak self] in
-            // completionHandler 是普通闭包，编译器无法从类型上证明它跑在主线程/主 actor
-            // 上（即便 AppKit 动画完成回调实际上总在主线程触发）；包一层 Task { @MainActor }
-            // 是本文件之外（AppDelegate 的 NSWorkspace 通知回调）已经在用的标准写法。
-            Task { @MainActor [weak self] in
-                self?.performGentleBreathing(times: dimmed ? times : times - 1, dimmed: !dimmed, completion: completion)
-            }
-        })
+    private func stopAccentPulse() {
+        accentBar?.layer?.removeAnimation(forKey: "bigdaddy.timeup.pulse")
     }
 
     private func scheduleAutoDismiss(after interval: TimeInterval?) {
@@ -165,7 +205,7 @@ final class TimeAgreementFlag {
     ///
     /// 只画一个刚好够容纳四个圆角的小图（2r+1 边长），靠 `capInsets` + `.stretch` 把
     /// 中间那 1×1 像素拉伸到实际面板尺寸——四角保持原样不被拉变形。这样遮罩与
-    /// panelSize 解耦，改面板尺寸不需要重画遮罩。
+    /// 面板尺寸解耦，内容高度每次展示都在变也不需要重画遮罩。
     ///
     /// `NSImage(size:flipped:drawingHandler:)` 的绘制块在每次需要该图时按当时尺寸重新
     /// 执行，因此这里画的是"当前请求的 rect"而不是写死的常量。
@@ -187,7 +227,7 @@ final class TimeAgreementFlag {
         if let panel { return panel }
 
         let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: Self.panelSize),
+            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth, height: 88),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -209,8 +249,14 @@ final class TimeAgreementFlag {
         return panel
     }
 
+    /// 内容整体**水平居中**。
+    ///
+    /// 此前是"图标 + 左对齐文字"一横排、整排靠左顶着 16pt 内边距：读数只有 "3:24" 四个
+    /// 字符宽，右侧就空出一大片，看上去像排版塌了一半。现在改成竖排居中——标题、读数、
+    /// 留言三行共享同一条中轴线，无论读数是 "12:00" 还是 "0:05"、有没有留言，视觉重心
+    /// 都落在面板正中。
     private func buildContentView() -> NSView {
-        let container = NSVisualEffectView(frame: NSRect(origin: .zero, size: Self.panelSize))
+        let container = NSVisualEffectView()
         container.material = .hudWindow
         container.state = .active
         container.blendingMode = .behindWindow
@@ -221,49 +267,99 @@ final class TimeAgreementFlag {
         // hasShadow 阴影轮廓又是按不透明区域计算的，于是尖角会在阴影上再现一次——
         // 表现就是"设了圆角但四个角仍能看到矩形尖角"。maskImage 是 AppKit 为这个视图
         // 专门提供的裁剪入口，材质与阴影都会遵循它。
+        // 容器是窗口的 contentView，尺寸由窗口 frame 经 autoresizing 决定，因此这里
+        // **不能**关掉 translatesAutoresizingMaskIntoConstraints——那会让它自己也去参与
+        // 约束求解，和 AppKit 给 contentView 加的那套约束打架。子视图照常用约束布局。
         container.maskImage = Self.roundedMaskImage(cornerRadius: Self.cornerRadius)
+        container.autoresizingMask = [.width, .height]
+
+        // 到点时呼吸的琥珀色横杠，贴在面板顶边——位置固定、不参与竖排堆叠，
+        // 因此它的显隐不会让下面三行文字跳动。
+        let bar = NSView()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = Self.accentColor.cgColor
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.isHidden = true
+        container.addSubview(bar)
+        self.accentBar = bar
 
         let icon = NSImageView()
         icon.image = NSImage(systemSymbolName: "hourglass", accessibilityDescription: nil)
         icon.contentTintColor = .labelColor
         icon.translatesAutoresizingMaskIntoConstraints = false
+        self.iconView = icon
+
+        let caption = NSTextField(labelWithString: Localization.string(zh: "时间约定剩余", en: "Time left"))
+        caption.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        caption.textColor = .secondaryLabelColor
+        caption.alignment = .center
+        self.captionLabel = caption
+
+        // 图标和标题同一行：图标单独占一行会把面板拉高一截，而它承载的信息量还不如
+        // 标题那几个字——并排放既省高度，又让"沙漏/铃铛"这个状态提示紧贴文字含义。
+        let header = NSStackView(views: [icon, caption])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 6
 
         let remaining = NSTextField(labelWithString: "0:00")
-        remaining.font = NSFont.monospacedDigitSystemFont(ofSize: 22, weight: .bold)
+        // 等宽数字：不用它的话，秒数从 "1:19" 走到 "1:20" 时整行宽度会变，居中布局下
+        // 读数会左右微微跳动，盯着看一分钟就很难受。
+        remaining.font = NSFont.monospacedDigitSystemFont(ofSize: 30, weight: .bold)
         remaining.textColor = .labelColor
-        remaining.alignment = .left
-        remaining.translatesAutoresizingMaskIntoConstraints = false
+        remaining.alignment = .center
         self.remainingLabel = remaining
 
         let note = NSTextField(labelWithString: "")
         note.font = NSFont.systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
+        note.alignment = .center
         note.lineBreakMode = .byTruncatingTail
-        note.translatesAutoresizingMaskIntoConstraints = false
         note.isHidden = true
+        // 留言最长 200 字，按固有宽度能撑到面板的好几倍。压低横向抗压缩优先级，
+        // 让下面那条固定宽度的约束赢，多出来的部分老实截断成省略号。
+        note.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         self.noteLabel = note
 
-        let textStack = NSStackView(views: [remaining, note])
-        textStack.orientation = .vertical
-        textStack.alignment = .leading
-        textStack.spacing = 2
-        textStack.translatesAutoresizingMaskIntoConstraints = false
+        let ack = NSButton(
+            title: Localization.string(zh: "我知道了", en: "Got it"),
+            target: self,
+            action: #selector(acknowledgeTapped)
+        )
+        ack.bezelStyle = .rounded
+        ack.controlSize = .regular
+        ack.keyEquivalent = "\r"
+        ack.isHidden = true
+        self.acknowledgeButton = ack
 
-        let row = NSStackView(views: [icon, textStack])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 12
-        row.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(row)
+        let column = NSStackView(views: [header, remaining, note, ack])
+        column.orientation = .vertical
+        column.alignment = .centerX
+        column.spacing = 4
+        // 隐藏的行不该继续占位：没有留言时那 11pt 的空行会让面板显得头重脚轻。
+        column.setVisibilityPriority(.notVisible, for: note)
+        column.setVisibilityPriority(.notVisible, for: ack)
+        column.setCustomSpacing(8, after: remaining)
+        column.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(column)
 
         NSLayoutConstraint.activate([
-            icon.widthAnchor.constraint(equalToConstant: 28),
-            icon.heightAnchor.constraint(equalToConstant: 28),
-            row.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
-            row.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -16),
-            row.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15),
+
+            bar.topAnchor.constraint(equalTo: container.topAnchor),
+            bar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 3),
+
+            // 竖排宽度写死成"面板宽 - 两侧内边距"，而不是让内容自己撑：读数、标题、
+            // 留言三者宽度差得很远，跟着内容走的话面板会随秒数增减左右呼吸。
+            column.widthAnchor.constraint(equalToConstant: Self.panelWidth - Self.horizontalPadding * 2),
+            column.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            column.topAnchor.constraint(equalTo: container.topAnchor, constant: Self.verticalPadding)
         ])
 
+        self.contentColumn = column
         return container
     }
 
@@ -296,8 +392,7 @@ final class TimeAgreementFlag {
 
     /// 计算面板应处的屏幕坐标。三个兜底场景（对应 anchorScreenAndButtonFrame 的注释）
     /// 统一退化成"目标屏幕顶部居中"，不单独分支处理，让这里始终只有一条定位路径。
-    private func computeFrame(anchor: NSStatusItem) -> NSRect {
-        let size = Self.panelSize
+    private func computeFrame(anchor: NSStatusItem, size: NSSize) -> NSRect {
         let (screen, buttonFrameOnScreen) = Self.anchorScreenAndButtonFrame(anchor: anchor)
         guard let screen else {
             // 连一块屏幕都取不到，理论上不会发生（运行中的 macOS 系统至少有一块主屏）；

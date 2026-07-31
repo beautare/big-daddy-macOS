@@ -793,8 +793,12 @@ final class BigDaddyClient {
     enum UrlUnavailableReason: String {
         /// 前台不是浏览器，本来就没有 URL 可言
         case notApplicable = "NOT_APPLICABLE"
-        /// Firefox 等没有 AppleScript URL 接口的浏览器
+        /// Firefox 等没有 AppleScript URL 接口的浏览器，且辅助功能这条路也没读出地址栏
         case unsupportedBrowser = "UNSUPPORTED_BROWSER"
+        /// Firefox 系浏览器的地址栏只能走辅助功能读，而本机还没给辅助功能授权。
+        /// 与 unsupportedBrowser 必须分开：那个是"这辈子都拿不到，别催了"，这个是
+        /// "去系统设置勾一下就有了"，家长看到的提示完全不同。
+        case accessibilityDenied = "ACCESSIBILITY_DENIED"
         /// 自动化权限被拒（-1743），需要引导家长去系统设置打开
         case notPermitted = "NOT_PERMITTED"
         /// 还没弹过授权框（-1744），可以主动触发一次系统授权
@@ -1058,6 +1062,31 @@ final class BigDaddyClient {
             }
     }
 
+    /// 给"只能拿标题"的浏览器发一次真实的标题查询，把系统的自动化授权询问问出来。
+    ///
+    /// 不能复用 probeAutomation：那个函数第一步就要在 supportedBrowsers 里查方言，
+    /// Firefox 查不到、直接返回 .unknown，调用方会把它当成"被拒"记进
+    /// automationDeniedBundleIDs，于是菜单里冒出一条针对 Firefox 的「浏览器网址未授权」——
+    /// 一个 Firefox 永远不可能满足的诉求。
+    ///
+    /// 与 probeAutomation 一样会**同步阻塞到用户点选为止**，只能在后台线程调用。
+    func warmTitleAutomation(bundleID: String) {
+        _ = runAppleScript(windowNameScript(bundleID: bundleID))
+    }
+
+    /// 已安装的"只能拿标题、拿不到网址"的浏览器（Firefox 系）。
+    ///
+    /// 与 installedSupportedBrowsers 分开是刻意的：那个列表驱动着菜单里的
+    /// 「⚠️ 浏览器网址未授权 · 点此修复」和授权自检面板，都在谈**网址**读取；
+    /// 把 Firefox 混进去，等于让家长对着一个根本不存在的网址开关反复折腾。
+    /// 这个列表只有一个用途——绑定时顺带把自动化授权问出来，好让窗口标题这条路
+    /// 从孩子第一次打开 Firefox 起就是通的。
+    static func installedTitleOnlyBrowsers() -> [String] {
+        knownUnscriptableBrowsers
+            .filter { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil }
+            .sorted()
+    }
+
     /// 已经记过一笔的前台应用 bundle id，避免每次心跳都刷同一行日志
     private var loggedUnsupportedBundleIDs: Set<String> = []
 
@@ -1110,15 +1139,27 @@ final class BigDaddyClient {
             }
         } else if BigDaddyClient.knownUnscriptableBrowsers.contains(bundleID) {
             lastBrowserBundleID = bundleID
-            // 没有 AppleScript 网址接口，但地址栏在辅助功能树里是可读的（见该方法注释）。
-            // 拿得到就当作正常记录，拿不到才退回"能力边界"。
+            // 标题优先走 AppleScript 的**标准套件**（`name of front window`）。
+            //
+            // Firefox 没有浏览器套件（拿不到标签页 URL），但它的 Info.plist 里
+            // NSAppleScriptEnabled 是 true，窗口的 name 属性照常可读——而窗口标题本身
+            // 就是"页面标题 — Mozilla Firefox"，家长要的那半句信息全在里面。
+            //
+            // 这一步很关键：此前 Firefox 的标题只能走 CGWindowList(kCGWindowName) 或
+            // 辅助功能，两条路各自要屏幕录制/辅助功能授权，两者都缺时家长端看到的是
+            // 一条**既没有标题也没有链接**的空记录——换个浏览器就整条记录消失，看起来
+            // 像客户端坏了。AppleScript 用的是另一套（且已经为 Chrome/Safari 引导过的）
+            // 自动化授权，缺屏幕录制时也照样拿得到。
+            let title = windowTitle(pid: frontApp.processIdentifier, bundleID: bundleID)
+            // 地址栏只能从辅助功能树里读（见 addressBarURLViaAccessibility 的注释）。
             if let url = addressBarURLViaAccessibility(pid: frontApp.processIdentifier) {
                 lastUrlUnavailableReason = .notApplicable
-                let title = windowTitle(pid: frontApp.processIdentifier)
                 return (title, url)
             }
-            lastUrlUnavailableReason = .unsupportedBrowser
+            // 没读到地址栏时要分清是"缺授权"还是"这浏览器就这样"，家长能做的事不同。
+            lastUrlUnavailableReason = AXIsProcessTrusted() ? .unsupportedBrowser : .accessibilityDenied
             logUnsupportedFrontAppOnce(bundleID: bundleID, appName: frontApp.localizedName, known: true)
+            return (title, "")
         } else {
             lastBrowserBundleID = nil
             lastUrlUnavailableReason = .notApplicable
@@ -1128,10 +1169,18 @@ final class BigDaddyClient {
         return (windowTitle(pid: frontApp.processIdentifier), "")
     }
 
-    /// 前台窗口标题。首选 CGWindowList 的 kCGWindowName，但该字段自 macOS 10.15 起仅对
-    /// 持有屏幕录制权限的进程返回，未授权时恒为空——此时回落到 Accessibility API。
-    /// 两条路都只有标题，没有 URL。
-    private func windowTitle(pid: pid_t) -> String {
+    /// 前台窗口标题。三条路依次尝试，因为它们各自依赖一套**互不相干**的授权：
+    /// 1. `bundleID` 非空时先走 AppleScript 的标准套件（`name of front window`）——
+    ///    依赖自动化授权，这是 Firefox 唯一还站得住的那条路（见 activeWindowInfo 里
+    ///    knownUnscriptableBrowsers 分支的注释）；
+    /// 2. CGWindowList 的 kCGWindowName——该字段自 macOS 10.15 起仅对持有**屏幕录制**
+    ///    权限的进程返回，未授权时恒为空；
+    /// 3. Accessibility 的 AXTitle——依赖**辅助功能**授权。
+    private func windowTitle(pid: pid_t, bundleID: String? = nil) -> String {
+        if let bundleID, case let .success(raw) = runAppleScript(windowNameScript(bundleID: bundleID)) {
+            let title = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty { return title }
+        }
         let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
         if let windowListInfo = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] {
             for info in windowListInfo {
@@ -1145,10 +1194,33 @@ final class BigDaddyClient {
         return accessibilityWindowTitle(pid: pid)
     }
 
+    /// 只问窗口标题的 AppleScript。用**标准套件**的 `name of front window`，任何
+    /// NSAppleScriptEnabled 的应用都答得上来，不需要浏览器套件——这正是它对 Firefox
+    /// 有效而 browserTabCombinedScript 无效的原因。
+    ///
+    /// 出错分支返回空串而不是错误码：调用方只需要"拿没拿到标题"，拿不到自会往下走
+    /// CGWindowList / 辅助功能两条兜底路；把权限码往上传在这里没有任何消费者。
+    private func windowNameScript(bundleID: String) -> String {
+        """
+        tell application id "\(bundleID)"
+            try
+                if (count of windows) is 0 then return ""
+                return name of front window
+            on error
+                return ""
+            end try
+        end tell
+        """
+    }
+
     /// Firefox 内部给地址栏输入框的元素 id。与界面语言无关（AXDescription 那一路是
     /// 本地化的，中文版 Firefox 上是"使用 Google 搜索，或者输入网址"，拿它做匹配换个
     /// 语言就失效），实测在 Firefox 上稳定返回 "urlbar-input"。
     private static let firefoxURLBarDOMIdentifier = "urlbar-input"
+
+    /// 网页内容区在辅助功能树里的角色。地址栏一定不在它里面，而它下面挂的是整棵 DOM
+    /// （轻松上万个节点），必须整棵跳过——否则广度优先遍历会先被网页内容填满预算。
+    private static let webContentAXRole = "AXWebArea"
 
     /// 从辅助功能树里读 Firefox 系浏览器的地址栏。
     ///
@@ -1162,20 +1234,31 @@ final class BigDaddyClient {
     private func addressBarURLViaAccessibility(pid: pid_t) -> String? {
         guard AXIsProcessTrusted() else { return nil }
         let axApp = AXUIElementCreateApplication(pid)
+        // 从**焦点窗口**起步，而不是从应用根节点：应用根下面还挂着菜单栏和其他窗口，
+        // 从它开始等于先把预算花在孩子此刻并没有在看的东西上。
+        guard let focused = axAttribute(axApp, kAXFocusedWindowAttribute as String),
+              CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
 
-        // 广度优先，但把深度和访问节点数都卡死：地址栏固定在窗口 → 工具栏这几层里
-        // （实测 depth 6），而网页内容的辅助功能树可以有成千上万个节点，不设上限的话
-        // 每分钟一次心跳都要为此空跑一遍整棵 DOM。
-        var queue: [(element: AXUIElement, depth: Int)] = [(axApp, 0)]
+        // 广度优先，深度和访问节点数都卡死：地址栏固定在窗口 → 工具栏这几层里
+        // （实测 depth 6），不设上限的话每分钟一次心跳都要空跑一遍整棵界面树。
+        //
+        // 两处修正，正是"Firefox 有时读得到地址栏、有时读不到"的成因：
+        // ① 遇到 AXWebArea 整棵跳过。网页内容的辅助功能树轻松上万个节点，而它和地址栏
+        //    在同一层的兄弟位置上——广度优先会把这上万个节点排在地址栏所在的深层之前，
+        //    预算在到达地址栏之前就被网页内容吃光了，页面越复杂越容易读不到。
+        // ② 预算耗尽时 break 而不是 continue。continue 只是不再展开这个节点，循环还要
+        //    把队列里剩下的（可能成千上万个）节点一个个弹完才结束，白白空转。
+        var queue: [(element: AXUIElement, depth: Int)] = [(focused as! AXUIElement, 0)]
         var visited = 0
         while !queue.isEmpty {
             let (element, depth) = queue.removeFirst()
             visited += 1
-            if depth > 8 || visited > 400 { continue }
+            if depth > 10 || visited > 1200 { break }
             if axAttribute(element, "AXDOMIdentifier") as? String == Self.firefoxURLBarDOMIdentifier {
                 guard let raw = axAttribute(element, kAXValueAttribute as String) as? String else { return nil }
                 return normalizedAddressBarURL(raw)
             }
+            if axAttribute(element, kAXRoleAttribute as String) as? String == Self.webContentAXRole { continue }
             if let children = axAttribute(element, kAXChildrenAttribute as String) as? [AXUIElement] {
                 for child in children { queue.append((child, depth + 1)) }
             }
@@ -1537,6 +1620,18 @@ final class BigDaddyClient {
     func reportTimeSessionShown(_ sessionId: String) async {
         let body: [String: Any] = ["sessionId": sessionId]
         _ = try? await request(path: "/bigdaddy/client/time-session/shown", method: "POST", body: body, signed: true)
+    }
+
+    /// 孩子在到点提醒上点了「我知道了」。与 shown 的回执是两件事：shown 只说明旗帜
+    /// 显示过（电脑前可能没人），这一条说明孩子本人此刻就在、并且亲手关掉了提醒。
+    /// 后端据此写一条 TIMER_ACKNOWLEDGED 审计，家长在仪表盘能看到。
+    ///
+    /// 同样 fire-and-forget：孩子已经点过按钮、面板也已经收回，这是既成事实；为了一条
+    /// 回执把界面卡住或弹错误提示，只会让孩子觉得"这个按钮点了没用"。真丢了就丢了，
+    /// 到点本身仍由服务端判定并通知家长，不依赖这条。
+    func reportTimeSessionAcknowledged(_ sessionId: String) async {
+        let body: [String: Any] = ["sessionId": sessionId]
+        _ = try? await request(path: "/bigdaddy/client/time-session/acknowledged", method: "POST", body: body, signed: true)
     }
 
     func verifyExitPassword(_ value: String) async -> Bool {
