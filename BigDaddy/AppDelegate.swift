@@ -1538,7 +1538,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             AuditLog.record("TIME_SESSION_STARTED grantedSeconds=\(session.grantedSeconds)")
             timeSessionMilestonesFired.insert(.started)
             scheduleTimeSessionTimer()
-            // present 内部会先 stopFlashing，接替上一次约定还没走完的闪烁
+            // present 内部会先把面板重置回倒计时形态（含摘掉「我知道了」按钮、恢复
+            // ignoresMouseEvents），接替上一次约定还没走完的到点提醒。
             presentTimeSessionFlag(session: session, autoDismissAfter: 4)
         } else if confirmingLocalExpiry {
             // 让归零时启动的那 5 分钟闪烁自然走完：既不在这里打断，也不记 CANCELLED
