@@ -8,10 +8,10 @@ enum ShieldIcon {
 
     /// 菜单栏图标的四种状态。
     ///
-    /// **盾牌本身在任何状态下都保持满尺寸、内胆不变**，状态由右侧一个独立符号承担。
+    /// **盾牌本身在任何状态下都保持满尺寸、内胆不变**，状态由右下角一枚圆形徽章承担。
     /// 这样"这是 BigDaddy"和"它现在什么状态"是两条各自完整、可以分开读的信息。
     ///
-    /// 走过的三条弯路，都值得记下来免得再走一遍：
+    /// 走过的几条弯路，都值得记下来免得再走一遍：
     ///
     /// 1. **换系统符号**（最初的做法）：截图开=eye、缺权限=exclamationmark.triangle、
     ///    正在截图=camera，盾牌只在默认态出现。三个符号彼此、和盾牌之间都没有形状关联，
@@ -20,79 +20,96 @@ enum ShieldIcon {
     /// 2. **改盾牌内胆**（第二版）：整面填实=截图开、空心加感叹号=缺权限。轮廓是统一了，
     ///    但棋盘格——品牌标记本身——在这两个状态里被牺牲掉了，剩下一个纯色盾牌形状。
     ///
-    /// 3. **右下角压徽章**（考虑过，实测否决）：在 16pt 里徽章要和盾牌分离就得挖一圈透明
-    ///    护城河，护城河会把盾牌右下角啃掉一块，轮廓直接不成立；不挖护城河则两者糊成一团。
-    ///    退而缩小盾牌给徽章腾位置，等于牺牲最该保住的东西——盾牌缩到 11pt 后棋盘格就开始
-    ///    糊了。根因是**菜单栏里高度稀缺、宽度便宜**：叠加是在拿高度换空间，只能一起变小；
-    ///    并排是拿宽度换，两个元素都能保持满尺寸。所以选了并排。
+    /// 3. **并排 + 直接叠加**（第三、四版）：先是盾牌和一个独立画的符号（描边眼睛/
+    ///    三角形）挨着放，再收紧间距甚至让两者的包围盒相交、谁后画谁盖住重叠处。
+    ///    这条路线的根本问题到第四版才彻底暴露：盾牌的棋盘格本身有两个镂空格子，
+    ///    符号（尤其描边眼睛）自己中间也是镂空的——两个"镂空"的图形直接做 alpha
+    ///    重叠，遮挡效果完全取决于重叠点具体落在谁的哪个镂空/实心区域，家长看到的
+    ///    是"两个图标随便怼在一起"，而不是一个统一设计的图标。用户反馈原话："缺少
+    ///    设计感，只是拼接"，说得准确。
     ///
-    /// 4. **并排但留出间隙**（第三版，即 gap 为正的最初实现）：两个图形各自独立、界限
-    ///    清楚，但代价是看起来像"凑巧挨着的两个图标"而不是"一个整体"——家长第一眼
-    ///    不容易读出它们是同一件事的两个方面。收紧成负值间距（symbolRect 的起点比盾牌
-    ///    的右边界更靠左，见 image(pointSize:variant:) 里的 gap 常量），让盾牌的右下
-    ///    弧线咬进符号左侧一小块，两个图形从"挨着"变成"长在一起"，读成一体。咬太深会
-    ///    啃掉符号自身的可辨认轮廓（比如眼睛的杏仁尖角、三角的左下角），实测 -0.12 是
-    ///    咬得出来、又不伤符号本身识别度的临界点附近，留了一点余量。
+    /// 4. **圆形徽章 + 挖洞 + 实心 + 镂空图案**（当前版本）：解法是不再让两个"镂空"
+    ///    图形互相重叠，而是学真正的图标系统（iOS/macOS 角标、Slack 的小红点那一类）
+    ///    分三步走：① 在盾牌右下角先挖一个比徽章本身略大的圆洞（`.clear` 合成模式，
+    ///    把盾牌在这块区域的棋盘格/描边全部擦成透明，不管原来是实心还是镂空，统一
+    ///    清零）；② 在挖出来的洞中央画一个**实心**圆徽章；③ 再从这个实心圆里镂空
+    ///    刻出图案。徽章本身永远是实心的，图案永远是"从实心里抠出来的镂空"，不会再
+    ///    出现"我这块透明、你那块也透明，叠在一起变成什么谁也说不准"的情况——这正是
+    ///    iOS 角标"先挖白边、再填色、再放图标"三段式的单色版本。挖洞比徽章大一圈
+    ///    （knockoutRatio）留出的空隙，让徽章和盾牌的棋盘格/描边线保持一点呼吸空间。
     ///
-    /// 符号本身也构成一个小家族：看=空心眼睛，此刻拍下=实心眼睛，出问题=三角感叹号。
-    /// 空心/实心表示"在看 / 正在拍"，和盾牌自身的视觉语言一致。
+    /// 5. **徽章里的图案必须是实心剪影**（当前版本最后一次修正）：第 4 版一开始在徽章里
+    ///    刻的还是眼睛（杏仁镂空环 + 瞳孔）和三角感叹号（三角框 + 感叹号），结果仍然糊。
+    ///    这次算了笔账才找到真原因：16pt 图标下徽章直径只有 9.3pt，眼睛的**环带**厚度
+    ///    只剩约 1pt——2x 屏上 2 像素，1x 屏上 1 像素。任何"需要两个色阶才能读出来"的
+    ///    结构（环带 + 中心、外框 + 内容）在这个尺寸下都不可能成立，这是物理限制，不是
+    ///    画得不够好。凡是内部还有结构的图案，一律换成**单一实心剪影**之后立刻就清楚了。
+    ///    所以现在：看=实心圆点（也是"录制中"的通用符号），出问题=裸感叹号（去掉三角外框，
+    ///    框对语义没贡献却要吃掉一半像素预算）。
+    ///
+    /// 需要更丰富的图形（真正的眼睛、带框三角）的地方是「关于」窗口和各种弹窗——那里
+    /// 尺寸够，可以放；菜单栏这 16pt 就老实用剪影。
     enum Variant {
-        /// 已守护、未开启截图：只有盾牌，不带任何符号
+        /// 已守护、未开启截图：只有盾牌，不带任何徽章
         case brand
-        /// 截图已开启：盾牌 + 空心眼睛
+        /// 截图已开启：盾牌右下角 + 实心圆点徽章
         case watching
-        /// 此刻正在截图：盾牌 + 实心眼睛（同一只眼的瞬时强化）
+        /// 此刻正在截图：盾牌右下角 + 同心圆徽章（相对实心点多一圈，读作快门张开）
         case capturing
-        /// 缺少系统权限：盾牌 + 三角感叹号
+        /// 缺少系统权限：盾牌右下角 + 感叹号徽章
         case warning
     }
 
-    /// 盾牌与状态符号的重叠量：负值 = 符号的起点比盾牌的右边界更靠左，两个图形的
-    /// 包围盒相交。选负值、且盾牌后画（见下方 image 里的绘制顺序），是让两个图形
-    /// 读成"一体"的关键——原因见 Variant 文档的第 4 条弯路记录。
-    private static let symbolOverlapRatio: CGFloat = -0.12
+    /// 徽章直径相对盾牌宽度的比例。
+    private static let badgeSizeRatio: CGFloat = 0.58
+    /// 挖洞半径相对徽章半径的倍数：挖洞比徽章本身大一圈，在徽章和盾牌之间留一条
+    /// 干净的呼吸缝，避免徽章边缘和盾牌的棋盘格/描边线像素级硬碰硬。
+    private static let knockoutRatio: CGFloat = 1.22
+    /// 徽章圆心位置，取盾牌自身坐标系（0...pointSize 宽、0...shieldHeight 高）的比例。
+    /// 偏右下——贴近盾牌的尖角，是徽章"挂"在盾牌上最自然的位置，也符合角标的
+    /// 通行放法（iOS App 角标同样是右上/右下角，不会放在图形正中间）。
+    private static let badgeCenterXRatio: CGFloat = 0.80
+    private static let badgeCenterYRatio: CGFloat = 0.24
 
-    /// - Parameter pointSize: 盾牌的宽度。带符号的状态整体会更宽（菜单栏用的是
-    ///   `NSStatusItem.variableLength`，宽度随状态变化本来就是支持的）。
+    /// - Parameter pointSize: 盾牌的宽度。带徽章的状态整体会比盾牌本身略宽/略高一点
+    ///   （徽章会有一小部分探出盾牌的右下角轮廓，这是角标的常见画法），菜单栏用的是
+    ///   `NSStatusItem.variableLength`，尺寸随状态变化本来就是支持的。
     static func image(pointSize: CGFloat, variant: Variant = .brand) -> NSImage {
         let shieldBox = NSSize(width: pointSize, height: pointSize * aspectRatio)
-        let symbolSize = variant == .brand ? 0 : pointSize * 0.62
-        let gap = variant == .brand ? 0 : pointSize * symbolOverlapRatio
-        let size = NSSize(width: shieldBox.width + gap + symbolSize, height: shieldBox.height)
+        let badgeR = pointSize * badgeSizeRatio / 2
+        let knockoutR = badgeR * knockoutRatio
+        // 徽章圆心在"盾牌本身矩形"坐标系里的位置；如果徽章需要探出盾牌右边/顶边/
+        // 底边，画布要跟着放大，否则探出去的部分会被裁掉。整个画布以盾牌左下角为
+        // 原点，plainCenter 是徽章圆心相对盾牌矩形左下角的坐标。
+        let plainCenter = NSPoint(x: pointSize * badgeCenterXRatio, y: shieldBox.height * badgeCenterYRatio)
+        let overflowRight = variant == .brand ? 0 : max(0, plainCenter.x + knockoutR - shieldBox.width)
+        let overflowBottom = variant == .brand ? 0 : max(0, knockoutR - plainCenter.y)
+        let overflowTop = variant == .brand ? 0 : max(0, plainCenter.y + knockoutR - shieldBox.height)
+        let size = NSSize(width: shieldBox.width + overflowRight,
+                          height: shieldBox.height + overflowBottom + overflowTop)
 
         let image = NSImage(size: size)
         image.lockFocus()
 
         let inset = pointSize * 0.06
-        let shieldRect = NSRect(origin: .zero, size: shieldBox).insetBy(dx: inset, dy: inset)
-
-        // 符号先画、盾牌后画：两者的黑色区域在模板图里就是同一种"不透明"，画的先后
-        // 顺序本身不改变颜色，但盾牌的棋盘格有两个格子是透明的（见 drawBrandShield）——
-        // 后画的盾牌能让它自己的透明格子露出底下符号的痕迹，而不透明的格子/描边线会
-        // 盖住重叠处的符号，视觉上就是"盾牌咬进符号一口"。反过来画（盾牌先、符号后）
-        // 会变成符号盖住盾牌，读成"符号啃了盾牌一口"，不是我们想要的方向。
-        if variant != .brand {
-            let symbolRect = NSRect(x: shieldBox.width + gap, y: (size.height - symbolSize) / 2,
-                                    width: symbolSize, height: symbolSize)
-            switch variant {
-            case .brand: break
-            case .watching: drawEye(in: symbolRect, filled: false)
-            case .capturing: drawEye(in: symbolRect, filled: true)
-            case .warning: drawWarningTriangle(in: symbolRect)
-            }
-        }
-
+        let shieldRect = NSRect(x: 0, y: overflowBottom, width: shieldBox.width, height: shieldBox.height)
+            .insetBy(dx: inset, dy: inset)
         drawBrandShield(in: shieldRect, lineWidth: pointSize * 0.09)
+
+        if variant != .brand {
+            let center = NSPoint(x: plainCenter.x, y: plainCenter.y + overflowBottom)
+            drawBadge(center: center, radius: badgeR, knockoutRadius: knockoutR, variant: variant)
+        }
 
         image.unlockFocus()
         image.isTemplate = true
         return image
     }
 
-    // MARK: - 组件
+    // MARK: - 盾牌
 
     private static func drawBrandShield(in rect: NSRect, lineWidth: CGFloat) {
-        let shield = path(in: rect)
+        let shield = shieldPath(in: rect)
 
         NSGraphicsContext.saveGraphicsState()
         shield.addClip()
@@ -113,65 +130,7 @@ enum ShieldIcon {
         shield.stroke()
     }
 
-    /// 杏仁形眼睛。filled=false 是描边+瞳孔（"家长能看到这台机器"），filled=true 整只填实
-    /// 再挖出瞳孔（"此刻正拍下一张"）——同一个形状的轻重两态，比换个符号更容易读成一件事。
-    private static func drawEye(in r: NSRect, filled: Bool) {
-        let w = r.width, h = r.height
-        let eye = NSBezierPath()
-        eye.move(to: NSPoint(x: r.minX, y: r.midY))
-        eye.curve(to: NSPoint(x: r.maxX, y: r.midY),
-                  controlPoint1: NSPoint(x: r.minX + 0.28 * w, y: r.minY + 1.05 * h),
-                  controlPoint2: NSPoint(x: r.maxX - 0.28 * w, y: r.minY + 1.05 * h))
-        eye.curve(to: NSPoint(x: r.minX, y: r.midY),
-                  controlPoint1: NSPoint(x: r.maxX - 0.28 * w, y: r.maxY - 1.05 * h),
-                  controlPoint2: NSPoint(x: r.minX + 0.28 * w, y: r.maxY - 1.05 * h))
-        eye.close()
-
-        // 两态的瞳孔比例不同，是实测扫出来的：描边态瞳孔是**实心**的，画大点才看得见；
-        // 实心态瞳孔是**挖空**的，同样大小会把杏仁形连同它的尖角一起吃掉，读出来是个
-        // 甜甜圈而不是眼睛。0.12 是尖角还在、瞳孔又认得出的那个点。
-        let pupilR = w * (filled ? 0.12 : 0.17)
-        let pupil = NSRect(x: r.midX - pupilR, y: r.midY - pupilR, width: pupilR * 2, height: pupilR * 2)
-
-        if filled {
-            NSColor.black.setFill()
-            eye.fill()
-            // 模板图只认 alpha，瞳孔必须真的挖空成透明——画白色在深色菜单栏里会被重新着色
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current?.compositingOperation = .clear
-            NSBezierPath(ovalIn: pupil).fill()
-            NSGraphicsContext.restoreGraphicsState()
-        } else {
-            NSColor.black.setStroke()
-            eye.lineWidth = max(0.7, w * 0.13)
-            eye.stroke()
-            NSColor.black.setFill()
-            NSBezierPath(ovalIn: pupil).fill()
-        }
-    }
-
-    /// 三角感叹号。用最通用的警示符号，家长不需要学就知道"这儿有事要处理"。
-    private static func drawWarningTriangle(in r: NSRect) {
-        let w = r.width, h = r.height
-        let tri = NSBezierPath()
-        tri.move(to: NSPoint(x: r.midX, y: r.maxY))
-        tri.line(to: NSPoint(x: r.maxX, y: r.minY))
-        tri.line(to: NSPoint(x: r.minX, y: r.minY))
-        tri.close()
-        tri.lineJoinStyle = .round
-        NSColor.black.setStroke()
-        tri.lineWidth = max(0.7, w * 0.13)
-        tri.stroke()
-
-        NSColor.black.setFill()
-        let barW = w * 0.12
-        NSBezierPath(roundedRect: NSRect(x: r.midX - barW / 2, y: r.minY + 0.36 * h, width: barW, height: 0.32 * h),
-                     xRadius: barW / 2, yRadius: barW / 2).fill()
-        let dotD = w * 0.14
-        NSBezierPath(ovalIn: NSRect(x: r.midX - dotD / 2, y: r.minY + 0.20 * h, width: dotD, height: dotD)).fill()
-    }
-
-    private static func path(in rect: NSRect) -> NSBezierPath {
+    private static func shieldPath(in rect: NSRect) -> NSBezierPath {
         let w = rect.width, h = rect.height
         let x0 = rect.minX, y0 = rect.minY
         let path = NSBezierPath()
@@ -191,5 +150,77 @@ enum ShieldIcon {
                    controlPoint2: NSPoint(x: x0 + 0.04 * w, y: y0 + 1.0 * h))
         path.close()
         return path
+    }
+
+    // MARK: - 徽章
+
+    /// 徽章统一走"挖洞 → 填实心圆 → 从实心圆里镂空刻图案"三段式，见 Variant 文档
+    /// 第 4 条。三种非默认状态共享这套底座，只有第三步"刻什么图案"不同。
+    private static func drawBadge(center: NSPoint, radius: CGFloat, knockoutRadius: CGFloat, variant: Variant) {
+        clearCircle(center: center, radius: knockoutRadius)
+        NSColor.black.setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
+
+        switch variant {
+        case .brand:
+            break
+        case .watching:
+            cutCircle(center: center, radius: radius * 0.40)
+        case .capturing:
+            cutRing(center: center, outerRadius: radius * 0.52, innerRadius: radius * 0.22)
+        case .warning:
+            cutExclamation(center: center, badgeRadius: radius)
+        }
+    }
+
+    private static func clearCircle(center: NSPoint, radius: CGFloat) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.compositingOperation = .clear
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius,
+                                    width: radius * 2, height: radius * 2)).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// 实心圆点镂空——"正在被看着"。
+    ///
+    /// 为什么是个点而不是眼睛：徽章直径在 16pt 图标下只有 9.3pt，能放进去的图案还要再
+    /// 小一圈。眼睛这种**需要两个色阶才能读出**的形状（眼眶环 + 中间瞳孔）在这里环带
+    /// 只剩约 1pt（2x 屏上 2 像素），渲染出来必然是一团糊的疙瘩——这不是画得不够好看，
+    /// 是物理上不够放。实测把眼睛、三角形这类带内部结构的图案换成**实心剪影**之后，
+    /// 同样尺寸下立刻就清晰了。圆点同时也是"录制中"最通用的符号，家长不用学。
+    private static func cutCircle(center: NSPoint, radius: CGFloat) {
+        clearCircle(center: center, radius: radius)
+    }
+
+    /// 同心圆镂空——"此刻正在拍这一张"。相对实心点多一圈，读作快门张开；这个状态是
+    /// 瞬时的（截图那一下才出现），即使和实心点区分得不那么强烈也不影响理解。
+    private static func cutRing(center: NSPoint, outerRadius: CGFloat, innerRadius: CGFloat) {
+        let path = NSBezierPath(ovalIn: NSRect(x: center.x - outerRadius, y: center.y - outerRadius,
+                                               width: outerRadius * 2, height: outerRadius * 2))
+        path.windingRule = .evenOdd
+        path.append(NSBezierPath(ovalIn: NSRect(x: center.x - innerRadius, y: center.y - innerRadius,
+                                                width: innerRadius * 2, height: innerRadius * 2)))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.compositingOperation = .clear
+        path.fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// 感叹号镂空（竖条 + 圆点）——"有事要你处理"。
+    ///
+    /// 刻意**不画三角形外框**：三角框加内部感叹号同样是"需要两个色阶"的结构，在徽章
+    /// 尺寸下三条边会和里面的感叹号糊成一块。裸感叹号只有两个实心块，任何尺寸都清晰，
+    /// 而且"!"本身就是通用的警示符号，外框那圈三角对语义没有额外贡献。
+    private static func cutExclamation(center: NSPoint, badgeRadius: CGFloat) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.compositingOperation = .clear
+        let barW = badgeRadius * 0.24
+        NSBezierPath(roundedRect: NSRect(x: center.x - barW / 2, y: center.y - badgeRadius * 0.05,
+                                         width: barW, height: badgeRadius * 0.52),
+                     xRadius: barW / 2, yRadius: barW / 2).fill()
+        let dotD = badgeRadius * 0.26
+        NSBezierPath(ovalIn: NSRect(x: center.x - dotD / 2, y: center.y - badgeRadius * 0.52,
+                                    width: dotD, height: dotD)).fill()
+        NSGraphicsContext.restoreGraphicsState()
     }
 }

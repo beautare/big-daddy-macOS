@@ -114,6 +114,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private static let updateReminderInterval: TimeInterval = 4 * 60 * 60
     /// "关于"窗口（自绘 NSWindow，见 showAboutWindow）当前是否已打开，再次点击菜单项时
     /// 先关掉旧的再重建，避免残留一个数据已过期的旧窗口。
+    /// 家长已经点过"前往系统设置授权"，正处在"去设置里开开关 → 回来重启生效"这段
+    /// 两步流程的中间。
+    ///
+    /// 为什么需要显式记这个状态、而不是靠查权限：屏幕录制权限是
+    /// `CGPreflightScreenCaptureAccess()`，它在**本进程内有缓存**——家长在系统设置里
+    /// 把开关打开之后，我们这个进程再怎么查都还是 false，直到重启。也就是说"是否已经
+    /// 授权"这件事我们在代码里根本看不见，只能看见"家长有没有点过那颗按钮"。
+    ///
+    /// 这个状态一旦为 true，两处 UI 都会改变：「关于」窗口把第 2 步（重启生效）提成
+    /// 主按钮，菜单栏一级菜单也会多出一条同样的提醒。见 showAboutWindow / rebuildMenu。
+    private var awaitingScreenRecordingGrant = false
+
     private weak var aboutWindow: NSWindow?
     /// 与"关于"窗口里按钮的 tag 一一对应，点击时按下标取出对应动作执行（见 aboutActionTapped）。
     private var aboutWindowActions: [() -> Void] = []
@@ -405,6 +417,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             timeSessionMenuItem = nil
         }
 
+        // 屏幕录制"就差最后一步"的兜底提醒。
+        //
+        // 家长点过"前往系统设置授权"、在设置里开完开关之后，还剩一步重启才生效。那一步
+        // 的按钮在「关于」窗口里（现在会一直开着等他回来），但家长完全可能顺手把窗口关了、
+        // 或者在设置里绕了一圈就忘了这回事。菜单栏图标此刻还挂着警示徽章，他点开菜单
+        // 想搞清楚是怎么回事——这条就得在这儿等着，而且是一点就完事的。
+        //
+        // 少了这条，最坏情况就是家长的原始抱怨："我明明授权了，怎么还是警示图标？"
+        if client.config.bound && client.config.screenshotEnabled
+            && awaitingScreenRecordingGrant && !checkScreenRecordingPermission() {
+            menu.addItem(NSMenuItem(
+                title: Localization.string(
+                    zh: "✅ 已在设置里授权？点此重启生效",
+                    en: "✅ Granted in Settings? Restart to Apply"
+                ),
+                action: #selector(promptRestartForScreenRecording), keyEquivalent: ""
+            ))
+            menu.addItem(.separator())
+        }
+
         // 浏览器网址未授权：这是一条**可点即修**的待办，必须留在一级菜单。
         //
         // 之前它只存在于两个地方：一次性的本机通知（错过就没了）和「关于 BigDaddy…」
@@ -501,15 +533,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         var actions: [(title: String, handler: () -> Void, prominent: Bool)] = []
         // 家长已远程开启截图，但本机系统的屏幕录制权限还没给——配置了但实际不生效，
-        // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。拆成两个独立按钮而不是一个"打开设置
-        // 顺带问要不要重启"的合并流程：我们没法从代码里区分用户"还没去授权"还是"已经
-        // 授权了、只差重启"（同一个进程级缓存问题），与其让一个按钮猜错、给已经去过
-        // 设置的用户又重新弹一次系统设置，不如把两个诚实、各司其职的动作都摆出来。
-        // ⚠️ 前缀而不是蓝底：蓝色已经被"发现新版本"占用，两种"建议点一下"的含义
-        // 不该共用同一个颜色语言。
+        // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。
+        //
+        // 这里是**一次只给一个动作**的两步向导，不是两颗并排的按钮。
+        //
+        // 之前的做法是把"前往设置授权"和"已授权？重启客户端"两颗按钮平级摆出来，理由是
+        // 我们查不出家长到底走到哪一步了（权限有进程级缓存，见 awaitingScreenRecordingGrant），
+        // 与其猜错不如都摆出来让家长自己选。但实测下来这是个糟糕的取舍：
+        //   · 两颗按钮看不出有先后顺序，家长不知道该先点哪个；
+        //   · 点第一颗之后窗口直接关掉，第二步的入口凭空消失；
+        //   · 家长在系统设置里授权完回来，没有任何东西提醒他还剩一步，
+        //     于是菜单栏一直挂着警示图标，家长的结论是"我明明授权了，这软件坏了"。
+        //
+        // 现在改成：我们确实查不到权限，但我们**查得到家长有没有点过第一颗按钮**，用这个
+        // 已知信息把流程切成两个互斥的状态，每个状态只呈现那一步该做的唯一动作。猜错的
+        // 代价也被兜住了——第二步的说明里写清了"如果还没开，就走下面那条回去设置"。
         if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
-            actions.append((Localization.string(zh: "⚠️ 前往设置授权", en: "⚠️ Open Settings"), openScreenRecordingSettings, false))
-            actions.append((Localization.string(zh: "已授权？重启客户端", en: "Granted? Restart App"), promptRestartForScreenRecording, false))
+            if awaitingScreenRecordingGrant {
+                // 第 2 步：家长刚从系统设置回来。重启是此刻唯一该做的事，给蓝底主按钮。
+                actions.append((
+                    Localization.string(zh: "✅ 我已授权，立即重启生效", en: "✅ I've Granted It — Restart Now"),
+                    promptRestartForScreenRecording,
+                    true
+                ))
+                // 兜底：万一家长其实没在设置里打开开关（找错地方 / 找不到 BigDaddy 那一项），
+                // 给一条低调的回头路，而不是让他卡在一个只能重启的死胡同里。
+                actions.append((
+                    Localization.string(zh: "还没授权？再去一次设置", en: "Not Yet? Open Settings Again"),
+                    openScreenRecordingSettings,
+                    false
+                ))
+            } else {
+                // 第 1 步：还没去过设置。此刻唯一该做的事就是去开开关。
+                actions.append((
+                    Localization.string(zh: "⚠️ 前往系统设置授权", en: "⚠️ Open System Settings"),
+                    openScreenRecordingSettings,
+                    true
+                ))
+            }
         }
         // 浏览器自动化权限缺失：家长端会看到"有标题、没链接"的日志。这条和屏幕录制那条
         // 的可见性条件不同——它跟 screenshotEnabled 无关，只要设备已绑定、且实际撞到过
@@ -956,10 +1017,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 让菜单栏图标反映当前"截图是否开启 / 是否正在截图 / 权限是否缺失"，作为孩子端常驻可见指示。
     ///
-    /// 四种状态**共用同一个满尺寸的品牌盾牌**，状态由盾牌右侧一个并排的符号承担（见
-    /// ShieldIcon.Variant）：没有符号=守护中未截图，空心眼睛=截图已开启，实心眼睛=此刻正在
-    /// 截图，三角感叹号=缺权限。为什么是并排而不是换图标、改内胆或压角标，见 ShieldIcon
-    /// 里那段记录。
+    /// 四种状态**共用同一个满尺寸的品牌盾牌**，状态由盾牌右下角一枚实心圆徽章承担
+    /// （见 ShieldIcon.Variant）：没有徽章=守护中未截图，眼睛（留瞳孔）=截图已开启，
+    /// 眼睛（不留瞳孔）=此刻正在截图，三角感叹号=缺权限。徽章走"挖洞→填实心→镂空
+    /// 刻图案"三段式，不是简单地把两个图形直接叠在一起——为什么，见 ShieldIcon
+    /// 里那段记录（早期版本让盾牌和符号两个"都带镂空"的图形直接做透明度叠加，
+    /// 效果随机且像随手拼贴，而不是设计过的图标）。
     ///
     /// 浏览器网址未授权也走同一个 warning 符号：两者是同一类问题（配置了但实际不生效），
     /// 用同一套视觉语言，点开菜单第一眼就能看到对应那条待办。屏幕录制排在前面——
@@ -3011,8 +3074,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
     
+    /// "前往系统设置授权"：进入两步流程的第 2 步，并且**把「关于」窗口留在原地**。
+    ///
+    /// 顺序很关键，两件事都要做对：
+    ///
+    /// 1. 先把 awaitingScreenRecordingGrant 置位、再重建「关于」窗口。aboutActionTapped
+    ///    会在调用本方法之前先关掉窗口（那是它的通用行为，别的按钮都指望着这一点），
+    ///    所以这里主动重建一次，家长从系统设置切回来时窗口还在，而且已经变成"第 2 步：
+    ///    立即重启生效"的样子。这正是原来那个"点完按钮窗口就没了、第二步入口消失"的
+    ///    问题的修复点。
+    /// 2. 系统设置必须**最后**打开。showAboutWindow 结尾有 NSApp.activate +
+    ///    makeKeyAndOrderFront，如果先开设置再重建窗口，我们会把焦点从系统设置抢回来，
+    ///    家长得自己再切回去——反而更烦。
     @objc private func openScreenRecordingSettings() {
+        awaitingScreenRecordingGrant = true
         CGRequestScreenCaptureAccess()
+        // 菜单栏一级菜单里那条"已授权？点此重启生效"的提醒也依赖这个状态
+        rebuildMenu()
+        showAboutWindow()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
@@ -3285,9 +3364,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     @objc private func promptRestartForScreenRecording() {
         let alert = NSAlert()
         alert.messageText = Localization.string(zh: "重启后屏幕录制权限才会生效", en: "Restart to Apply Screen Recording Permission")
+        // 明确写出"在哪个开关"，是因为家长最常见的失败不是不肯授权，而是在系统设置里
+        // 找错了地方（屏幕录制、辅助功能、文件与文件夹几个面板长得很像）。重启是不可逆
+        // 的打断，所以这里也如实说清楚"重启后要是还没生效，就是开关没开成"，省得家长
+        // 重启一次发现没用、却不知道下一步该查什么。
         alert.informativeText = Localization.string(
-            zh: "如果你已经在系统设置「隐私与安全性 → 屏幕录制」里开启了 BigDaddy 的开关，点击「立即重启」即可生效；如果还没开启，请先点「⚠️ 前往设置授权」。",
-            en: "If you've already turned on the switch for BigDaddy in System Settings (Privacy & Security → Screen Recording), click Restart Now to apply it. If not yet, use “⚠️ Open Settings” first."
+            zh: "屏幕录制权限必须重启 BigDaddy 才会生效，这是 macOS 的限制。\n\n请确认你已经在「系统设置 → 隐私与安全性 → 屏幕录制」里找到 BigDaddy 并打开了它的开关，然后点「立即重启」。\n\n重启后如果菜单栏还是警示图标，说明那个开关没有真的打开，再回到设置里检查一次即可。",
+            en: "Screen Recording permission only takes effect after BigDaddy restarts — that's a macOS restriction.\n\nMake sure you've found BigDaddy under System Settings → Privacy & Security → Screen Recording and switched it on, then click Restart Now.\n\nIf the menu bar still shows the warning icon after restarting, that switch didn't actually get turned on — just go back and check it again."
         )
         applyShieldIcon(to: alert)
         alert.addButton(withTitle: Localization.string(zh: "立即重启", en: "Restart Now"))
