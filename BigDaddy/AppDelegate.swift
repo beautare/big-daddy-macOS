@@ -3399,10 +3399,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 重置后立刻把还开着的浏览器重新问一遍，省得家长再找入口
             warmAutomationConsentIfNeeded()
         case .unavailable:
-            done.messageText = Localization.string(zh: "开发构建无法重置", en: "Can't reset in a dev build")
+            // 这个分支只有开发构建会走到（裸二进制没有 Info.plist / bundle id），所以
+            // 说明里给命令行是合适的——站在这台机器前的人就是开发者本人。
+            //
+            // 顺便把"为什么开发构建总是撞上这个"讲明白：裸二进制是 ad-hoc 签名，
+            // 每次重新构建 cdhash 都会变，macOS 因此认不出这是同一个程序——旧的授权
+            // 记录变成孤儿（在「自动化」面板里还列着，但开关扳不动，因为它绑定的是
+            // 一个已经不存在的代码身份），而新的身份又得从头再问一次。构建几次之后，
+            // 面板里就会出现好几组同名的 BigDaddy。这跟当初 Keychain 每次构建都重新
+            // 弹授权框是同一个根因。
+            done.messageText = Localization.string(zh: "开发构建无法定向重置", en: "Can't scope a reset in a dev build")
             done.informativeText = Localization.string(
-                zh: "当前运行的不是打包后的 .app（没有 bundle identifier），系统的重置工具没有可定位的目标。请改用打包安装后的正式版本。",
-                en: "This isn't a packaged .app (no bundle identifier), so the system reset tool has nothing to target. Use the packaged build instead."
+                zh: """
+                当前运行的是未打包的裸二进制，没有 bundle identifier，tccutil 无从定位，因此这里没法只重置 BigDaddy 自己。
+
+                两条出路：
+                • 推荐：用 scripts/package.sh 打包成 .app 再测权限相关功能。打包版有固定的 bundle id 和稳定签名，授权记录不会因为重新构建而失效，这颗按钮也就能正常工作。
+                • 应急：在终端执行 `tccutil reset AppleEvents`。注意它是全局的——会一并清掉**本机所有 App** 的自动化决定（其它 App 之后也要重新同意一次），所以不放在这里自动执行。
+                """,
+                en: """
+                You're running an unpackaged bare binary with no bundle identifier, so tccutil has nothing to target and this button can't scope a reset to BigDaddy alone.
+
+                Two ways forward:
+                • Preferred: package it with scripts/package.sh and test permission-related features there. The packaged build has a fixed bundle id and a stable signature, so grants survive rebuilds and this button works.
+                • Escape hatch: run `tccutil reset AppleEvents` in Terminal. It is global — it clears automation decisions for EVERY app on this Mac, so it isn't run automatically from here.
+                """
             )
             done.runModal()
         case .failed(let status, let message):
