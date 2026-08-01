@@ -169,6 +169,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var menuRebuildPending = false
     /// 菜单展开期间每秒刷新剩余时间的定时器，关菜单即停。
     private var openMenuTickTimer: Timer?
+    /// 家长去系统设置开辅助功能期间的状态轮询，授权到手或超时即停（见 startAccessibilityGrantWatch）。
+    private var accessibilityWatchTimer: Timer?
 
     private enum TimeSessionMilestone: Hashable {
         case started, halfway, fiveMinutes, oneMinute, thirtySeconds
@@ -437,6 +439,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(.separator())
         }
 
+        // 辅助功能未授权：和下面那条网址授权一样是"可点即修"的待办，但后果更重——
+        // 非浏览器窗口的标题、以及 Firefox 系浏览器的地址栏都只能从辅助功能树里读，
+        // 缺了它家长端看到的是一片没有标题、没有链接的空记录。
+        //
+        // 为什么绑定时明明拦过一次、这里还要再来一条：那道闸只在**绑定那一刻**生效
+        // （checkAndRequestPermissions），而这个权限完全可能在绑定之后失效——家长在
+        // 系统设置里手滑关掉、系统升级后 TCC 记录重置、或者（开发期最常见）客户端
+        // 重新签名后 macOS 认不出这是同一个 App。一旦失效，此前**整个客户端里没有
+        // 任何一个入口**能把它重新打开：菜单里没有、「关于」窗口里也没有，只有重新
+        // 绑定一次才会再弹那道闸。这正是"Firefox 一直显示无网址、却无从下手"的成因。
+        if client.config.bound && !AXIsProcessTrustedWithOptions(nil) {
+            menu.addItem(NSMenuItem(
+                title: Localization.string(
+                    zh: "⚠️ 辅助功能未授权 · 点此修复",
+                    en: "⚠️ Accessibility access off · Fix it"
+                ),
+                action: #selector(promptAccessibilityPermission), keyEquivalent: ""
+            ))
+            menu.addItem(.separator())
+        }
+
         // 浏览器网址未授权：这是一条**可点即修**的待办，必须留在一级菜单。
         //
         // 之前它只存在于两个地方：一次性的本机通知（错过就没了）和「关于 BigDaddy…」
@@ -571,6 +594,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     true
                 ))
             }
+        }
+        // 辅助功能缺失：与菜单里那条同一个判据（见 rebuildMenu 里的注释）。放在最前面，
+        // 因为它比下面两条影响更大——没有它，连窗口标题这种最基本的记录都是空的。
+        if client.config.bound && !AXIsProcessTrustedWithOptions(nil) {
+            actions.append((
+                Localization.string(zh: "⚠️ 开启辅助功能权限", en: "⚠️ Turn On Accessibility"),
+                promptAccessibilityPermission,
+                false
+            ))
         }
         // 浏览器自动化权限缺失：家长端会看到"有标题、没链接"的日志。这条和屏幕录制那条
         // 的可见性条件不同——它跟 screenshotEnabled 无关，只要设备已绑定、且实际撞到过
@@ -1032,7 +1064,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let on = client.config.screenshotEnabled
         let missingScreenRecording = on && !checkScreenRecordingPermission()
         let missingAutomation = client.config.bound && !automationDeniedBundleIDs.isEmpty
-        let missingPermission = missingScreenRecording || missingAutomation
+        // 辅助功能缺失也要让图标变成警示态：菜单里那条「⚠️ 辅助功能未授权 · 点此修复」
+        // 是唯一的修复入口，而没有人会去点一个看起来一切正常的图标。少了这一条，那个
+        // 入口等于藏在一扇没有门把手的门后面。
+        let missingAccessibility = client.config.bound && !AXIsProcessTrustedWithOptions(nil)
+        let missingPermission = missingScreenRecording || missingAutomation || missingAccessibility
 
         let variant: ShieldIcon.Variant
         let desc: String
@@ -1041,11 +1077,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
         } else if missingPermission {
             variant = .warning
-            desc = missingScreenRecording
-                ? Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限",
-                                      en: "BigDaddy screenshots on but missing system permission")
-                : Localization.string(zh: "BigDaddy 缺少浏览器网址读取权限",
-                                      en: "BigDaddy is missing browser URL access")
+            // 优先说最严重的那一条：缺辅助功能连窗口标题都记不到，比"有标题没链接"更致命。
+            if missingAccessibility {
+                desc = Localization.string(zh: "BigDaddy 缺少辅助功能权限",
+                                           en: "BigDaddy is missing Accessibility access")
+            } else if missingScreenRecording {
+                desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限",
+                                           en: "BigDaddy screenshots on but missing system permission")
+            } else {
+                desc = Localization.string(zh: "BigDaddy 缺少浏览器网址读取权限",
+                                           en: "BigDaddy is missing browser URL access")
+            }
         } else if on {
             variant = .watching
             desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
@@ -3067,10 +3109,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     @objc private func openAccessibilitySettings() {
+        // 先发带 prompt 的查询再开设置页，顺序不能反。
+        //
+        // 这一步不只是"弹个框"：**只有真正请求过一次，BigDaddy 才会出现在
+        // 「隐私与安全性 → 辅助功能」的名单里**。macOS 的这个名单只列出请求过该权限的
+        // App，从没请求过的应用连一行灰色条目都不会有。所以如果跳过它直接开设置页，
+        // 家长看到的是一个根本找不到 BigDaddy 的列表——"按提示去设置里勾上"这条路
+        // 在那之前是死的（自动化权限那边踩过同一个坑，见 showAutomationPromptUnavailable）。
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 菜单/「关于」窗口里"辅助功能未授权 · 点此修复"的响应。
+    ///
+    /// 已经授权时不重复打扰，直接确认一句就好——权限可能在家长点开菜单到点下这一项
+    /// 之间刚好被打开（菜单项的文字是上一次 rebuildMenu 时算的，未必是此刻的真相）。
+    ///
+    /// 授权成功后**不需要重启**客户端：AXIsProcessTrusted 会实时反映最新状态，
+    /// 下一次心跳就能带上窗口标题和 Firefox 的网址——这点和屏幕录制不同（那个受
+    /// 进程级缓存影响，必须重启，所以那条路才有"已授权？重启客户端"的第二步）。
+    @objc private func promptAccessibilityPermission() {
+        guard !AXIsProcessTrustedWithOptions(nil) else {
+            let done = NSAlert()
+            applyShieldIcon(to: done)
+            done.messageText = Localization.string(zh: "辅助功能已授权", en: "Accessibility is on")
+            done.informativeText = Localization.string(
+                zh: "本机已经允许 BigDaddy 使用辅助功能，窗口标题和网址记录都能正常采集。",
+                en: "This Mac already allows BigDaddy to use Accessibility; window titles and addresses are being recorded normally."
+            )
+            done.runModal()
+            rebuildMenu()
+            return
+        }
+
+        let alert = NSAlert()
+        applyShieldIcon(to: alert)
+        alert.messageText = Localization.string(zh: "需要辅助功能权限", en: "Accessibility permission needed")
+        alert.informativeText = Localization.string(
+            zh: "缺少这项权限时，家长端看到的记录会没有窗口标题，Firefox 一类浏览器也读不到网址。\n\n点「去授权」后，系统会弹出询问并打开设置页面；在「隐私与安全性 → 辅助功能」的名单里把 BigDaddy 打开即可，开启后立即生效，不需要重启。",
+            en: "Without it, the parent dashboard shows records with no window title, and browsers like Firefox report no address.\n\nChoose “Authorize” — macOS will ask and open the settings page. Switch BigDaddy on under Privacy & Security → Accessibility. It takes effect immediately; no restart needed."
+        )
+        alert.addButton(withTitle: Localization.string(zh: "去授权", en: "Authorize"))
+        alert.addButton(withTitle: Localization.string(zh: "以后再说", en: "Later"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        openAccessibilitySettings()
+        startAccessibilityGrantWatch()
+    }
+
+    /// 家长去系统设置期间盯着权限状态，一旦打开就把菜单里那条警示摘掉。
+    ///
+    /// 需要主动盯：辅助功能的授权发生在**另一个进程**（系统设置）里，本进程收不到任何
+    /// 通知；不盯的话，家长明明已经勾上了，菜单里那条"⚠️ 未授权"还挂着，看起来像没生效。
+    /// 每 2 秒查一次、最多 2 分钟——AXIsProcessTrustedWithOptions(nil) 不弹窗、不打扰。
+    private func startAccessibilityGrantWatch() {
+        accessibilityWatchTimer?.invalidate()
+        var elapsed: TimeInterval = 0
+        accessibilityWatchTimer = scheduleCommonModeTimer(interval: 2, repeats: true) { [weak self] timer in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                elapsed += 2
+                if AXIsProcessTrustedWithOptions(nil) || elapsed >= 120 {
+                    timer.invalidate()
+                    self.accessibilityWatchTimer = nil
+                    self.rebuildMenu()
+                    // 菜单栏图标同样由这个权限驱动（见 updateStatusItemAppearance），
+                    // 授权到手后要把警示态一起摘掉，否则家长开完权限还盯着一个 ⚠️。
+                    self.updateStatusItemAppearance()
+                }
+            }
         }
     }
     
