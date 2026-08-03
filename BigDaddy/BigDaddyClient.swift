@@ -152,7 +152,7 @@ final class BigDaddyClient {
     let dashboardBaseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyDashboardBaseURL") as? String ?? "http://localhost:4000")!
     let identity: DeviceIdentity
     var config: ClientConfig
-    var lastHeartbeatDescription = "not sent"
+    var lastHeartbeatDescription = Localization.string(zh: "尚未发送", en: "Not sent")
     var bindToken: String?
     /// register 响应报告本机 secret 与后端存档不一致（设备已绑定、后端拒绝换钥）。
     /// 此状态下所有签名接口都会验签失败，必须在 UI 上明确警示，引导解绑后重新绑定。

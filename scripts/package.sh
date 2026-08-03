@@ -72,6 +72,10 @@ cp "${BIN_DIR}/BigDaddy" "${APP_DIR}/Contents/MacOS/BigDaddy"
 cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
 # 应用图标（由 scripts/generate_appicon.swift 生成后提交进仓库）
 cp "${ROOT_DIR}/BigDaddy/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
+# 系统权限说明走 InfoPlist.strings：中文环境统一显示简体，其他语言回退英文。
+for LOCALIZATION in Base.lproj zh_CN.lproj zh_HK.lproj zh_TW.lproj; do
+  cp -R "${ROOT_DIR}/BigDaddy/${LOCALIZATION}" "${APP_DIR}/Contents/Resources/${LOCALIZATION}"
+done
 
 # 嵌入 Sparkle.framework（动态框架必须放在 Contents/Frameworks/ 下，@rpath 才能找到）
 SPARKLE_FW="${BIN_DIR}/Sparkle.framework"

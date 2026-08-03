@@ -6,14 +6,30 @@ import Sparkle
 
 enum Localization {
     static var isChinese: Bool {
-        if let language = Locale.preferredLanguages.first {
-            return language.hasPrefix("zh")
-        }
-        return false
+        isChinese(for: Locale.preferredLanguages.first)
+    }
+
+    static func isChinese(for preferredLanguage: String?) -> Bool {
+        preferredLanguage?.lowercased().hasPrefix("zh") ?? false
     }
 
     static func string(zh: String, en: String) -> String {
-        return isChinese ? zh : en
+        string(zh: zh, en: en, preferredLanguage: Locale.preferredLanguages.first)
+    }
+
+    static func string(zh: String, en: String, preferredLanguage: String?) -> String {
+        guard isChinese(for: preferredLanguage) else { return en }
+        guard usesTraditionalChinese(for: preferredLanguage) else { return zh }
+
+        return zh.applyingTransform(StringTransform("Hans-Hant"), reverse: false) ?? zh
+    }
+
+    private static func usesTraditionalChinese(for preferredLanguage: String?) -> Bool {
+        guard let language = preferredLanguage?.lowercased() else { return false }
+        return language.contains("hant")
+            || language.contains("-tw")
+            || language.contains("-hk")
+            || language.contains("-mo")
     }
 }
 

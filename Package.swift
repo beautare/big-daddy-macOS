@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "BigDaddy",
+    defaultLocalization: "en",
     platforms: [.macOS(.v12)],
     products: [
         .executable(name: "BigDaddy", targets: ["BigDaddy"])
@@ -19,6 +20,10 @@ let package = Package(
             ],
             path: "BigDaddy",
             exclude: ["Info.plist"]
+        ),
+        .testTarget(
+            name: "BigDaddyTests",
+            dependencies: ["BigDaddy"]
         )
     ]
 )
