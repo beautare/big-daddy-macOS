@@ -65,6 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var screenshotTimer: Timer?
     private var heartbeatTimer: Timer?
     private var commandTimer: Timer?
+    private var idleActivityTimer: Timer?
+    private let idleActivityPollInterval: TimeInterval = 5
     private var configTimer: Timer?
     /// 屏幕录制权限的授予/撤回都发生在系统设置里，没有公开的变更通知 API 可订阅，只能
     /// 轮询；这个定时器让菜单栏图标（盾牌旁的三角感叹号 ⇄ 眼睛）在用户刚授权/撤权后近乎实时地跟上，
@@ -1430,16 +1432,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     ///    不是"孩子清醒使用电脑的时间"）。screenUnlock 场景机器全程醒着，这一步是
     ///    无害的冗余刷新，不必单独判断 event 类型来跳过。
     private func handleResumeFromSystemEvent(event: EventType, auditLine: String) {
-        AuditLog.record(auditLine)
-        client.noteActivityFloor()
+        handleResume(event: event, auditLine: auditLine, resetActivityFloor: true)
+    }
+
+    private func stopIdleActivityMonitor() {
+        idleActivityTimer?.invalidate()
+        idleActivityTimer = nil
+    }
+
+    private func scheduleIdleActivityMonitor() {
+        stopIdleActivityMonitor()
+        guard wasIdle else { return }
+        idleActivityTimer = scheduleCommonModeTimer(
+            interval: idleActivityPollInterval,
+            repeats: true
+        ) { [weak self] timer in
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                guard self.wasIdle else {
+                    self.stopIdleActivityMonitor()
+                    return
+                }
+                guard !self.client.isIdle else { return }
+                self.handleResume(event: .resume)
+            }
+        }
+    }
+
+    private func handleResume(
+        event: EventType,
+        auditLine: String? = nil,
+        resetActivityFloor: Bool = false
+    ) {
+        if let auditLine { AuditLog.record(auditLine) }
+        if resetActivityFloor { client.noteActivityFloor() }
         wasIdle = false
+        stopIdleActivityMonitor()
         scheduleNextHeartbeat()
         scheduleNextCommandPoll()
         Task {
             await client.sendHeartbeat(event: event)
             await client.startBackfillIfNeeded()
+            let intervalBeforeResume = client.config.screenshotIntervalMins
             _ = await client.refreshConfig()
-            await MainActor.run { [weak self] in self?.syncTimeSessionState() }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.client.config.screenshotIntervalMins != intervalBeforeResume {
+                    self.scheduleScreenshotTimer()
+                }
+                self.syncTimeSessionState()
+                self.triggerImmediateCommandPollIfNeeded()
+            }
         }
     }
 
@@ -1478,6 +1524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         scheduleNextHeartbeat()
         scheduleNextCommandPoll()
+        scheduleIdleActivityMonitor()
 
         // 定期拉取配置，使家长在后端的开启/撤销近实时生效，并让状态变化对孩子端可见
         configTimer?.invalidate()
@@ -1499,25 +1546,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 guard let self else { return }
                 let previouslyIdle = self.wasIdle
                 let isIdle = self.client.isIdle
-                if !isIdle && previouslyIdle {
-                    // 从 IDLE 恢复 → 立即发送 RESUME 并拉取最新配置，恢复正常节奏。
-                    // 这是除 pollConfigForChildVisibility 之外唯一另一处调用 refreshConfig()
-                    // 却可能改变 screenshotIntervalMins 的地方：如果家长恰好在设备空闲期间
-                    // 改了截图间隔，这次 refreshConfig 会把新值同步进 client.config，但如果
-                    // 不在这里顺带重排 screenshotTimer，旧计时器会带着旧间隔继续跑——而且
-                    // 60 秒一次的 pollConfigForChildVisibility 下次执行时，config 已经是最新值，
-                    // 它自己的"变化前后对比"会发现"没有变化"，永远不会补上这次重排。
-                    await self.client.sendHeartbeat(event: .resume)
-                    let intervalBeforeResume = self.client.config.screenshotIntervalMins
-                    _ = await self.client.refreshConfig()
-                    if self.client.config.screenshotIntervalMins != intervalBeforeResume {
-                        self.scheduleScreenshotTimer()
-                    }
-                } else {
-                    await self.client.sendHeartbeat(event: isIdle ? .idle : .heartbeat)
+                let transition = ActivityStateTransition.resolve(previouslyIdle: previouslyIdle, isIdle: isIdle)
+                if transition == .resumed {
+                    self.handleResume(event: .resume)
+                    return
                 }
+
+                await self.client.sendHeartbeat(event: isIdle ? .idle : .heartbeat)
                 self.wasIdle = isIdle
                 self.scheduleNextHeartbeat()
+                if isIdle {
+                    self.scheduleIdleActivityMonitor()
+                } else {
+                    self.stopIdleActivityMonitor()
+                }
                 self.triggerImmediateCommandPollIfNeeded()
             }
         }
