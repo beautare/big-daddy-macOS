@@ -155,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     // MARK: - 时间约定（家长设定的可用时长）
 
-    /// 下拉旗帜面板，懒加载（首次需要展示时才创建 NSPanel）。
+    /// 下拉旗帜管理器，懒加载（首次需要展示时才按显示器创建 NSPanel）。
     private var timeFlag: TimeAgreementFlag?
     /// 驱动倒计时/里程碑检查的 1 秒定时器，仅在有进行中的约定时存活。
     private var timeSessionTimer: Timer?
