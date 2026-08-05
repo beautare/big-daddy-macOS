@@ -185,8 +185,8 @@ if [[ "${ENTITLEMENTS_XML}" != *"<key>com.apple.developer.system-extension.insta
   exit 1
 fi
 FILTER_ENTITLEMENTS_XML=$(codesign -d --entitlements - --xml "${FILTER_EXTENSION_APP_PATH}" 2>/dev/null | tr -d '\n')
-if [[ "${FILTER_ENTITLEMENTS_XML}" != *"<string>content-filter-provider</string>"* ]]; then
-  echo "ERROR: content-filter-provider entitlement missing from the signed system extension" >&2
+if [[ "${FILTER_ENTITLEMENTS_XML}" != *"<string>content-filter-provider-systemextension</string>"* ]]; then
+  echo "ERROR: content-filter-provider-systemextension entitlement missing from the signed system extension" >&2
   exit 1
 fi
 
