@@ -17,9 +17,19 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     private(set) var state: State = .unavailable
+    var onStateChanged: (() -> Void)?
+
     private var activationSubmitted = false
     private var activationCompleted = false
     private var configurationUpdateInFlight = false
+    private var configurationUpdatePending = false
+    private var currentConfiguration = WebFilterConfiguration()
+    private var currentIsDeviceBound = false
+    private var contentFilterEnabled = false
+
+    private var desiredFilterEnabled: Bool {
+        currentIsDeviceBound && currentConfiguration.enabled
+    }
 
     func statusReport(requestedRevision: Int64) -> WebFilterStatusReport {
         let systemExtensionState: WebFilterStatusReport.SystemExtensionState
@@ -45,6 +55,18 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             error = message
         }
 
+        guard desiredFilterEnabled else {
+            return WebFilterStatusReport(
+                systemExtensionState: systemExtensionState,
+                enforcementState: .passThrough,
+                requestedRevision: requestedRevision,
+                appliedRevision: requestedRevision,
+                ruleCount: 0,
+                lastAppliedAt: nil,
+                error: error
+            )
+        }
+
         guard let providerStatus = try? WebFilterSharedStore.loadStatus() else {
             return WebFilterStatusReport(
                 systemExtensionState: systemExtensionState,
@@ -57,9 +79,20 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             )
         }
 
+        let enforcementState: WebFilterStatusReport.EnforcementState
+        if contentFilterEnabled,
+           providerStatus.enforcementState == .enforcing,
+           providerStatus.appliedRevision == requestedRevision {
+            enforcementState = .enforcing
+        } else if providerStatus.enforcementState == .passThrough {
+            enforcementState = .passThrough
+        } else {
+            enforcementState = .unknown
+        }
+
         return WebFilterStatusReport(
             systemExtensionState: systemExtensionState,
-            enforcementState: providerStatus.enforcementState == .enforcing ? .enforcing : .passThrough,
+            enforcementState: enforcementState,
             requestedRevision: requestedRevision,
             appliedRevision: providerStatus.appliedRevision,
             ruleCount: providerStatus.ruleCount,
@@ -69,6 +102,9 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {
+        currentConfiguration = configuration
+        currentIsDeviceBound = isDeviceBound
+
         let policy = WebFilterPolicySnapshot(
             configuration: configuration,
             isDeviceBound: isDeviceBound
@@ -78,11 +114,11 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         } catch {
             state = .failed(error.localizedDescription)
             NSLog("BigDaddy: web filter policy could not be stored: \(error.localizedDescription)")
+            notifyStateChanged()
             return
         }
 
-        guard isDeviceBound else { return }
-        ensureInfrastructure()
+        applyDesiredFilterState()
     }
 
     nonisolated func request(
@@ -118,6 +154,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     private func handleUserApprovalRequired() {
         state = .awaitingUserApproval
         AuditLog.record("WEB_FILTER_SYSTEM_EXTENSION_AWAITING_APPROVAL")
+        notifyStateChanged()
     }
 
     private func handleActivationFinished(_ result: OSSystemExtensionRequest.Result) {
@@ -127,12 +164,18 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         case .completed:
             state = .approved
             AuditLog.record("WEB_FILTER_SYSTEM_EXTENSION_APPROVED")
-            enableContentFilter()
+            if desiredFilterEnabled {
+                enableContentFilter()
+            } else {
+                disableContentFilter()
+            }
         case .willCompleteAfterReboot:
             state = .restartRequired
             AuditLog.record("WEB_FILTER_SYSTEM_EXTENSION_RESTART_REQUIRED")
+            notifyStateChanged()
         @unknown default:
             state = .failed("Unknown system extension activation result")
+            notifyStateChanged()
         }
     }
 
@@ -140,9 +183,23 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         activationSubmitted = false
         state = .failed(message)
         AuditLog.record("WEB_FILTER_SYSTEM_EXTENSION_FAILED error=\(message)")
+        notifyStateChanged()
+    }
+
+    private func applyDesiredFilterState() {
+        if desiredFilterEnabled {
+            ensureInfrastructure()
+        } else {
+            disableContentFilter()
+        }
     }
 
     private func ensureInfrastructure() {
+        guard desiredFilterEnabled else {
+            disableContentFilter()
+            return
+        }
+
         if activationCompleted {
             enableContentFilter()
             return
@@ -155,6 +212,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         guard FileManager.default.fileExists(atPath: extensionURL.path) else {
             state = .unavailable
             NSLog("BigDaddy: embedded web filter system extension is unavailable")
+            notifyStateChanged()
             return
         }
 
@@ -166,19 +224,36 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         )
         request.delegate = self
         OSSystemExtensionManager.shared.submitRequest(request)
+        notifyStateChanged()
     }
 
     private func enableContentFilter() {
-        guard !configurationUpdateInFlight else { return }
+        guard desiredFilterEnabled else {
+            disableContentFilter()
+            return
+        }
+        guard !configurationUpdateInFlight else {
+            configurationUpdatePending = true
+            return
+        }
         configurationUpdateInFlight = true
         let manager = NEFilterManager.shared()
         manager.loadFromPreferences { [weak self] error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let error {
-                    self.configurationUpdateInFlight = false
+                    self.finishConfigurationUpdate()
                     self.state = .failed(error.localizedDescription)
                     AuditLog.record("WEB_FILTER_CONFIGURATION_LOAD_FAILED error=\(error.localizedDescription)")
+                    self.notifyStateChanged()
+                    self.applyPendingConfigurationUpdateIfNeeded()
+                    return
+                }
+
+                guard self.desiredFilterEnabled else {
+                    self.finishConfigurationUpdate()
+                    self.configurationUpdatePending = false
+                    self.disableContentFilter()
                     return
                 }
 
@@ -187,8 +262,11 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                    let existingConfiguration = manager.providerConfiguration,
                    existingConfiguration.filterSockets,
                    existingConfiguration.filterDataProviderBundleIdentifier == Self.extensionBundleIdentifier {
-                    self.configurationUpdateInFlight = false
+                    self.finishConfigurationUpdate()
+                    self.contentFilterEnabled = true
                     self.state = .configurationEnabled
+                    self.notifyStateChanged()
+                    self.applyPendingConfigurationUpdateIfNeeded()
                     return
                 }
 
@@ -204,17 +282,111 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                 manager.saveToPreferences { error in
                     Task { @MainActor [weak self] in
                         guard let self else { return }
-                        self.configurationUpdateInFlight = false
                         if let error {
+                            self.finishConfigurationUpdate()
                             self.state = .failed(error.localizedDescription)
                             AuditLog.record("WEB_FILTER_CONFIGURATION_SAVE_FAILED error=\(error.localizedDescription)")
+                            self.notifyStateChanged()
+                            self.applyPendingConfigurationUpdateIfNeeded()
                             return
                         }
+                        self.finishConfigurationUpdate()
+                        guard self.desiredFilterEnabled else {
+                            self.configurationUpdatePending = false
+                            self.disableContentFilter()
+                            return
+                        }
+                        self.contentFilterEnabled = true
                         self.state = .configurationEnabled
                         AuditLog.record("WEB_FILTER_CONFIGURATION_ENABLED")
+                        self.notifyStateChanged()
+                        self.applyPendingConfigurationUpdateIfNeeded()
                     }
                 }
             }
         }
+    }
+
+    private func disableContentFilter() {
+        guard !configurationUpdateInFlight else {
+            configurationUpdatePending = true
+            return
+        }
+        configurationUpdateInFlight = true
+        let manager = NEFilterManager.shared()
+        manager.loadFromPreferences { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let error {
+                    self.finishConfigurationUpdate()
+                    self.state = .failed(error.localizedDescription)
+                    AuditLog.record("WEB_FILTER_CONFIGURATION_LOAD_FAILED error=\(error.localizedDescription)")
+                    self.notifyStateChanged()
+                    self.applyPendingConfigurationUpdateIfNeeded()
+                    return
+                }
+
+                let isBigDaddyFilter = self.isBigDaddyFilter(manager)
+                self.contentFilterEnabled = manager.isEnabled && isBigDaddyFilter
+                if !self.contentFilterEnabled {
+                    self.finishConfigurationUpdate()
+                    self.markContentFilterDisabled()
+                    self.applyPendingConfigurationUpdateIfNeeded()
+                    return
+                }
+
+                manager.isEnabled = false
+                manager.saveToPreferences { error in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        if let error {
+                            self.finishConfigurationUpdate()
+                            self.state = .failed(error.localizedDescription)
+                            AuditLog.record("WEB_FILTER_CONFIGURATION_DISABLE_FAILED error=\(error.localizedDescription)")
+                            self.notifyStateChanged()
+                            self.applyPendingConfigurationUpdateIfNeeded()
+                            return
+                        }
+                        self.finishConfigurationUpdate()
+                        self.markContentFilterDisabled()
+                        AuditLog.record("WEB_FILTER_CONFIGURATION_DISABLED")
+                        self.applyPendingConfigurationUpdateIfNeeded()
+                    }
+                }
+            }
+        }
+    }
+
+    private func markContentFilterDisabled() {
+        contentFilterEnabled = false
+        switch state {
+        case .configurationEnabled:
+            state = .approved
+        case .failed:
+            state = activationCompleted ? .approved : .unavailable
+        default:
+            break
+        }
+        notifyStateChanged()
+    }
+
+    private func finishConfigurationUpdate() {
+        configurationUpdateInFlight = false
+    }
+
+    private func applyPendingConfigurationUpdateIfNeeded() {
+        if configurationUpdatePending {
+            configurationUpdatePending = false
+            applyDesiredFilterState()
+        }
+    }
+
+    private func isBigDaddyFilter(_ manager: NEFilterManager) -> Bool {
+        manager.grade == .firewall
+            && manager.providerConfiguration?.filterDataProviderBundleIdentifier == Self.extensionBundleIdentifier
+    }
+
+    private func notifyStateChanged() {
+        onStateChanged?()
     }
 }

@@ -221,6 +221,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         print("BigDaddy: runtime prepared")
         client.startNetworkMonitoring()
         print("BigDaddy: network monitoring started")
+        webFilterController.onStateChanged = { [weak self] in
+            self?.scheduleWebFilterStatusReport()
+        }
         webFilterController.synchronize(
             configuration: client.config.webFilter,
             isDeviceBound: client.config.bound
@@ -2479,14 +2482,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 那里的根路径会直接 302 到登录页，没有下载入口——家长照着这段文字去孩子的
         // Mac 上打开它，看到的只会是一个登录表单，不是下载按钮，白跑一趟还更困惑。
         // 下载页在营销站根域名（bigdaddy.mom）上，从 dashboard 子域名剥掉 "dashboard."
-        // 前缀就是它；剥不掉时（本地开发环境用的是不分域名的 localhost，没有这个前缀）
-        // 原样使用——开发环境本来就不分家，dashboardBaseURL 本身已经是对的地址。
+        // 前缀就是它。本地开发环境的 localhost 只能代表当前这台 Mac，不能让孩子在另一台
+        // Mac 上照抄，所以一律回落到生产官网。
         let dashboardHost = client.dashboardBaseURL.host ?? "dashboard.bigdaddy.mom"
         let dashboardPrefix = "dashboard."
-        let marketingHost = dashboardHost.hasPrefix(dashboardPrefix)
-            ? String(dashboardHost.dropFirst(dashboardPrefix.count))
-            : dashboardHost
-        let marketingURL = URL(string: "https://\(marketingHost)") ?? client.dashboardBaseURL
+        let marketingHost: String
+        if Self.isLocalDashboardHost(dashboardHost) {
+            marketingHost = "bigdaddy.mom"
+        } else if dashboardHost.hasPrefix(dashboardPrefix) {
+            marketingHost = String(dashboardHost.dropFirst(dashboardPrefix.count))
+        } else {
+            marketingHost = dashboardHost
+        }
+        let marketingURL = URL(string: "https://\(marketingHost)")!
 
         let alert = NSAlert()
         alert.messageText = Localization.string(
@@ -2522,6 +2530,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if alert.runModal() == .alertSecondButtonReturn {
             NSWorkspace.shared.open(marketingURL)
         }
+    }
+
+    private static func isLocalDashboardHost(_ host: String) -> Bool {
+        host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 
     /// 在访达中定位本机守护记录文件，供孩子/家长查看或导出
