@@ -34,6 +34,20 @@ struct DeviceIdentity {
     let secretHash: String
 }
 
+enum ConfigRefreshResult: Equatable {
+    case successChanged
+    case successUnchanged
+    case failed
+
+    var succeeded: Bool {
+        self != .failed
+    }
+
+    var changed: Bool {
+        self == .successChanged
+    }
+}
+
 /// 时间约定：家长在仪表盘给孩子设定的一段可用时长，权威状态随 ConfigResponse.timeSession
 /// 下发（nil = 当前没有进行中的约定）。只做墙钟模式——remainingSeconds 是**服务端在响应
 /// 那一刻**算出的剩余秒数，客户端把它加到本机单调时钟（ProcessInfo.systemUptime）上得出
@@ -94,6 +108,7 @@ struct ClientConfig: Codable, Equatable {
     var heartbeatIdleSeconds: Int = 900
     var idleThresholdSeconds: Int = 180
     var hasPendingCommand: Bool = false
+    var webFilter: WebFilterConfiguration = WebFilterConfiguration()
     /// 当前活跃的时间约定（nil = 没有）。这是客户端获取会话状态的**唯一权威来源**：
     /// SYNC_TIME_SESSION 命令只是门铃，冷启动、断网恢复、睡眠唤醒全部走这条路恢复。
     var timeSession: TimeSession? = nil
@@ -117,6 +132,7 @@ struct ClientConfig: Codable, Equatable {
         heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 900
         idleThresholdSeconds = try container.decodeIfPresent(Int.self, forKey: .idleThresholdSeconds) ?? 180
         hasPendingCommand = try container.decodeIfPresent(Bool.self, forKey: .hasPendingCommand) ?? false
+        webFilter = try container.decodeIfPresent(WebFilterConfiguration.self, forKey: .webFilter) ?? WebFilterConfiguration()
         timeSession = try container.decodeIfPresent(TimeSession.self, forKey: .timeSession)
     }
 }
@@ -145,6 +161,7 @@ final class SwitchCounter: @unchecked Sendable {
 
 final class BigDaddyClient {
     static var lastSharedInstance: BigDaddyClient?
+    static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
 
     let baseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")!
     /// 家长仪表盘地址：正式 .app 由打包脚本写入 Info.plist（BigDaddyDashboardBaseURL），
@@ -373,22 +390,28 @@ final class BigDaddyClient {
                 config.bound = false
                 config.hasPendingCommand = false
                 ConfigStore.save(config)
+                NotificationCenter.default.post(
+                    name: Self.webFilterConfigChangedNotification,
+                    object: self
+                )
             }
         }
     }
 
     @discardableResult
-    func refreshConfig() async -> Bool {
+    func refreshConfig() async -> ConfigRefreshResult {
         let data: Data
         do {
             data = try await request(path: "/bigdaddy/client/config", method: "GET", body: nil, signed: true)
         } catch let error as BigDaddyAPIError where error.isAuthFailure {
             markCredentialsInvalid()
-            return false
+            return .failed
         } catch {
-            return false
+            return .failed
         }
-        guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else { return false }
+        guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else {
+            return .failed
+        }
         let previous = config
         let remote = response.data
         if remote.bound {
@@ -404,7 +427,42 @@ final class BigDaddyClient {
             config.hasPendingCommand = false
             ConfigStore.save(config)
         }
-        return config != previous
+        if config.webFilter != previous.webFilter || config.bound != previous.bound {
+            NotificationCenter.default.post(
+                name: Self.webFilterConfigChangedNotification,
+                object: self
+            )
+        }
+        return config != previous ? .successChanged : .successUnchanged
+    }
+
+    func reportWebFilterStatus(_ report: WebFilterStatusReport) async {
+        guard config.bound, !credentialsInvalid else { return }
+        var body: [String: Any] = [
+            "systemExtensionState": report.systemExtensionState.rawValue,
+            "enforcementState": report.enforcementState.rawValue,
+            "requestedRevision": report.requestedRevision,
+            "appliedRevision": report.appliedRevision,
+            "ruleCount": report.ruleCount
+        ]
+        if let lastAppliedAt = report.lastAppliedAt {
+            body["lastAppliedAt"] = ISO8601DateFormatter().string(from: lastAppliedAt)
+        }
+        if let error = report.error {
+            body["error"] = error
+        }
+        do {
+            _ = try await request(
+                path: "/bigdaddy/client/web-filter/status",
+                method: "POST",
+                body: body,
+                signed: true
+            )
+        } catch let error as BigDaddyAPIError where error.isAuthFailure {
+            markCredentialsInvalid()
+        } catch {
+            NSLog("BigDaddy: web filter status report failed: \(error.localizedDescription)")
+        }
     }
 
     /// 记录最近一次截图时间，随心跟上报
@@ -1589,11 +1647,15 @@ final class BigDaddyClient {
         // 一次 poll 可能同时取回多条这样的门铃（家长连续操作了几次"改约/中断"），
         // 逐条 ack 但只需要刷新一次配置，不必每条各刷一次。
         let timeSessionCommands = response.data.filter { $0.type == "SYNC_TIME_SESSION" }
+        let configCommands = response.data.filter { $0.type == "SYNC_CONFIG" }
         // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在仪表盘改完压缩质量/
         // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
         // 可能落后 60 秒配置轮询）的旧配置，家长对比时就会觉得"改了质量没区别/压缩没生效"。
-        if !screenshotCommands.isEmpty || !timeSessionCommands.isEmpty {
-            _ = await refreshConfig()
+        let refreshResult: ConfigRefreshResult?
+        if !screenshotCommands.isEmpty || !timeSessionCommands.isEmpty || !configCommands.isEmpty {
+            refreshResult = await refreshConfig()
+        } else {
+            refreshResult = nil
         }
         for command in screenshotCommands {
             // 之前无条件回执 SUCCEEDED，哪怕截图因为未开启/无权限/上传失败而根本没发生，
@@ -1606,10 +1668,25 @@ final class BigDaddyClient {
             )
         }
         if !timeSessionCommands.isEmpty {
+            let succeeded = refreshResult?.succeeded == true
             for command in timeSessionCommands {
-                await ack(commandId: command.commandId, status: "SUCCEEDED", message: "Time session synced")
+                await ack(
+                    commandId: command.commandId,
+                    status: succeeded ? "SUCCEEDED" : "FAILED",
+                    message: succeeded ? "Time session synced" : "Time session configuration refresh failed"
+                )
             }
-            NotificationCenter.default.post(name: Self.timeSessionSyncedNotification, object: nil)
+            if succeeded {
+                NotificationCenter.default.post(name: Self.timeSessionSyncedNotification, object: nil)
+            }
+        }
+        let configSynced = refreshResult?.succeeded == true
+        for command in configCommands {
+            await ack(
+                commandId: command.commandId,
+                status: configSynced ? "SUCCEEDED" : "FAILED",
+                message: configSynced ? "Configuration synced" : "Configuration refresh failed"
+            )
         }
     }
 

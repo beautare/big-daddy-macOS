@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 APP_DIR="${BUILD_DIR}/Release/BigDaddy.app"
+FILTER_DERIVED_DATA="${BUILD_DIR}/FilterDerivedData"
+FILTER_EXTENSION_NAME="BigDaddyWebFilter.systemextension"
+FILTER_EXTENSION_BUILD_PATH="${FILTER_DERIVED_DATA}/Build/Products/Release/${FILTER_EXTENSION_NAME}"
+FILTER_EXTENSION_APP_PATH="${APP_DIR}/Contents/Library/SystemExtensions/${FILTER_EXTENSION_NAME}"
 DIST_DIR="${ROOT_DIR}/dist"
 STAGING_DIR="${BUILD_DIR}/staging"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
@@ -16,16 +20,19 @@ ARCH="${ARCH:-universal}"
 case "${ARCH}" in
   universal)
     ARCH_FLAGS=(--arch arm64 --arch x86_64)
+    XCODE_ARCHS="arm64 x86_64"
     DMG_SUFFIX=""
     VOLNAME="BigDaddy Installer"
     ;;
   arm64)
     ARCH_FLAGS=(--arch arm64)
+    XCODE_ARCHS="arm64"
     DMG_SUFFIX="-arm64"
     VOLNAME="BigDaddy Installer (Apple Silicon)"
     ;;
   x86_64)
     ARCH_FLAGS=(--arch x86_64)
+    XCODE_ARCHS="x86_64"
     DMG_SUFFIX="-x86_64"
     VOLNAME="BigDaddy Installer (Intel)"
     ;;
@@ -68,10 +75,26 @@ mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources" "${APP_DIR}
 swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}"
 BIN_DIR=$(swift build --package-path "${ROOT_DIR}" -c release "${ARCH_FLAGS[@]}" --show-bin-path)
 
+xcodebuild \
+  -project "${ROOT_DIR}/BigDaddyFilterExtension.xcodeproj" \
+  -scheme BigDaddyWebFilter \
+  -configuration Release \
+  -derivedDataPath "${FILTER_DERIVED_DATA}" \
+  -destination "generic/platform=macOS" \
+  ARCHS="${XCODE_ARCHS}" \
+  ONLY_ACTIVE_ARCH=NO \
+  MARKETING_VERSION="${VERSION}" \
+  CURRENT_PROJECT_VERSION="${BUILD_NUMBER}" \
+  CODE_SIGNING_ALLOWED=NO \
+  COMPILER_INDEX_STORE_ENABLE=NO \
+  build
+
 cp "${BIN_DIR}/BigDaddy" "${APP_DIR}/Contents/MacOS/BigDaddy"
 cp "${ROOT_DIR}/BigDaddy/Info.plist" "${APP_DIR}/Contents/Info.plist"
 # 应用图标（由 scripts/generate_appicon.swift 生成后提交进仓库）
 cp "${ROOT_DIR}/BigDaddy/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
+mkdir -p "${APP_DIR}/Contents/Library/SystemExtensions"
+cp -R "${FILTER_EXTENSION_BUILD_PATH}" "${FILTER_EXTENSION_APP_PATH}"
 # 系统权限说明走 InfoPlist.strings：中文环境统一显示简体，其他语言回退英文。
 for LOCALIZATION in Base.lproj zh_CN.lproj zh_HK.lproj zh_TW.lproj; do
   cp -R "${ROOT_DIR}/BigDaddy/${LOCALIZATION}" "${APP_DIR}/Contents/Resources/${LOCALIZATION}"
@@ -97,6 +120,30 @@ install_name_tool -add_rpath @executable_path/../Frameworks "${APP_DIR}/Contents
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAPIBaseURL ${BIGDADDY_API_BASE_URL:-https://proxy-ko.bigdaddy.mom/api/v1}" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyDashboardBaseURL ${BIGDADDY_DASHBOARD_BASE_URL:-https://dashboard.bigdaddy.mom}" "${APP_DIR}/Contents/Info.plist"
 
+if [[ "${CODESIGN_IDENTITY}" == "-" ]]; then
+  TEAM_IDENTIFIER_PREFIX=""
+else
+  : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required for Network Extension signing}"
+  : "${BIGDADDY_APP_PROVISIONING_PROFILE:?BIGDADDY_APP_PROVISIONING_PROFILE is required for Network Extension signing}"
+  : "${BIGDADDY_FILTER_PROVISIONING_PROFILE:?BIGDADDY_FILTER_PROVISIONING_PROFILE is required for Network Extension signing}"
+  TEAM_IDENTIFIER_PREFIX="${APPLE_TEAM_ID}."
+  cp "${BIGDADDY_APP_PROVISIONING_PROFILE}" "${APP_DIR}/Contents/embedded.provisionprofile"
+  cp "${BIGDADDY_FILTER_PROVISIONING_PROFILE}" "${FILTER_EXTENSION_APP_PATH}/Contents/embedded.provisionprofile"
+fi
+
+APP_GROUP_IDENTIFIER="${TEAM_IDENTIFIER_PREFIX}group.vip.bigdaddy.shared"
+FILTER_MACH_SERVICE_NAME="${APP_GROUP_IDENTIFIER}.BigDaddyWebFilter"
+/usr/libexec/PlistBuddy -c "Set :BigDaddyAppGroupIdentifier ${APP_GROUP_IDENTIFIER}" "${APP_DIR}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :BigDaddyAppGroupIdentifier ${APP_GROUP_IDENTIFIER}" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :NetworkExtension:NEMachServiceName ${FILTER_MACH_SERVICE_NAME}" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist"
+
+HOST_ENTITLEMENTS="${BUILD_DIR}/resolved-host.entitlements"
+FILTER_ENTITLEMENTS="${BUILD_DIR}/resolved-filter.entitlements"
+cp "${ROOT_DIR}/entitlements.plist" "${HOST_ENTITLEMENTS}"
+cp "${ROOT_DIR}/BigDaddyFilterExtension/BigDaddyFilterExtension.entitlements" "${FILTER_ENTITLEMENTS}"
+/usr/libexec/PlistBuddy -c "Set :com.apple.security.application-groups:0 ${APP_GROUP_IDENTIFIER}" "${HOST_ENTITLEMENTS}"
+/usr/libexec/PlistBuddy -c "Set :com.apple.security.application-groups:0 ${APP_GROUP_IDENTIFIER}" "${FILTER_ENTITLEMENTS}"
+
 # 签名顺序：先签内嵌的 framework（含其内部 XPC Services），再签外层 app bundle
 #
 # --options runtime（Hardened Runtime）是公证的硬性要求，同时它会**默认禁止本 App 发送
@@ -108,11 +155,13 @@ install_name_tool -add_rpath @executable_path/../Frameworks "${APP_DIR}/Contents
 # 另注：entitlements.plist 里**不能写 XML 注释**。codesign 会把它交给 AMFI 的严格解析器，
 # 遇到注释直接 "AMFIUnserializeXML: syntax error" 整个打包失败，所以说明都写在这里。
 if [[ "${CODESIGN_IDENTITY}" == "-" ]]; then
+  codesign --force --sign "-" --entitlements "${FILTER_ENTITLEMENTS}" "${FILTER_EXTENSION_APP_PATH}"
   codesign --force --deep --sign "-" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
-  codesign --force --sign "-" --entitlements "${ROOT_DIR}/entitlements.plist" "${APP_DIR}"
+  codesign --force --sign "-" --entitlements "${HOST_ENTITLEMENTS}" "${APP_DIR}"
 else
+  codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" --entitlements "${FILTER_ENTITLEMENTS}" "${FILTER_EXTENSION_APP_PATH}"
   codesign --force --deep --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${APP_DIR}/Contents/Frameworks/Sparkle.framework"
-  codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" --entitlements "${ROOT_DIR}/entitlements.plist" "${APP_DIR}"
+  codesign --force --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" --entitlements "${HOST_ENTITLEMENTS}" "${APP_DIR}"
 fi
 
 codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
@@ -129,6 +178,15 @@ ENTITLEMENTS_XML=$(codesign -d --entitlements - --xml "${APP_DIR}" 2>/dev/null |
 if [[ "${ENTITLEMENTS_XML}" != *"<key>com.apple.security.automation.apple-events</key><true/>"* ]]; then
   echo "ERROR: com.apple.security.automation.apple-events missing from the signed app;" >&2
   echo "       browser URL capture would silently fail in the released build." >&2
+  exit 1
+fi
+if [[ "${ENTITLEMENTS_XML}" != *"<key>com.apple.developer.system-extension.install</key><true/>"* ]]; then
+  echo "ERROR: com.apple.developer.system-extension.install missing from the signed app" >&2
+  exit 1
+fi
+FILTER_ENTITLEMENTS_XML=$(codesign -d --entitlements - --xml "${FILTER_EXTENSION_APP_PATH}" 2>/dev/null | tr -d '\n')
+if [[ "${FILTER_ENTITLEMENTS_XML}" != *"<string>content-filter-provider</string>"* ]]; then
+  echo "ERROR: content-filter-provider entitlement missing from the signed system extension" >&2
   exit 1
 fi
 

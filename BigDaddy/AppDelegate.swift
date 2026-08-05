@@ -62,12 +62,14 @@ final class BindTokenMailbox: @unchecked Sendable {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, NSWindowDelegate, SPUUpdaterDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
+    private let webFilterController = WebFilterController()
     private var screenshotTimer: Timer?
     private var heartbeatTimer: Timer?
     private var commandTimer: Timer?
     private var idleActivityTimer: Timer?
     private let idleActivityPollInterval: TimeInterval = 5
     private var configTimer: Timer?
+    private var webFilterStatusReportTask: Task<Void, Never>?
     /// 屏幕录制权限的授予/撤回都发生在系统设置里，没有公开的变更通知 API 可订阅，只能
     /// 轮询；这个定时器让菜单栏图标（盾牌旁的三角感叹号 ⇄ 眼睛）在用户刚授权/撤权后近乎实时地跟上，
     /// 不用等到下一次远端配置轮询（60 秒）。见 refreshIconIfPermissionChanged。
@@ -219,6 +221,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         print("BigDaddy: runtime prepared")
         client.startNetworkMonitoring()
         print("BigDaddy: network monitoring started")
+        webFilterController.synchronize(
+            configuration: client.config.webFilter,
+            isDeviceBound: client.config.bound
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onWebFilterConfigChanged),
+            name: BigDaddyClient.webFilterConfigChangedNotification,
+            object: client
+        )
+        scheduleWebFilterStatusReport()
         #if !DEBUG
         // DEBUG（Xcode 直接运行 / swift build）的可执行文件不在任何 .app bundle 里，
         // 没有 Info.plist，Sparkle 找不到 SUFeedURL/SUPublicEDKey 必然启动失败、弹出
@@ -268,7 +281,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         print("BigDaddy: timers scheduled")
         Task {
             print("BigDaddy: async task background started")
-            let configChanged = await client.refreshConfig()
+            let configRefreshResult = await client.refreshConfig()
+            let configChanged = configRefreshResult.changed
             print("BigDaddy: async task background heartbeat sending started")
             // 本次启动永远是 START 事件；如果检测到上次异常终止，通过
             // previousCrashAt 字段"如实补报"，而不是把这次正常启动本身
@@ -324,6 +338,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 里发一次，随后 NSApp.terminate(nil) 触发本方法时又发一次，导致家长端收到
         // 两条 SHUTDOWN 记录。若进程是被信号杀死（非本方法触发的正常退出），由
         // installSignalHandlers 里的 FORCE_KILL 上报负责如实反映。
+    }
+
+    @objc private func onWebFilterConfigChanged() {
+        webFilterController.synchronize(
+            configuration: client.config.webFilter,
+            isDeviceBound: client.config.bound
+        )
+        scheduleWebFilterStatusReport()
+    }
+
+    private func scheduleWebFilterStatusReport() {
+        webFilterStatusReportTask?.cancel()
+        webFilterStatusReportTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            await self.reportWebFilterStatus()
+        }
+    }
+
+    private func reportWebFilterStatus() async {
+        guard client.config.bound else { return }
+        let report = webFilterController.statusReport(
+            requestedRevision: client.config.webFilter.revision
+        )
+        await client.reportWebFilterStatus(report)
     }
 
     /// 重建整张菜单。
@@ -1048,7 +1091,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 if self.client.credentialsInvalid {
                     await self.client.register()
                 }
-                let changed = self.client.credentialsInvalid ? false : await self.client.refreshConfig()
+                let changed = self.client.credentialsInvalid
+                    ? false
+                    : await self.client.refreshConfig().changed
                 if self.client.config.bound {
                     // 绑定成功：立即发送一次心跳，让后端即时感知设备上线
                     await self.client.sendHeartbeat(event: .start)
@@ -1611,8 +1656,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
         var changed = false
         if !client.credentialsInvalid {
-            changed = await client.refreshConfig()
+            changed = await client.refreshConfig().changed
         }
+        await reportWebFilterStatus()
         let boundChanged = client.config.bound != boundBefore
         let credentialsChanged = client.credentialsInvalid != invalidBefore
         guard changed || boundChanged || credentialsChanged else { return }

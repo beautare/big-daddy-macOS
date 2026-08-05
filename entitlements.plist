@@ -6,5 +6,15 @@
   <false/>
   <key>com.apple.security.automation.apple-events</key>
   <true/>
+  <key>com.apple.security.application-groups</key>
+  <array>
+    <string>$(TeamIdentifierPrefix)group.vip.bigdaddy.shared</string>
+  </array>
+  <key>com.apple.developer.networking.networkextension</key>
+  <array>
+    <string>content-filter-provider</string>
+  </array>
+  <key>com.apple.developer.system-extension.install</key>
+  <true/>
 </dict>
 </plist>

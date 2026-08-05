@@ -10,6 +10,8 @@
   <string>vip.bigdaddy.monitor</string>
   <key>CFBundleName</key>
   <string>BigDaddy</string>
+  <key>BigDaddyAppGroupIdentifier</key>
+  <string>group.vip.bigdaddy.shared</string>
   <key>CFBundleShortVersionString</key>
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
@@ -27,6 +29,8 @@
   <true/>
   <key>NSAppleEventsUsageDescription</key>
   <string>BigDaddy needs to read the address of the current browser tab so a parent can accurately view browsing activity.</string>
+  <key>NSSystemExtensionUsageDescription</key>
+  <string>BigDaddy uses a network content filter to enforce domain rules configured by a parent.</string>
   <key>BigDaddyAPIBaseURL</key>
   <string>http://localhost:8009/api/v1</string>
   <key>BigDaddyDashboardBaseURL</key>
