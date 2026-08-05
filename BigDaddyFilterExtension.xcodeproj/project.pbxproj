@@ -20,7 +20,7 @@
 		200000000000000000000004 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 		200000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000006 /* BigDaddyFilterExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = BigDaddyFilterExtension.entitlements; sourceTree = "<group>"; };
-		200000000000000000000007 /* BigDaddyWebFilter.systemextension */ = {isa = PBXFileReference; explicitFileType = wrapper.system-extension; includeInIndex = 0; path = BigDaddyWebFilter.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		200000000000000000000007 /* vip.bigdaddy.monitor.web-filter-extension.systemextension */ = {isa = PBXFileReference; explicitFileType = wrapper.system-extension; includeInIndex = 0; path = "vip.bigdaddy.monitor.web-filter-extension.systemextension"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -67,7 +67,7 @@
 		400000000000000000000004 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				200000000000000000000007 /* BigDaddyWebFilter.systemextension */,
+				200000000000000000000007 /* vip.bigdaddy.monitor.web-filter-extension.systemextension */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -88,8 +88,8 @@
 			dependencies = (
 			);
 			name = BigDaddyWebFilter;
-			productName = BigDaddyWebFilter;
-			productReference = 200000000000000000000007 /* BigDaddyWebFilter.systemextension */;
+			productName = "vip.bigdaddy.monitor.web-filter-extension";
+			productReference = 200000000000000000000007 /* vip.bigdaddy.monitor.web-filter-extension.systemextension */;
 			productType = "com.apple.product-type.system-extension";
 		};
 /* End PBXNativeTarget section */
@@ -187,7 +187,8 @@
 				MACOSX_DEPLOYMENT_TARGET = 12.4;
 				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "vip.bigdaddy.monitor.web-filter-extension";
-				PRODUCT_NAME = BigDaddyWebFilter;
+				PRODUCT_MODULE_NAME = BigDaddyWebFilter;
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				REGISTER_APP_GROUPS = YES;
 				SKIP_INSTALL = NO;
 				SWIFT_VERSION = 5.0;
@@ -210,7 +211,8 @@
 				MACOSX_DEPLOYMENT_TARGET = 12.4;
 				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "vip.bigdaddy.monitor.web-filter-extension";
-				PRODUCT_NAME = BigDaddyWebFilter;
+				PRODUCT_MODULE_NAME = BigDaddyWebFilter;
+				PRODUCT_NAME = "$(PRODUCT_BUNDLE_IDENTIFIER)";
 				REGISTER_APP_GROUPS = YES;
 				SKIP_INSTALL = NO;
 				SWIFT_VERSION = 5.0;

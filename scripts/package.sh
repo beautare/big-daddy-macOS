@@ -5,7 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 APP_DIR="${BUILD_DIR}/Release/BigDaddy.app"
 FILTER_DERIVED_DATA="${BUILD_DIR}/FilterDerivedData"
-FILTER_EXTENSION_NAME="BigDaddyWebFilter.systemextension"
+FILTER_EXTENSION_BUNDLE_IDENTIFIER="vip.bigdaddy.monitor.web-filter-extension"
+FILTER_EXTENSION_NAME="${FILTER_EXTENSION_BUNDLE_IDENTIFIER}.systemextension"
 FILTER_EXTENSION_BUILD_PATH="${FILTER_DERIVED_DATA}/Build/Products/Release/${FILTER_EXTENSION_NAME}"
 FILTER_EXTENSION_APP_PATH="${APP_DIR}/Contents/Library/SystemExtensions/${FILTER_EXTENSION_NAME}"
 DIST_DIR="${ROOT_DIR}/dist"
@@ -42,9 +43,10 @@ case "${ARCH}" in
     ;;
 esac
 
-# 版本号单一来源：优先显式传入的 VERSION，其次最近的 git tag（去掉 v 前缀），
-# 都没有时才退回仓库 Info.plist 里的占位值（例如无 tag 的全新 checkout）
-VERSION="${VERSION:-$(git -C "${ROOT_DIR}" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')}"
+# 版本号单一来源：优先显式传入的 VERSION，其次当前提交可达的最高版本 tag（去掉 v 前缀），
+# 都没有时才退回仓库 Info.plist 里的占位值（例如无 tag 的全新 checkout）。按版本排序可避免
+# 同一个提交同时存在多个 tag 时，git describe 任意选中较旧版本。
+VERSION="${VERSION:-$(git -C "${ROOT_DIR}" tag --merged HEAD --list 'v[0-9]*' --sort=-v:refname | sed -n '1{s/^v//;p;}')}"
 if [[ -z "${VERSION}" ]]; then
   VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "${ROOT_DIR}/BigDaddy/Info.plist")
 fi
@@ -136,6 +138,20 @@ FILTER_MACH_SERVICE_NAME="${APP_GROUP_IDENTIFIER}.BigDaddyWebFilter"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAppGroupIdentifier ${APP_GROUP_IDENTIFIER}" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAppGroupIdentifier ${APP_GROUP_IDENTIFIER}" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :NetworkExtension:NEMachServiceName ${FILTER_MACH_SERVICE_NAME}" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist"
+
+FILTER_BUNDLE_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist")
+FILTER_EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist")
+FILTER_RESOLVED_MACH_SERVICE_NAME=$(/usr/libexec/PlistBuddy -c "Print :NetworkExtension:NEMachServiceName" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist")
+if [[ "${FILTER_EXTENSION_NAME}" != "${FILTER_BUNDLE_IDENTIFIER}.systemextension" || "${FILTER_EXECUTABLE}" != "${FILTER_BUNDLE_IDENTIFIER}" ]]; then
+  echo "ERROR: system extension service path must match its bundle identifier" >&2
+  echo "       wrapper=${FILTER_EXTENSION_NAME}, executable=${FILTER_EXECUTABLE}, bundle=${FILTER_BUNDLE_IDENTIFIER}" >&2
+  exit 1
+fi
+if [[ "${FILTER_RESOLVED_MACH_SERVICE_NAME}" != "${APP_GROUP_IDENTIFIER}."* ]]; then
+  echo "ERROR: NEMachServiceName must use an entitled app group as its prefix" >&2
+  echo "       mach-service=${FILTER_RESOLVED_MACH_SERVICE_NAME}, app-group=${APP_GROUP_IDENTIFIER}" >&2
+  exit 1
+fi
 
 HOST_ENTITLEMENTS="${BUILD_DIR}/resolved-host.entitlements"
 FILTER_ENTITLEMENTS="${BUILD_DIR}/resolved-filter.entitlements"

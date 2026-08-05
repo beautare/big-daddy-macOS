@@ -186,7 +186,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
 
         let extensionURL = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Library/SystemExtensions")
-            .appendingPathComponent("BigDaddyWebFilter.systemextension")
+            .appendingPathComponent("\(Self.extensionBundleIdentifier).systemextension")
         guard FileManager.default.fileExists(atPath: extensionURL.path) else {
             state = .unavailable
             NSLog("BigDaddy: embedded web filter system extension is unavailable")
