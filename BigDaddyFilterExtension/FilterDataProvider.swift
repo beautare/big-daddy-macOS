@@ -3,12 +3,17 @@ import NetworkExtension
 
 final class FilterDataProvider: NEFilterDataProvider {
     private let policyLock = NSLock()
-    private var policy: WebFilterPolicySnapshot?
-    private var providerStatus: WebFilterProviderStatus?
-    private var nextPolicyReloadAt: TimeInterval = 0
+    private var policy = WebFilterPolicySnapshot(
+        configuration: WebFilterConfiguration(),
+        isDeviceBound: false,
+        appliedAt: Date(timeIntervalSince1970: 0)
+    )
+    private var configurationObservation: NSKeyValueObservation?
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
-        reloadPolicy()
+        configurationObservation = observe(\.filterConfiguration, options: [.initial, .new]) { [weak self] _, _ in
+            self?.reloadPolicy()
+        }
         completionHandler(nil)
     }
 
@@ -16,6 +21,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         with reason: NEProviderStopReason,
         completionHandler: @escaping () -> Void
     ) {
+        configurationObservation = nil
         completionHandler()
     }
 
@@ -30,49 +36,18 @@ final class FilterDataProvider: NEFilterDataProvider {
     private func currentPolicy() -> WebFilterPolicySnapshot {
         policyLock.lock()
         defer { policyLock.unlock() }
-
-        let now = ProcessInfo.processInfo.systemUptime
-        if now >= nextPolicyReloadAt {
-            reloadPolicyLocked()
-            nextPolicyReloadAt = now + 1
-        }
-        return policy!
+        return policy
     }
 
     private func reloadPolicy() {
         policyLock.lock()
-        reloadPolicyLocked()
-        nextPolicyReloadAt = ProcessInfo.processInfo.systemUptime + 1
-        policyLock.unlock()
-    }
-
-    private func reloadPolicyLocked() {
-        let loadedPolicy = try? WebFilterSharedStore.loadPolicy()
-        if policy == nil {
-            policy = loadedPolicy ?? WebFilterPolicySnapshot(
+        policy = WebFilterPolicyTransport.policy(from: filterConfiguration.vendorConfiguration)
+            ?? WebFilterPolicySnapshot(
                 configuration: WebFilterConfiguration(),
                 isDeviceBound: false,
                 appliedAt: Date(timeIntervalSince1970: 0)
             )
-        } else if let loadedPolicy {
-            policy = loadedPolicy
-        }
-
-        let current = policy!
-        let status = WebFilterProviderStatus(
-            systemExtensionState: .approved,
-            enforcementState: current.enabled ? .enforcing : .passThrough,
-            appliedRevision: current.revision,
-            ruleCount: current.blockedDomains.count,
-            lastAppliedAt: Date()
-        )
-        guard providerStatus.map({ status.hasSamePolicyState(as: $0) }) != true else { return }
-        do {
-            try WebFilterSharedStore.saveStatus(status)
-            providerStatus = status
-        } catch {
-            NSLog("BigDaddyWebFilter: provider status could not be stored: \(error.localizedDescription)")
-        }
+        policyLock.unlock()
     }
 
     private func hostname(from flow: NEFilterFlow) -> String? {

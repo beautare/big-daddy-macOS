@@ -10,6 +10,8 @@
   <string>vip.bigdaddy.monitor</string>
   <key>CFBundleName</key>
   <string>BigDaddy</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
   <key>BigDaddyAppGroupIdentifier</key>
   <string>group.vip.bigdaddy.shared</string>
   <key>CFBundleShortVersionString</key>

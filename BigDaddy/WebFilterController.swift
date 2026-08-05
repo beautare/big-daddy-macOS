@@ -26,6 +26,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     private var currentConfiguration = WebFilterConfiguration()
     private var currentIsDeviceBound = false
     private var contentFilterEnabled = false
+    private var lastConfigurationAppliedAt: Date?
 
     private var desiredFilterEnabled: Bool {
         currentIsDeviceBound && currentConfiguration.enabled
@@ -67,7 +68,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             )
         }
 
-        guard let providerStatus = try? WebFilterSharedStore.loadStatus() else {
+        guard contentFilterEnabled else {
             return WebFilterStatusReport(
                 systemExtensionState: systemExtensionState,
                 enforcementState: .unknown,
@@ -79,24 +80,13 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             )
         }
 
-        let enforcementState: WebFilterStatusReport.EnforcementState
-        if contentFilterEnabled,
-           providerStatus.enforcementState == .enforcing,
-           providerStatus.appliedRevision == requestedRevision {
-            enforcementState = .enforcing
-        } else if providerStatus.enforcementState == .passThrough {
-            enforcementState = .passThrough
-        } else {
-            enforcementState = .unknown
-        }
-
         return WebFilterStatusReport(
             systemExtensionState: systemExtensionState,
-            enforcementState: enforcementState,
+            enforcementState: .enforcing,
             requestedRevision: requestedRevision,
-            appliedRevision: providerStatus.appliedRevision,
-            ruleCount: providerStatus.ruleCount,
-            lastAppliedAt: providerStatus.lastAppliedAt,
+            appliedRevision: requestedRevision,
+            ruleCount: currentConfiguration.blockedDomains.count,
+            lastAppliedAt: lastConfigurationAppliedAt,
             error: error
         )
     }
@@ -104,19 +94,6 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {
         currentConfiguration = configuration
         currentIsDeviceBound = isDeviceBound
-
-        let policy = WebFilterPolicySnapshot(
-            configuration: configuration,
-            isDeviceBound: isDeviceBound
-        )
-        do {
-            try WebFilterSharedStore.savePolicy(policy)
-        } catch {
-            state = .failed(error.localizedDescription)
-            NSLog("BigDaddy: web filter policy could not be stored: \(error.localizedDescription)")
-            notifyStateChanged()
-            return
-        }
 
         applyDesiredFilterState()
     }
@@ -145,7 +122,8 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     nonisolated func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
-        let message = error.localizedDescription
+        let nsError = error as NSError
+        let message = "\(nsError.domain) (\(nsError.code)): \(nsError.localizedDescription)"
         Task { @MainActor [weak self] in
             self?.handleActivationFailed(message)
         }
@@ -257,23 +235,23 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                     return
                 }
 
-                if manager.isEnabled,
-                   manager.grade == .firewall,
-                   let existingConfiguration = manager.providerConfiguration,
-                   existingConfiguration.filterSockets,
-                   existingConfiguration.filterDataProviderBundleIdentifier == Self.extensionBundleIdentifier {
-                    self.finishConfigurationUpdate()
-                    self.contentFilterEnabled = true
-                    self.state = .configurationEnabled
-                    self.notifyStateChanged()
-                    self.applyPendingConfigurationUpdateIfNeeded()
-                    return
-                }
-
                 let providerConfiguration = NEFilterProviderConfiguration()
                 providerConfiguration.filterSockets = true
                 providerConfiguration.filterDataProviderBundleIdentifier = Self.extensionBundleIdentifier
                 providerConfiguration.organization = "BigDaddy"
+                let policy = WebFilterPolicySnapshot(
+                    configuration: self.currentConfiguration,
+                    isDeviceBound: self.currentIsDeviceBound
+                )
+                do {
+                    providerConfiguration.vendorConfiguration = try WebFilterPolicyTransport.vendorConfiguration(for: policy)
+                } catch {
+                    self.finishConfigurationUpdate()
+                    self.state = .failed(error.localizedDescription)
+                    self.notifyStateChanged()
+                    self.applyPendingConfigurationUpdateIfNeeded()
+                    return
+                }
 
                 manager.localizedDescription = "BigDaddy Web Filter"
                 manager.providerConfiguration = providerConfiguration
@@ -297,6 +275,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                             return
                         }
                         self.contentFilterEnabled = true
+                        self.lastConfigurationAppliedAt = Date()
                         self.state = .configurationEnabled
                         AuditLog.record("WEB_FILTER_CONFIGURATION_ENABLED")
                         self.notifyStateChanged()

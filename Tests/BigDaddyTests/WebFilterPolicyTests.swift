@@ -45,6 +45,22 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertFalse(policy.enabled)
     }
 
+    func testPolicyRoundTripsThroughVendorConfiguration() throws {
+        let policy = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(
+                enabled: true,
+                revision: 8,
+                blockedDomains: [WebFilterRule(domain: "example.com", includeSubdomains: true)]
+            ),
+            isDeviceBound: true,
+            appliedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        let vendorConfiguration = try WebFilterPolicyTransport.vendorConfiguration(for: policy)
+
+        XCTAssertEqual(WebFilterPolicyTransport.policy(from: vendorConfiguration), policy)
+    }
+
     private func makePolicy(enabled: Bool, rules: [WebFilterRule]) -> WebFilterPolicySnapshot {
         WebFilterPolicySnapshot(
             configuration: WebFilterConfiguration(

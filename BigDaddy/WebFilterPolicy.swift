@@ -49,41 +49,16 @@ enum DomainName {
     }
 }
 
-enum WebFilterSharedStore {
-    static let appGroupInfoKey = "BigDaddyAppGroupIdentifier"
-    static let policyFileName = "web-filter-policy.json"
-    static let statusFileName = "web-filter-status.json"
+enum WebFilterPolicyTransport {
+    static let policyDataKey = "BigDaddyWebFilterPolicyData"
 
-    static func loadPolicy(bundle: Bundle = .main) throws -> WebFilterPolicySnapshot {
-        let data = try Data(contentsOf: fileURL(named: policyFileName, bundle: bundle))
-        return try decoder.decode(WebFilterPolicySnapshot.self, from: data)
+    static func vendorConfiguration(for policy: WebFilterPolicySnapshot) throws -> [String: Any] {
+        [policyDataKey: try encoder.encode(policy)]
     }
 
-    static func savePolicy(_ policy: WebFilterPolicySnapshot, bundle: Bundle = .main) throws {
-        let data = try encoder.encode(policy)
-        try data.write(to: fileURL(named: policyFileName, bundle: bundle), options: .atomic)
-    }
-
-    static func loadStatus(bundle: Bundle = .main) throws -> WebFilterProviderStatus {
-        let data = try Data(contentsOf: fileURL(named: statusFileName, bundle: bundle))
-        return try decoder.decode(WebFilterProviderStatus.self, from: data)
-    }
-
-    static func saveStatus(_ status: WebFilterProviderStatus, bundle: Bundle = .main) throws {
-        let data = try encoder.encode(status)
-        try data.write(to: fileURL(named: statusFileName, bundle: bundle), options: .atomic)
-    }
-
-    private static func fileURL(named fileName: String, bundle: Bundle) throws -> URL {
-        guard let appGroupIdentifier = bundle.object(forInfoDictionaryKey: appGroupInfoKey) as? String else {
-            throw WebFilterSharedStoreError.missingAppGroupIdentifier
-        }
-        guard let containerURL = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: appGroupIdentifier
-        ) else {
-            throw WebFilterSharedStoreError.containerUnavailable(appGroupIdentifier)
-        }
-        return containerURL.appendingPathComponent(fileName)
+    static func policy(from vendorConfiguration: [String: Any]?) -> WebFilterPolicySnapshot? {
+        guard let data = vendorConfiguration?[policyDataKey] as? Data else { return nil }
+        return try? decoder.decode(WebFilterPolicySnapshot.self, from: data)
     }
 
     private static let encoder: JSONEncoder = {
@@ -98,44 +73,6 @@ enum WebFilterSharedStore {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }()
-}
-
-enum WebFilterSharedStoreError: LocalizedError {
-    case missingAppGroupIdentifier
-    case containerUnavailable(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .missingAppGroupIdentifier:
-            return "BigDaddyAppGroupIdentifier is missing from Info.plist"
-        case .containerUnavailable(let identifier):
-            return "App Group container is unavailable: \(identifier)"
-        }
-    }
-}
-
-struct WebFilterProviderStatus: Codable, Equatable {
-    enum SystemExtensionState: String, Codable {
-        case approved = "APPROVED"
-    }
-
-    enum EnforcementState: String, Codable {
-        case passThrough = "PASS_THROUGH"
-        case enforcing = "ENFORCING"
-    }
-
-    let systemExtensionState: SystemExtensionState
-    let enforcementState: EnforcementState
-    let appliedRevision: Int64
-    let ruleCount: Int
-    let lastAppliedAt: Date
-
-    func hasSamePolicyState(as other: WebFilterProviderStatus) -> Bool {
-        systemExtensionState == other.systemExtensionState
-            && enforcementState == other.enforcementState
-            && appliedRevision == other.appliedRevision
-            && ruleCount == other.ruleCount
-    }
 }
 
 struct WebFilterStatusReport: Equatable {

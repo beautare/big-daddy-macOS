@@ -144,6 +144,31 @@ cp "${ROOT_DIR}/BigDaddyFilterExtension/BigDaddyFilterExtension.entitlements" "$
 /usr/libexec/PlistBuddy -c "Set :com.apple.security.application-groups:0 ${APP_GROUP_IDENTIFIER}" "${HOST_ENTITLEMENTS}"
 /usr/libexec/PlistBuddy -c "Set :com.apple.security.application-groups:0 ${APP_GROUP_IDENTIFIER}" "${FILTER_ENTITLEMENTS}"
 
+if [[ "${CODESIGN_IDENTITY}" != "-" ]]; then
+  HOST_PROFILE_PLIST="${BUILD_DIR}/host-profile.plist"
+  FILTER_PROFILE_PLIST="${BUILD_DIR}/filter-profile.plist"
+  security cms -D -i "${BIGDADDY_APP_PROVISIONING_PROFILE}" > "${HOST_PROFILE_PLIST}"
+  security cms -D -i "${BIGDADDY_FILTER_PROVISIONING_PROFILE}" > "${FILTER_PROFILE_PLIST}"
+
+  inject_profile_identity() {
+    local profile_plist="$1"
+    local entitlements_plist="$2"
+    local application_identifier
+    local team_identifier
+    local keychain_access_group
+    application_identifier=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.application-identifier" "${profile_plist}")
+    team_identifier=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.team-identifier" "${profile_plist}")
+    keychain_access_group=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:keychain-access-groups:0" "${profile_plist}")
+    /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string ${application_identifier}" "${entitlements_plist}"
+    /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string ${team_identifier}" "${entitlements_plist}"
+    /usr/libexec/PlistBuddy -c "Add :keychain-access-groups array" "${entitlements_plist}"
+    /usr/libexec/PlistBuddy -c "Add :keychain-access-groups:0 string ${keychain_access_group}" "${entitlements_plist}"
+  }
+
+  inject_profile_identity "${HOST_PROFILE_PLIST}" "${HOST_ENTITLEMENTS}"
+  inject_profile_identity "${FILTER_PROFILE_PLIST}" "${FILTER_ENTITLEMENTS}"
+fi
+
 # 签名顺序：先签内嵌的 framework（含其内部 XPC Services），再签外层 app bundle
 #
 # --options runtime（Hardened Runtime）是公证的硬性要求，同时它会**默认禁止本 App 发送
