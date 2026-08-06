@@ -232,7 +232,21 @@ if [[ "${FILTER_ENTITLEMENTS_XML}" != *"<string>content-filter-provider-systemex
 fi
 
 mkdir -p "${STAGING_DIR}"
-cp -R "${APP_DIR}" "${STAGING_DIR}/BigDaddy.app"
+ditto "${APP_DIR}" "${STAGING_DIR}/BigDaddy.app"
+STAGED_APP_PATH="${STAGING_DIR}/BigDaddy.app"
+STAGED_FILTER_PATH="${STAGED_APP_PATH}/Contents/Library/SystemExtensions/${FILTER_EXTENSION_NAME}"
+if [[ ! -d "${STAGED_FILTER_PATH}" ]]; then
+  echo "ERROR: staged app is missing the web filter system extension" >&2
+  exit 1
+fi
+codesign --verify --deep --strict --verbose=2 "${STAGED_APP_PATH}"
+
+STAGED_HOST_ENTITLEMENTS_XML=$(codesign -d --entitlements - --xml "${STAGED_APP_PATH}" 2>/dev/null | tr -d '\n')
+STAGED_FILTER_ENTITLEMENTS_XML=$(codesign -d --entitlements - --xml "${STAGED_FILTER_PATH}" 2>/dev/null | tr -d '\n')
+if [[ "${STAGED_HOST_ENTITLEMENTS_XML}" != *"<string>${APP_GROUP_IDENTIFIER}</string>"* || "${STAGED_FILTER_ENTITLEMENTS_XML}" != *"<string>${APP_GROUP_IDENTIFIER}</string>"* ]]; then
+  echo "ERROR: staged app and web filter must both retain the App Group entitlement" >&2
+  exit 1
+fi
 ln -s /Applications "${STAGING_DIR}/Applications"
 
 DMG_PATH="${DIST_DIR}/BigDaddy-v${VERSION}${DMG_SUFFIX}.dmg"

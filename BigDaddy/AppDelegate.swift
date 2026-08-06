@@ -224,7 +224,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         client.startNetworkMonitoring()
         print("BigDaddy: network monitoring started")
         webFilterController.onStateChanged = { [weak self] in
-            self?.scheduleWebFilterStatusReport()
+            guard let self else { return }
+            self.scheduleWebFilterStatusReport()
+            self.rebuildMenu()
+            self.updateStatusItemAppearance()
         }
         webFilterController.synchronize(
             configuration: client.config.webFilter,
@@ -489,6 +492,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             timeSessionMenuItem = item
         } else {
             timeSessionMenuItem = nil
+        }
+
+        if client.config.bound,
+           case .awaitingUserApproval = webFilterController.state {
+            menu.addItem(NSMenuItem(
+                title: Localization.string(
+                    zh: "⚠️ 授权网站访问限制…",
+                    en: "⚠️ Authorize Website Access Restrictions…"
+                ),
+                action: #selector(openWebFilterAuthorization), keyEquivalent: ""
+            ))
+            menu.addItem(.separator())
         }
 
         // 屏幕录制"就差最后一步"的兜底提醒。
@@ -1154,11 +1169,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let on = client.config.screenshotEnabled
         let missingScreenRecording = on && !checkScreenRecordingPermission()
         let missingAutomation = client.config.bound && !automationDeniedBundleIDs.isEmpty
+        let awaitingWebFilterApproval: Bool
+        if case .awaitingUserApproval = webFilterController.state {
+            awaitingWebFilterApproval = true
+        } else {
+            awaitingWebFilterApproval = false
+        }
         // 辅助功能缺失也要让图标变成警示态：菜单里那条「⚠️ 辅助功能未授权 · 点此修复」
         // 是唯一的修复入口，而没有人会去点一个看起来一切正常的图标。少了这一条，那个
         // 入口等于藏在一扇没有门把手的门后面。
         let missingAccessibility = client.config.bound && !AXIsProcessTrustedWithOptions(nil)
-        let missingPermission = missingScreenRecording || missingAutomation || missingAccessibility
+        let missingPermission = missingScreenRecording || missingAutomation || missingAccessibility || awaitingWebFilterApproval
 
         let variant: ShieldIcon.Variant
         let desc: String
@@ -1171,6 +1192,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if missingAccessibility {
                 desc = Localization.string(zh: "BigDaddy 缺少辅助功能权限",
                                            en: "BigDaddy is missing Accessibility access")
+            } else if awaitingWebFilterApproval {
+                desc = Localization.string(zh: "BigDaddy 等待授权网站访问限制",
+                                           en: "BigDaddy is waiting for website restriction approval")
             } else if missingScreenRecording {
                 desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限",
                                            en: "BigDaddy screenshots on but missing system permission")
@@ -3312,6 +3336,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         rebuildMenu()
         showAboutWindow()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func openWebFilterAuthorization() {
+        let alert = NSAlert()
+        applyShieldIcon(to: alert)
+        alert.alertStyle = .warning
+        alert.messageText = Localization.string(
+            zh: "需要批准网站访问限制",
+            en: "Website Access Restrictions Need Approval"
+        )
+        alert.informativeText = Localization.string(
+            zh: "点「继续」后，系统会打开“登录项与扩展”。在“网络扩展”中打开 BigDaddy.app 即可；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。",
+            en: "Continue to open Login Items & Extensions, then turn on BigDaddy.app under Network Extensions. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval."
+        )
+        alert.addButton(withTitle: Localization.string(zh: "继续", en: "Continue"))
+        alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
             NSWorkspace.shared.open(url)
         }
     }

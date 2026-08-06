@@ -17,9 +17,10 @@ final class FilterDataProvider: NEFilterDataProvider {
     private var configurationObservation: NSKeyValueObservation?
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
-        configurationObservation = observe(\.filterConfiguration, options: [.initial, .new]) { [weak self] _, _ in
+        configurationObservation = observe(\.filterConfiguration, options: [.new]) { [weak self] _, _ in
             self?.reloadPolicy()
         }
+        reloadPolicy()
         completionHandler(nil)
     }
 
