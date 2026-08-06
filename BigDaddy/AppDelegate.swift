@@ -1217,6 +1217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 现在不拦了"，后者对家长是一次实实在在的失守。
                 desc = Localization.string(zh: "BigDaddy 的网站访问限制已被关闭",
                                            en: "BigDaddy website restrictions were turned off")
+            } else if case .failed = webFilterAttention {
+                desc = Localization.string(zh: "BigDaddy 的网站访问限制启用失败",
+                                           en: "BigDaddy website restrictions failed to start")
             } else if webFilterAttention != .none {
                 desc = Localization.string(zh: "BigDaddy 等待授权网站访问限制",
                                            en: "BigDaddy is waiting for website restriction approval")
