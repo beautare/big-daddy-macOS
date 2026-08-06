@@ -147,9 +147,14 @@ if [[ "${FILTER_EXTENSION_NAME}" != "${FILTER_BUNDLE_IDENTIFIER}.systemextension
   echo "       wrapper=${FILTER_EXTENSION_NAME}, executable=${FILTER_EXECUTABLE}, bundle=${FILTER_BUNDLE_IDENTIFIER}" >&2
   exit 1
 fi
-if [[ "${FILTER_RESOLVED_MACH_SERVICE_NAME}" != "${APP_GROUP_IDENTIFIER}."* ]]; then
-  echo "ERROR: NEMachServiceName must use an entitled app group as its prefix" >&2
-  echo "       mach-service=${FILTER_RESOLVED_MACH_SERVICE_NAME}, app-group=${APP_GROUP_IDENTIFIER}" >&2
+# 逐字相等，不只是前缀匹配。主 App 那侧没有 NEMachServiceName 可读，它是用
+# "App Group id + WebFilterIPC.machServiceSuffix" 现推出来的（见 WebFilterIPC.swift）——
+# 两边一旦漂开，XPC 静默连不上，表现为家长端"实际版本"恒为 0、永远停在"策略同步中"，
+# 而过滤本身照常工作，没有任何报错会提示你去看这里。所以这条校验必须是等号。
+if [[ "${FILTER_RESOLVED_MACH_SERVICE_NAME}" != "${FILTER_MACH_SERVICE_NAME}" ]]; then
+  echo "ERROR: NEMachServiceName must equal <app-group>.BigDaddyWebFilter" >&2
+  echo "       mach-service=${FILTER_RESOLVED_MACH_SERVICE_NAME}, expected=${FILTER_MACH_SERVICE_NAME}" >&2
+  echo "       (the host app derives the same name in WebFilterIPC.machServiceName)" >&2
   exit 1
 fi
 

@@ -29,14 +29,51 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         isDeviceBound: false,
         appliedAt: Date(timeIntervalSince1970: 0)
     )
-    private var contentFilterEnabled = false
+    /// 系统里那份内容过滤配置当前是否处于开启状态。
+    ///
+    /// nil = 还没成功回读过（启动早期），**不是** false：这两者在家长端要说完全不同的
+    /// 两句话——"还在确认"和"已经被人关掉了"。凭一次都没读到就报后者，会在每次开机的
+    /// 头几秒给家长一个假警报。
+    private var systemFilterEnabled: Bool?
+    private let providerConnection = WebFilterProviderConnection()
+
+    private var filterConfigurationObserver: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        // 系统里那份过滤配置被**别人**改动时（孩子在系统设置里关掉网络扩展、或删掉
+        // 「网络 → 过滤器」里那一条），NetworkExtension 会广播这条通知。这是我们能在
+        // 第一时间发现"已生效"变成假话的唯一途径；只靠 60 秒轮询的话，家长会盯着一个
+        // 绿色的"正在阻断"看上整整一分钟。
+        filterConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .NEFilterConfigurationDidChange,
+            object: NEFilterManager.shared(),
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refreshSystemFilterState()
+            }
+        }
+    }
+
+    deinit {
+        if let filterConfigurationObserver {
+            NotificationCenter.default.removeObserver(filterConfigurationObserver)
+        }
+    }
 
     private var shouldRunContentFilter: Bool {
         currentIsDeviceBound
     }
 
-    func statusReport(requestedRevision: Int64) -> WebFilterStatusReport {
-        let systemExtensionState: WebFilterStatusReport.SystemExtensionState
+    /// 家长端"扩展被关掉了"这一条的判据。只有在扩展确实激活成功过之后，"系统里过滤
+    /// 是关的"才等价于"有人关掉了它"；激活都还没走完时它当然是关的。
+    var isSystemFilterDisabledExternally: Bool {
+        shouldRunContentFilter && activationCompleted && systemFilterEnabled == false
+    }
+
+    func statusReport(requestedRevision: Int64) async -> WebFilterStatusReport {
+        var systemExtensionState: WebFilterStatusReport.SystemExtensionState
         let error: String?
         switch state {
         case .unavailable:
@@ -59,10 +96,13 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             error = message
         }
 
-        guard shouldRunContentFilter else {
-            return WebFilterStatusReport(
-                systemExtensionState: systemExtensionState,
-                enforcementState: .passThrough,
+        func report(
+            _ extensionState: WebFilterStatusReport.SystemExtensionState,
+            _ enforcement: WebFilterStatusReport.EnforcementState
+        ) -> WebFilterStatusReport {
+            WebFilterStatusReport(
+                systemExtensionState: extensionState,
+                enforcementState: enforcement,
                 requestedRevision: requestedRevision,
                 appliedRevision: 0,
                 ruleCount: 0,
@@ -71,31 +111,30 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             )
         }
 
-        guard contentFilterEnabled else {
-            return WebFilterStatusReport(
-                systemExtensionState: systemExtensionState,
-                enforcementState: .unknown,
-                requestedRevision: requestedRevision,
-                appliedRevision: 0,
-                ruleCount: 0,
-                lastAppliedAt: nil,
-                error: error
-            )
+        guard shouldRunContentFilter else {
+            return report(systemExtensionState, .passThrough)
+        }
+
+        switch systemFilterEnabled {
+        case .none:
+            return report(systemExtensionState, .unknown)
+        case .some(false):
+            // 已经批准过、家长也要它跑，但系统里的过滤是关的 —— 被人从系统设置里关掉了。
+            // 只在"其余一切正常"时才覆盖成 disabled：activation 本身失败/待批准这些更
+            // 靠前的原因更具体，盖掉它们等于把家长指向错误的修复动作。
+            if systemExtensionState == .approved {
+                systemExtensionState = .disabled
+            }
+            return report(systemExtensionState, .passThrough)
+        case .some(true):
+            break
         }
 
         let policy = currentPolicy
-        guard let acknowledgement = WebFilterProviderAcknowledgementStore.load(),
+        guard let acknowledgement = await providerConnection.acknowledgement(),
               acknowledgement.confirms(policy)
         else {
-            return WebFilterStatusReport(
-                systemExtensionState: systemExtensionState,
-                enforcementState: .unknown,
-                requestedRevision: requestedRevision,
-                appliedRevision: 0,
-                ruleCount: 0,
-                lastAppliedAt: nil,
-                error: error
-            )
+            return report(systemExtensionState, .unknown)
         }
 
         return WebFilterStatusReport(
@@ -107,6 +146,40 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             lastAppliedAt: acknowledgement.appliedAt,
             error: error
         )
+    }
+
+    /// 回读系统里那份过滤配置的真实开关状态。
+    ///
+    /// 没有这一步的话，孩子在「系统设置 → 登录项与扩展」里把网络扩展一关，客户端内存
+    /// 里的"已启用"仍然是 true、回执也仍然对得上，于是继续向家长上报"已生效，正在阻断"
+    /// —— 家长看着一个绿色的"正在阻断"，实际一条都没拦。这是比 UI 文案严重得多的一种
+    /// 错误，所以每次上报之前都要回读一次，而不是只在自己改配置时更新。
+    func refreshSystemFilterState() async {
+        // 自己正在改配置时不插队：那条路径结束时会写下更准的值，这里读到的多半是中间态。
+        guard !configurationUpdateInFlight else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            NEFilterManager.shared().loadFromPreferences { [weak self] error in
+                Task { @MainActor [weak self] in
+                    defer { continuation.resume() }
+                    guard let self else { return }
+                    // 读失败保持上一次的判断：一次偶发的 IPC 失败不该被翻译成
+                    // "扩展被关掉了"推给家长。
+                    guard error == nil else { return }
+                    let manager = NEFilterManager.shared()
+                    self.updateSystemFilterEnabled(manager.isEnabled && self.isBigDaddyFilter(manager))
+                }
+            }
+        }
+    }
+
+    private func updateSystemFilterEnabled(_ enabled: Bool) {
+        guard systemFilterEnabled != enabled else { return }
+        let hadValue = systemFilterEnabled != nil
+        systemFilterEnabled = enabled
+        if hadValue && !enabled && shouldRunContentFilter && activationCompleted {
+            AuditLog.record("WEB_FILTER_DISABLED_EXTERNALLY")
+        }
+        notifyStateChanged()
     }
 
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {
@@ -291,7 +364,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                             self.disableContentFilter()
                             return
                         }
-                        self.contentFilterEnabled = true
+                        self.systemFilterEnabled = true
                         self.state = .configurationEnabled
                         AuditLog.record("WEB_FILTER_CONFIGURATION_SAVED policyEnabled=\(self.currentPolicy.enabled)")
                         self.notifyStateChanged()
@@ -321,9 +394,9 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                     return
                 }
 
-                let isBigDaddyFilter = self.isBigDaddyFilter(manager)
-                self.contentFilterEnabled = manager.isEnabled && isBigDaddyFilter
-                if !self.contentFilterEnabled {
+                let currentlyEnabled = manager.isEnabled && self.isBigDaddyFilter(manager)
+                self.systemFilterEnabled = currentlyEnabled
+                if !currentlyEnabled {
                     self.finishConfigurationUpdate()
                     self.markContentFilterDisabled()
                     self.applyPendingConfigurationUpdateIfNeeded()
@@ -353,7 +426,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     private func markContentFilterDisabled() {
-        contentFilterEnabled = false
+        systemFilterEnabled = false
         switch state {
         case .configurationEnabled:
             state = .approved

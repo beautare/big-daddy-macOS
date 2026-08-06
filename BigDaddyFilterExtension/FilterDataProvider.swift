@@ -15,8 +15,22 @@ final class FilterDataProvider: NEFilterDataProvider {
     )
     private var trackedSocketFlows: [TrackedSocketFlow] = []
     private var configurationObservation: NSKeyValueObservation?
+    /// 回执服务端。主 App 靠它知道"provider 到底应用了哪个 revision"，家长端的
+    /// "实际版本 / 已生效"整列信息都来自这里。取不到 mach 服务名（Info.plist 没写
+    /// NEMachServiceName）时为 nil：过滤照常工作，只是家长端会一直显示"状态未知"。
+    private let ipcListener: WebFilterProviderIPCListener? = {
+        guard let machServiceName = WebFilterIPC.providerMachServiceName() else {
+            NSLog("BigDaddyWebFilter: no mach service name in Info.plist, acknowledgement channel disabled")
+            return nil
+        }
+        return WebFilterProviderIPCListener(
+            machServiceName: machServiceName,
+            codeSigningRequirement: WebFilterIPC.codeSigningRequirement()
+        )
+    }()
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
+        ipcListener?.start()
         configurationObservation = observe(\.filterConfiguration, options: [.new]) { [weak self] _, _ in
             self?.reloadPolicy()
         }
@@ -77,16 +91,14 @@ final class FilterDataProvider: NEFilterDataProvider {
             update(flow, using: .drop(), for: .any)
         }
 
+        // 回执只在"这份策略确实是当前生效的那份"时才发：期间又来了一次更新的话，
+        // 由那一轮 reloadPolicy 负责发它自己的回执，这一轮闭嘴，免得把已经被顶掉的
+        // 旧 revision 报成"已应用"。
         policyLock.lock()
-        defer { policyLock.unlock() }
-        guard policy == nextPolicy else { return }
-        do {
-            try WebFilterProviderAcknowledgementStore.save(
-                WebFilterProviderAcknowledgement(policy: nextPolicy)
-            )
-        } catch {
-            NSLog("BigDaddyWebFilter: provider acknowledgement could not be stored: \(error.localizedDescription)")
-        }
+        let isStillCurrent = policy == nextPolicy
+        policyLock.unlock()
+        guard isStillCurrent else { return }
+        ipcListener?.publish(WebFilterProviderAcknowledgement(policy: nextPolicy))
     }
 
     private func hostname(from flow: NEFilterFlow) -> String? {

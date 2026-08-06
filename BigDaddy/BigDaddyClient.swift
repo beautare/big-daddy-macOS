@@ -174,6 +174,10 @@ final class BigDaddyClient {
     /// register 响应报告本机 secret 与后端存档不一致（设备已绑定、后端拒绝换钥）。
     /// 此状态下所有签名接口都会验签失败，必须在 UI 上明确警示，引导解绑后重新绑定。
     var credentialsInvalid = false
+    /// 当前是否有浏览器处于"自动化权限被拒"状态，随心跳上报（见 sendHeartbeat 的 metadata）。
+    /// 那份被拒 bundle id 的集合归 AppDelegate 管（探测、重置、菜单入口都在那边），
+    /// 这里只留一个被同步过来的布尔值——心跳在这个类里组装，总得有个地方读到它。
+    var automationBlocked = false
     /// 上一次运行留下的墓碑时间戳（"上次运行没有正常结束"），由 prepareRuntime 在启动时读入。
     /// prepareRuntime 在主线程写、sendHeartbeat 在（可能是后台的）Task 里取走，与 SwitchCounter
     /// 是同一类读写竞争，一律经 previousCrashLock 访问。
@@ -514,6 +518,15 @@ final class BigDaddyClient {
                 // 立刻说清是缺授权还是浏览器没开窗口，而不是只看到一段没有链接的纯文本。
                 "urlUnavailableReason": lastUrlUnavailableReason.rawValue,
                 "browserBundleId": lastBrowserBundleID as Any? ?? NSNull(),
+                // 是否有浏览器确实被拒过自动化授权。上面两个字段说的是"这一条记录为什么
+                // 没有网址"，这个说的是"这台机器现在有没有一项待修的授权"——家长端的
+                // 开通引导要靠它给「在孩子的 Mac 上完成授权」那一步打勾，那一步只能由
+                // 坐在孩子电脑前的人完成，家长自己看不到任何进度。
+                //
+                // 注意它是 blocked 不是 granted：客户端只有在真的尝试读取并被系统拒绝时
+                // 才知道这件事，孩子一次浏览器都没开的话无从证明"已授权"。false 的含义
+                // 是"目前没有发现问题"。
+                "automationBlocked": automationBlocked,
                 // 开机自动启动的当前状态位：与权限位一样每次心跳都上报，家长端因此始终
                 // 能在服务端看到本机是否仍会开机自启，不必依赖"关闭那一刻"的单次事件
                 // 能否送达（那次事件可能因断网落进 PendingQueue 延迟补发）。

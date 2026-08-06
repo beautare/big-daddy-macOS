@@ -102,48 +102,8 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     }
 }
 
-enum WebFilterProviderAcknowledgementStore {
-    private static let appGroupInfoKey = "BigDaddyAppGroupIdentifier"
-    private static let fileName = "web-filter-provider-acknowledgement.json"
-
-    static func load(bundle: Bundle = .main) -> WebFilterProviderAcknowledgement? {
-        guard let fileURL = fileURL(bundle: bundle), let data = try? Data(contentsOf: fileURL) else {
-            return nil
-        }
-        return try? decoder.decode(WebFilterProviderAcknowledgement.self, from: data)
-    }
-
-    static func save(_ acknowledgement: WebFilterProviderAcknowledgement, bundle: Bundle = .main) throws {
-        guard let fileURL = fileURL(bundle: bundle) else {
-            throw WebFilterProviderAcknowledgementStoreError.containerUnavailable
-        }
-        try encoder.encode(acknowledgement).write(to: fileURL, options: .atomic)
-    }
-
-    private static func fileURL(bundle: Bundle) -> URL? {
-        guard let identifier = bundle.object(forInfoDictionaryKey: appGroupInfoKey) as? String else {
-            return nil
-        }
-        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)?
-            .appendingPathComponent(fileName)
-    }
-
-    private static let encoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        return encoder
-    }()
-
-    private static let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
-    }()
-}
-
-private enum WebFilterProviderAcknowledgementStoreError: Error {
-    case containerUnavailable
-}
+// 回执此前经由 App Group 容器里的一个 json 传递，那条路在 root（provider）和登录用户
+// （主 App）之间根本不通，已换成 XPC —— 原委见 WebFilterIPC.swift 顶部。
 
 struct WebFilterStatusReport: Equatable {
     enum SystemExtensionState: String {
@@ -153,6 +113,11 @@ struct WebFilterStatusReport: Equatable {
         case approved = "APPROVED"
         case restartRequired = "RESTART_REQUIRED"
         case failed = "FAILED"
+        /// 扩展装好也批准过了，但系统里的内容过滤当前是关的——有人在「系统设置 →
+        /// 登录项与扩展」或「网络 → 过滤器」里把它关掉了。必须和 unavailable
+        /// （压根没装上）分开：前者是"被人关的、可以打开"，后者是"这台机器上没有"，
+        /// 家长要做的事完全不同。
+        case disabled = "DISABLED"
     }
 
     enum EnforcementState: String {

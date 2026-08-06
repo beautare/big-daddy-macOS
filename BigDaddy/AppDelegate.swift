@@ -98,7 +98,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private static let maxBrowserPermissionRows = 5
     /// 是否有浏览器处于"自动化权限被拒"状态——决定"关于"面板里要不要出现引导入口。
     /// 记 bundle id 而不是布尔，是为了在面板文案里说清楚是哪个浏览器。
-    private var automationDeniedBundleIDs: Set<String> = []
+    /// 这份集合有六个写入点（探测被拒、探测恢复、批量自检、重置授权……），所以同步给
+    /// client 的动作挂在 didSet 上而不是逐个调用点手写——漏掉任何一处，家长端的开通
+    /// 引导就会长期显示一个陈旧的"浏览器网址读取"状态。
+    private var automationDeniedBundleIDs: Set<String> = [] {
+        didSet { client.automationBlocked = !automationDeniedBundleIDs.isEmpty }
+    }
     private var screenshotFlashTimer: Timer?
     private var countdownTimer: Timer?
     private var countdownSeconds = 300
@@ -117,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var signalSources: [DispatchSourceSignal] = []
     /// 凭据失效弹窗每次运行只弹一次（register 会在扫码绑定等多处重复调用），菜单警示项常驻
     private var credentialsAlertShown = false
+    /// "去批准网络扩展"的主动弹窗是否已经弹过。每进入一次待批准状态弹一次，离开该
+    /// 状态时复位——见 promptWebFilterApprovalIfNeeded。
+    private var webFilterApprovalPromptShown = false
     /// 菜单打开触发的绑定状态同步做节流，避免频繁点开图标时打网络风暴
     private var lastBindingSyncAt: Date = .distantPast
     /// 绑定检测快轮询任务（展示绑定码/二维码后启动的一段高频探测），持有引用以便取消
@@ -228,6 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self.scheduleWebFilterStatusReport()
             self.rebuildMenu()
             self.updateStatusItemAppearance()
+            // 异步派发而不是直接调：这个回调本身是从 WebFilterController 的状态迁移里
+            // 发出来的，而 promptWebFilterApprovalIfNeeded 会 runModal 停住主 runloop，
+            // 在状态迁移中途停下来等用户点按钮容易把后续回调堆在一起重入。
+            DispatchQueue.main.async { [weak self] in
+                self?.promptWebFilterApprovalIfNeeded()
+            }
         }
         webFilterController.synchronize(
             configuration: client.config.webFilter,
@@ -372,7 +386,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     private func reportWebFilterStatus() async {
         guard client.config.bound else { return }
-        let report = webFilterController.statusReport(
+        // 先回读系统里那份过滤配置的真实开关，再组装上报。顺序不能反：孩子刚在系统
+        // 设置里把网络扩展关掉时，客户端内存里还是"已启用"，先报后读就等于把这一分钟
+        // 的"其实没在拦"上报成了"正在阻断"。
+        await webFilterController.refreshSystemFilterState()
+        let report = await webFilterController.statusReport(
             requestedRevision: client.config.webFilter.revision
         )
         await client.reportWebFilterStatus(report)
@@ -494,13 +512,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             timeSessionMenuItem = nil
         }
 
-        if client.config.bound,
-           case .awaitingUserApproval = webFilterController.state {
+        if let webFilterTitle = webFilterMenuTitle(for: webFilterAttention) {
             menu.addItem(NSMenuItem(
-                title: Localization.string(
-                    zh: "⚠️ 授权网站访问限制…",
-                    en: "⚠️ Authorize Website Access Restrictions…"
-                ),
+                title: webFilterTitle,
                 action: #selector(openWebFilterAuthorization), keyEquivalent: ""
             ))
             menu.addItem(.separator())
@@ -697,6 +711,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     true
                 ))
             }
+        }
+        // 网站访问限制没生效：与菜单里那条同一个判据。这个窗口是本 App 事实上的权限
+        // 中心（屏幕录制、辅助功能、浏览器自动化都在这儿有修复按钮），此前唯独网络
+        // 扩展没有——它的唯一入口是菜单里一条只在"待批准"期间出现的瞬态菜单项，
+        // 状态一变成"失败"或"被人关掉"，家长就再也找不到任何可点的东西。
+        if let webFilterTitle = webFilterMenuTitle(for: webFilterAttention) {
+            actions.append((webFilterTitle, openWebFilterAuthorization, false))
         }
         // 辅助功能缺失：与菜单里那条同一个判据（见 rebuildMenu 里的注释）。放在最前面，
         // 因为它比下面两条影响更大——没有它，连窗口标题这种最基本的记录都是空的。
@@ -1169,17 +1190,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let on = client.config.screenshotEnabled
         let missingScreenRecording = on && !checkScreenRecordingPermission()
         let missingAutomation = client.config.bound && !automationDeniedBundleIDs.isEmpty
-        let awaitingWebFilterApproval: Bool
-        if case .awaitingUserApproval = webFilterController.state {
-            awaitingWebFilterApproval = true
-        } else {
-            awaitingWebFilterApproval = false
-        }
+        // 待批准、被人关掉、启用失败三种都要变警示态：它们都是"家长配置了、实际却不
+        // 生效"，跟屏幕录制缺权限是同一类问题。此前只有第一种会让图标变色，另外两种
+        // 图标一切如常，家长没有任何理由去点开菜单。
+        let webFilterAttention = self.webFilterAttention
         // 辅助功能缺失也要让图标变成警示态：菜单里那条「⚠️ 辅助功能未授权 · 点此修复」
         // 是唯一的修复入口，而没有人会去点一个看起来一切正常的图标。少了这一条，那个
         // 入口等于藏在一扇没有门把手的门后面。
         let missingAccessibility = client.config.bound && !AXIsProcessTrustedWithOptions(nil)
-        let missingPermission = missingScreenRecording || missingAutomation || missingAccessibility || awaitingWebFilterApproval
+        let missingPermission = missingScreenRecording || missingAutomation || missingAccessibility
+            || webFilterAttention != .none
 
         let variant: ShieldIcon.Variant
         let desc: String
@@ -1192,7 +1212,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if missingAccessibility {
                 desc = Localization.string(zh: "BigDaddy 缺少辅助功能权限",
                                            en: "BigDaddy is missing Accessibility access")
-            } else if awaitingWebFilterApproval {
+            } else if webFilterAttention == .disabledExternally {
+                // 排在"待批准"前面：待批准是"还没开始生效"，被人关掉是"本来在拦、
+                // 现在不拦了"，后者对家长是一次实实在在的失守。
+                desc = Localization.string(zh: "BigDaddy 的网站访问限制已被关闭",
+                                           en: "BigDaddy website restrictions were turned off")
+            } else if webFilterAttention != .none {
                 desc = Localization.string(zh: "BigDaddy 等待授权网站访问限制",
                                            en: "BigDaddy is waiting for website restriction approval")
             } else if missingScreenRecording {
@@ -3340,22 +3365,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
+    /// 网站访问限制此刻需不需要家长动手，以及要动哪一手。
+    ///
+    /// 三种情况收进一个枚举，是因为同一个判断要出现在四个地方（菜单栏图标、菜单项、
+    /// "关于"窗口、引导弹窗）。此前只有"待批准"一种被处理，另外两种——激活失败、
+    /// 以及扩展被人从系统设置里关掉——在客户端这边完全静默：图标不变、菜单里没有入口、
+    /// "关于"窗口里也没有，家长唯一可能察觉的途径是自己打开仪表盘看到一行红字。
+    /// 而这两种恰恰是"配置了但实际不生效"，跟屏幕录制缺权限属于同一类问题，理应用
+    /// 同一套视觉语言提醒。
+    enum WebFilterAttention: Equatable {
+        case none
+        /// 系统弹过"扩展已被阻止"，家长还没去批准
+        case awaitingApproval
+        /// 批准过、也配置好了，但系统里的过滤开关被人关掉了
+        case disabledExternally
+        /// 激活或配置失败，带上系统给的原因
+        case failed(String)
+    }
+
+    private var webFilterAttention: WebFilterAttention {
+        guard client.config.bound else { return .none }
+        switch webFilterController.state {
+        case .awaitingUserApproval:
+            return .awaitingApproval
+        case .failed(let message):
+            return .failed(message)
+        case .unavailable:
+            // 这台机器上压根没装出扩展（打包/安装问题），家长去系统设置里也找不到
+            // 任何可开的东西，指过去只会让他白跑一趟。仪表盘上仍会显示"系统扩展不可用"。
+            return .none
+        case .activationRequested, .approved, .configurationEnabled, .restartRequired:
+            return webFilterController.isSystemFilterDisabledExternally ? .disabledExternally : .none
+        }
+    }
+
+    private func webFilterMenuTitle(for attention: WebFilterAttention) -> String? {
+        switch attention {
+        case .none:
+            return nil
+        case .awaitingApproval:
+            return Localization.string(
+                zh: "⚠️ 授权网站访问限制…",
+                en: "⚠️ Authorize Website Access Restrictions…"
+            )
+        case .disabledExternally:
+            return Localization.string(
+                zh: "⚠️ 网站访问限制已被关闭 · 点此恢复…",
+                en: "⚠️ Website Restrictions Turned Off — Restore…"
+            )
+        case .failed:
+            return Localization.string(
+                zh: "⚠️ 网站访问限制启用失败 · 查看…",
+                en: "⚠️ Website Restrictions Failed — Details…"
+            )
+        }
+    }
+
+    /// 进入"待批准"时主动弹一次，而不是干等家长注意到菜单栏图标变了颜色。
+    ///
+    /// BigDaddy 是 LSUIElement：没有 Dock 图标、没有窗口。系统那条"系统扩展已被阻止"
+    /// 的通知转瞬即逝，而绑定往往是家长在**自己**电脑上完成的（/start 里"绑定"这一步
+    /// 标的就是"在你自己的设备上"），激活请求却发生在孩子那台机器上——真正看到系统
+    /// 提示的那个人，多半根本不知道那是什么。主动弹窗是这条链路上唯一不依赖"恰好有人
+    /// 盯着菜单栏"的提醒。
+    ///
+    /// 每次激活请求只弹一次：家长点了"取消"之后，菜单项和菜单栏的 ⚠️ 仍然常驻，
+    /// 不至于既骚扰又失联。
+    private func promptWebFilterApprovalIfNeeded() {
+        guard case .awaitingApproval = webFilterAttention else {
+            webFilterApprovalPromptShown = false
+            return
+        }
+        guard !webFilterApprovalPromptShown else { return }
+        webFilterApprovalPromptShown = true
+        openWebFilterAuthorization()
+    }
+
     @objc private func openWebFilterAuthorization() {
+        let attention = webFilterAttention
+        guard attention != .none else { return }
+
         let alert = NSAlert()
         applyShieldIcon(to: alert)
         alert.alertStyle = .warning
-        alert.messageText = Localization.string(
-            zh: "需要批准网站访问限制",
-            en: "Website Access Restrictions Need Approval"
-        )
-        alert.informativeText = Localization.string(
-            zh: "点「继续」后，系统会打开“登录项与扩展”。在页面底部“扩展”的“网络扩展”右侧点“显示细节”，再打开 BigDaddy.app；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。",
-            en: "Continue to open Login Items & Extensions. Under Extensions at the bottom, click Details next to Network Extensions, then turn on BigDaddy.app. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval."
-        )
+
+        // 三种情况共用同一个落点（那张"网络扩展"表单），但开场白必须不同：
+        // "还没批准"和"被人关掉了"对家长意味着完全不同的两件事。
+        switch attention {
+        case .none:
+            return
+        case .awaitingApproval:
+            alert.messageText = Localization.string(
+                zh: "需要批准网站访问限制",
+                en: "Website Access Restrictions Need Approval"
+            )
+            alert.informativeText = Localization.string(
+                zh: "点「继续」后，系统会打开“登录项与扩展”里的“网络扩展”。在列表里找到 BigDaddy.app，把它右边的开关打开；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。\n\n如果没有直接跳到“网络扩展”：在“登录项与扩展”页面拉到底部的“扩展”，点“网络扩展”右侧的“显示细节”。",
+                en: "Continue to open Network Extensions under Login Items & Extensions. Find BigDaddy.app in the list and turn on its switch. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval.\n\nIf it doesn't jump straight to Network Extensions: scroll to Extensions at the bottom of Login Items & Extensions and click Details next to Network Extensions."
+            )
+        case .disabledExternally:
+            alert.messageText = Localization.string(
+                zh: "网站访问限制已被关闭",
+                en: "Website Access Restrictions Are Turned Off"
+            )
+            alert.informativeText = Localization.string(
+                zh: "BigDaddy 的网络扩展在系统设置里被关掉了，家长设置的域名当前一个都没有拦截。点「继续」后，在“网络扩展”列表里把 BigDaddy.app 的开关重新打开即可。\n\n如果没有直接跳到“网络扩展”：在“登录项与扩展”页面拉到底部的“扩展”，点“网络扩展”右侧的“显示细节”。",
+                en: "BigDaddy's network extension was turned off in System Settings, so none of the configured domains are being blocked right now. Continue, then turn BigDaddy.app back on in the Network Extensions list.\n\nIf it doesn't jump straight to Network Extensions: scroll to Extensions at the bottom of Login Items & Extensions and click Details next to Network Extensions."
+            )
+        case .failed(let message):
+            alert.messageText = Localization.string(
+                zh: "网站访问限制启用失败",
+                en: "Website Access Restrictions Failed to Start"
+            )
+            alert.informativeText = Localization.string(
+                zh: "系统给出的原因：\(message)\n\n先点「继续」，在“网络扩展”里确认 BigDaddy.app 的开关是打开的。如果开关本来就是开的，重启这台 Mac 后通常就能恢复。",
+                en: "The system reported: \(message)\n\nContinue and confirm BigDaddy.app is switched on under Network Extensions. If it already is, restarting this Mac usually clears it."
+            )
+        }
+
         alert.addButton(withTitle: Localization.string(zh: "继续", en: "Continue"))
-        alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
+        alert.addButton(withTitle: Localization.string(zh: "稍后再说", en: "Later"))
+        // LSUIElement 的进程不会自动成为前台应用，不抢一次焦点的话这个弹窗会开在
+        // 所有窗口后面——家长看到的仍然是"什么都没发生"。
+        NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
+        openNetworkExtensionSettings()
+    }
+
+    /// 直接落到「网络扩展」那张详情表单，而不是「登录项与扩展」整页。
+    ///
+    /// 整页打开的话，家长还得自己滚到底部、在“扩展”里找到“网络扩展”、点“显示细节”，
+    /// 三步之后才是那个开关——而这正是最容易走丢的三步。
+    /// com.apple.ExtensionsPreferences 是「登录项与扩展」面板自己声明的 url_alias
+    /// （见 /System/Library/ExtensionKit/Extensions/LoginItems.appex 的 Info.plist），
+    /// 带上 extensionPointIdentifier 可以直接把对应那张表单弹出来。
+    ///
+    /// 不需要退路：参数万一被这个 macOS 版本忽略，落点也就是「登录项与扩展」整页，
+    /// 跟改动之前完全一样，家长最多多点两下。弹窗文案里那段"如果没有直接跳到…"
+    /// 就是为这种情况写的。
+    private func openNetworkExtensionSettings() {
+        let deepLink = "x-apple.systempreferences:com.apple.ExtensionsPreferences"
+            + "?extensionPointIdentifier=com.apple.system_extension.network_extension"
+        if let url = URL(string: deepLink) {
             NSWorkspace.shared.open(url)
         }
     }
