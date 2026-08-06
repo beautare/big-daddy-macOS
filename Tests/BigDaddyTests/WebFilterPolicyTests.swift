@@ -61,7 +61,43 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertEqual(WebFilterPolicyTransport.policy(from: vendorConfiguration), policy)
     }
 
-    private func makePolicy(enabled: Bool, rules: [WebFilterRule]) -> WebFilterPolicySnapshot {
+    func testProviderAcknowledgementConfirmsMatchingPolicy() {
+        let policy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "example.com", includeSubdomains: true)
+        ])
+
+        XCTAssertTrue(WebFilterProviderAcknowledgement(policy: policy).confirms(policy))
+    }
+
+    func testProviderAcknowledgementRejectsStaleOrDifferentPolicy() {
+        let policyID = UUID()
+        let appliedPolicy = makePolicy(enabled: false, rules: [
+            WebFilterRule(domain: "example.com", includeSubdomains: true)
+        ], policyID: policyID)
+        let currentPolicy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "example.com", includeSubdomains: true)
+        ], policyID: policyID)
+
+        XCTAssertFalse(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(currentPolicy))
+    }
+
+    func testProviderAcknowledgementRejectsDifferentRulesWithSameRevisionAndCount() {
+        let policyID = UUID()
+        let appliedPolicy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "example.com", includeSubdomains: true)
+        ], policyID: policyID)
+        let currentPolicy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "example.org", includeSubdomains: true)
+        ], policyID: policyID)
+
+        XCTAssertFalse(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(currentPolicy))
+    }
+
+    private func makePolicy(
+        enabled: Bool,
+        rules: [WebFilterRule],
+        policyID: UUID = UUID()
+    ) -> WebFilterPolicySnapshot {
         WebFilterPolicySnapshot(
             configuration: WebFilterConfiguration(
                 enabled: enabled,
@@ -69,6 +105,7 @@ final class WebFilterPolicyTests: XCTestCase {
                 blockedDomains: rules
             ),
             isDeviceBound: true,
+            policyID: policyID,
             appliedAt: Date(timeIntervalSince1970: 0)
         )
     }

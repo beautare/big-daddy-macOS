@@ -2,14 +2,9 @@ import Foundation
 import NetworkExtension
 
 final class FilterDataProvider: NEFilterDataProvider {
-    private final class TrackedSocketFlow {
-        weak var flow: NEFilterSocketFlow?
+    private struct TrackedSocketFlow {
+        let flow: NEFilterSocketFlow
         let hostname: String
-
-        init(flow: NEFilterSocketFlow, hostname: String) {
-            self.flow = flow
-            self.hostname = hostname
-        }
     }
 
     private let policyLock = NSLock()
@@ -45,11 +40,20 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
         policyLock.lock()
         let blocked = policy.blocks(hostname: hostname)
+        let verdict: NEFilterNewFlowVerdict = blocked ? .drop() : .allow()
         if !blocked, let socketFlow = flow as? NEFilterSocketFlow {
             trackedSocketFlows.append(TrackedSocketFlow(flow: socketFlow, hostname: hostname))
+            verdict.shouldReport = true
         }
         policyLock.unlock()
-        return blocked ? .drop() : .allow()
+        return verdict
+    }
+
+    override func handle(_ report: NEFilterReport) {
+        guard report.event == .flowClosed, let flow = report.flow else { return }
+        policyLock.lock()
+        trackedSocketFlows.removeAll { $0.flow === flow }
+        policyLock.unlock()
     }
 
     private func reloadPolicy() {
@@ -62,15 +66,25 @@ final class FilterDataProvider: NEFilterDataProvider {
 
         policyLock.lock()
         policy = nextPolicy
-        let flowsToDrop = trackedSocketFlows.compactMap { tracked -> NEFilterSocketFlow? in
-            guard let flow = tracked.flow else { return nil }
-            return nextPolicy.blocks(hostname: tracked.hostname) ? flow : nil
-        }
-        trackedSocketFlows.removeAll { $0.flow == nil }
+        let flowsToDrop = trackedSocketFlows
+            .filter { nextPolicy.blocks(hostname: $0.hostname) }
+            .map(\.flow)
+        trackedSocketFlows.removeAll { nextPolicy.blocks(hostname: $0.hostname) }
         policyLock.unlock()
 
         for flow in flowsToDrop {
             update(flow, using: .drop(), for: .any)
+        }
+
+        policyLock.lock()
+        defer { policyLock.unlock() }
+        guard policy == nextPolicy else { return }
+        do {
+            try WebFilterProviderAcknowledgementStore.save(
+                WebFilterProviderAcknowledgement(policy: nextPolicy)
+            )
+        } catch {
+            NSLog("BigDaddyWebFilter: provider acknowledgement could not be stored: \(error.localizedDescription)")
         }
     }
 

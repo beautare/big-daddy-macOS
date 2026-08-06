@@ -70,6 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private let idleActivityPollInterval: TimeInterval = 5
     private var configTimer: Timer?
     private var webFilterStatusReportTask: Task<Void, Never>?
+    private var webFilterStatusRetryCount = 0
+    private static let maxWebFilterStatusRetries = 5
     /// 屏幕录制权限的授予/撤回都发生在系统设置里，没有公开的变更通知 API 可订阅，只能
     /// 轮询；这个定时器让菜单栏图标（盾牌旁的三角感叹号 ⇄ 眼睛）在用户刚授权/撤权后近乎实时地跟上，
     /// 不用等到下一次远端配置轮询（60 秒）。见 refreshIconIfPermissionChanged。
@@ -348,6 +350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             configuration: client.config.webFilter,
             isDeviceBound: client.config.bound
         )
+        webFilterStatusRetryCount = 0
         scheduleWebFilterStatusReport()
     }
 
@@ -370,6 +373,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             requestedRevision: client.config.webFilter.revision
         )
         await client.reportWebFilterStatus(report)
+        guard report.systemExtensionState == .approved,
+              report.enforcementState == .unknown,
+              webFilterStatusRetryCount < Self.maxWebFilterStatusRetries
+        else {
+            return
+        }
+        webFilterStatusRetryCount += 1
+        scheduleWebFilterStatusReport()
     }
 
     /// 重建整张菜单。

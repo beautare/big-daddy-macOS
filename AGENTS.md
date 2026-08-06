@@ -27,3 +27,11 @@
 ## 提交规范
 - 格式：`<类型>: <描述>`，例如 `feat: 添加设备绑定状态监听`、`fix: 修复心跳包发送间隔`。
 - 提交前确保代码可编译且测试通过。
+
+- Do not preserve backward compatibility. Remove obsolete paths instead ofadding compatibility layers, fallbacks, or migrations.
+- Choose the simplest implementation that fully meets the currentrequirements. Avoid speculative abstractions, configuration, andindirection.
+- Grow the system in layers. Start from the smallest version that works endto end, and add each new capability on top of a product that alreadyworks. Never trade a working product for unfinished complexity.
+- Keep components modular and concerns clearly separated.
+- Prefer established, well-maintained libraries when they reduce overallcomplexity or improve reliability. Do not reimplement commonfunctionality without a clear reason.
+- Lean on the dependencies already in the project before writing your ownimplementation or adding packages. Do not assume a library lacks acapability without checking its documentation and types.
+- Make architectural decisions for the long term. Do not accept a stopgapthat only works for now and is meant to be replaced later.

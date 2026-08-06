@@ -23,13 +23,16 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     private var activationCompleted = false
     private var configurationUpdateInFlight = false
     private var configurationUpdatePending = false
-    private var currentConfiguration = WebFilterConfiguration()
     private var currentIsDeviceBound = false
+    private var currentPolicy = WebFilterPolicySnapshot(
+        configuration: WebFilterConfiguration(),
+        isDeviceBound: false,
+        appliedAt: Date(timeIntervalSince1970: 0)
+    )
     private var contentFilterEnabled = false
-    private var lastConfigurationAppliedAt: Date?
 
-    private var desiredFilterEnabled: Bool {
-        currentIsDeviceBound && currentConfiguration.enabled
+    private var shouldRunContentFilter: Bool {
+        currentIsDeviceBound
     }
 
     func statusReport(requestedRevision: Int64) -> WebFilterStatusReport {
@@ -56,12 +59,12 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             error = message
         }
 
-        guard desiredFilterEnabled else {
+        guard shouldRunContentFilter else {
             return WebFilterStatusReport(
                 systemExtensionState: systemExtensionState,
                 enforcementState: .passThrough,
                 requestedRevision: requestedRevision,
-                appliedRevision: requestedRevision,
+                appliedRevision: 0,
                 ruleCount: 0,
                 lastAppliedAt: nil,
                 error: error
@@ -80,20 +83,38 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             )
         }
 
+        let policy = currentPolicy
+        guard let acknowledgement = WebFilterProviderAcknowledgementStore.load(),
+              acknowledgement.confirms(policy)
+        else {
+            return WebFilterStatusReport(
+                systemExtensionState: systemExtensionState,
+                enforcementState: .unknown,
+                requestedRevision: requestedRevision,
+                appliedRevision: 0,
+                ruleCount: 0,
+                lastAppliedAt: nil,
+                error: error
+            )
+        }
+
         return WebFilterStatusReport(
             systemExtensionState: systemExtensionState,
-            enforcementState: .enforcing,
+            enforcementState: acknowledgement.enforcementEnabled ? .enforcing : .passThrough,
             requestedRevision: requestedRevision,
-            appliedRevision: requestedRevision,
-            ruleCount: currentConfiguration.blockedDomains.count,
-            lastAppliedAt: lastConfigurationAppliedAt,
+            appliedRevision: acknowledgement.appliedRevision,
+            ruleCount: acknowledgement.ruleCount,
+            lastAppliedAt: acknowledgement.appliedAt,
             error: error
         )
     }
 
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {
-        currentConfiguration = configuration
         currentIsDeviceBound = isDeviceBound
+        currentPolicy = WebFilterPolicySnapshot(
+            configuration: configuration,
+            isDeviceBound: isDeviceBound
+        )
 
         applyDesiredFilterState()
     }
@@ -142,7 +163,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         case .completed:
             state = .approved
             AuditLog.record("WEB_FILTER_SYSTEM_EXTENSION_APPROVED")
-            if desiredFilterEnabled {
+            if shouldRunContentFilter {
                 enableContentFilter()
             } else {
                 disableContentFilter()
@@ -165,7 +186,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     private func applyDesiredFilterState() {
-        if desiredFilterEnabled {
+        if shouldRunContentFilter {
             ensureInfrastructure()
         } else {
             disableContentFilter()
@@ -173,7 +194,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     private func ensureInfrastructure() {
-        guard desiredFilterEnabled else {
+        guard shouldRunContentFilter else {
             disableContentFilter()
             return
         }
@@ -206,7 +227,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     private func enableContentFilter() {
-        guard desiredFilterEnabled else {
+        guard shouldRunContentFilter else {
             disableContentFilter()
             return
         }
@@ -228,7 +249,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                     return
                 }
 
-                guard self.desiredFilterEnabled else {
+                guard self.shouldRunContentFilter else {
                     self.finishConfigurationUpdate()
                     self.configurationUpdatePending = false
                     self.disableContentFilter()
@@ -239,12 +260,8 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                 providerConfiguration.filterSockets = true
                 providerConfiguration.filterDataProviderBundleIdentifier = Self.extensionBundleIdentifier
                 providerConfiguration.organization = "BigDaddy"
-                let policy = WebFilterPolicySnapshot(
-                    configuration: self.currentConfiguration,
-                    isDeviceBound: self.currentIsDeviceBound
-                )
                 do {
-                    providerConfiguration.vendorConfiguration = try WebFilterPolicyTransport.vendorConfiguration(for: policy)
+                    providerConfiguration.vendorConfiguration = try WebFilterPolicyTransport.vendorConfiguration(for: self.currentPolicy)
                 } catch {
                     self.finishConfigurationUpdate()
                     self.state = .failed(error.localizedDescription)
@@ -269,15 +286,14 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                             return
                         }
                         self.finishConfigurationUpdate()
-                        guard self.desiredFilterEnabled else {
+                        guard self.shouldRunContentFilter else {
                             self.configurationUpdatePending = false
                             self.disableContentFilter()
                             return
                         }
                         self.contentFilterEnabled = true
-                        self.lastConfigurationAppliedAt = Date()
                         self.state = .configurationEnabled
-                        AuditLog.record("WEB_FILTER_CONFIGURATION_ENABLED")
+                        AuditLog.record("WEB_FILTER_CONFIGURATION_SAVED policyEnabled=\(self.currentPolicy.enabled)")
                         self.notifyStateChanged()
                         self.applyPendingConfigurationUpdateIfNeeded()
                     }

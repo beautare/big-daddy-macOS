@@ -15,13 +15,20 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     static let schemaVersion = 1
 
     let schemaVersion: Int
+    let policyID: UUID
     let enabled: Bool
     let revision: Int64
     let blockedDomains: [WebFilterRule]
     let appliedAt: Date
 
-    init(configuration: WebFilterConfiguration, isDeviceBound: Bool, appliedAt: Date = Date()) {
+    init(
+        configuration: WebFilterConfiguration,
+        isDeviceBound: Bool,
+        policyID: UUID = UUID(),
+        appliedAt: Date = Date()
+    ) {
         self.schemaVersion = Self.schemaVersion
+        self.policyID = policyID
         self.enabled = isDeviceBound && configuration.enabled
         self.revision = configuration.revision
         self.blockedDomains = configuration.blockedDomains
@@ -73,6 +80,75 @@ enum WebFilterPolicyTransport {
         decoder.dateDecodingStrategy = .iso8601
         return decoder
     }()
+}
+
+struct WebFilterProviderAcknowledgement: Codable, Equatable {
+    let policyID: UUID
+    let appliedRevision: Int64
+    let ruleCount: Int
+    let blockedDomains: [WebFilterRule]
+    let enforcementEnabled: Bool
+    let appliedAt: Date
+
+    init(policy: WebFilterPolicySnapshot, appliedAt: Date = Date()) {
+        policyID = policy.policyID
+        appliedRevision = policy.revision
+        ruleCount = policy.blockedDomains.count
+        blockedDomains = policy.blockedDomains
+        enforcementEnabled = policy.enabled
+        self.appliedAt = appliedAt
+    }
+
+    func confirms(_ policy: WebFilterPolicySnapshot) -> Bool {
+        policyID == policy.policyID
+            && appliedRevision == policy.revision
+            && ruleCount == policy.blockedDomains.count
+            && blockedDomains == policy.blockedDomains
+            && enforcementEnabled == policy.enabled
+    }
+}
+
+enum WebFilterProviderAcknowledgementStore {
+    private static let appGroupInfoKey = "BigDaddyAppGroupIdentifier"
+    private static let fileName = "web-filter-provider-acknowledgement.json"
+
+    static func load(bundle: Bundle = .main) -> WebFilterProviderAcknowledgement? {
+        guard let fileURL = fileURL(bundle: bundle), let data = try? Data(contentsOf: fileURL) else {
+            return nil
+        }
+        return try? decoder.decode(WebFilterProviderAcknowledgement.self, from: data)
+    }
+
+    static func save(_ acknowledgement: WebFilterProviderAcknowledgement, bundle: Bundle = .main) throws {
+        guard let fileURL = fileURL(bundle: bundle) else {
+            throw WebFilterProviderAcknowledgementStoreError.containerUnavailable
+        }
+        try encoder.encode(acknowledgement).write(to: fileURL, options: .atomic)
+    }
+
+    private static func fileURL(bundle: Bundle) -> URL? {
+        guard let identifier = bundle.object(forInfoDictionaryKey: appGroupInfoKey) as? String else {
+            return nil
+        }
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)?
+            .appendingPathComponent(fileName)
+    }
+
+    private static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }()
+
+    private static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }()
+}
+
+private enum WebFilterProviderAcknowledgementStoreError: Error {
+    case containerUnavailable
 }
 
 struct WebFilterStatusReport: Equatable {
