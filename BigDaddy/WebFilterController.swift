@@ -23,7 +23,6 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     private var activationCompleted = false
     private var configurationUpdateInFlight = false
     private var configurationUpdatePending = false
-    private var currentIsDeviceBound = false
     private var currentPolicy = WebFilterPolicySnapshot(
         configuration: WebFilterConfiguration(),
         isDeviceBound: false,
@@ -65,8 +64,15 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         }
     }
 
+    /// 只在家长真正打开「网站访问限制」时才为真——不是"设备已绑定"就为真。
+    ///
+    /// currentPolicy.enabled 本来就是 isDeviceBound && configuration.enabled（见
+    /// WebFilterPolicySnapshot.init），直接复用它，不用另外维护一份判据。此前这里只看
+    /// isDeviceBound：任何设备一绑定，不管家长有没有打开网站限制，孩子那台 Mac 上立刻
+    /// 弹出系统扩展授权请求——多数家庭其实从未用到这项功能，却要先经历一次系统弹窗。
+    /// 现在把它推迟到 webFilter.enabled 第一次变成 true 的那次 synchronize 才发生。
     private var shouldRunContentFilter: Bool {
-        currentIsDeviceBound
+        currentPolicy.enabled
     }
 
     /// 家长端"扩展被关掉了"这一条的判据。只有在扩展确实激活成功过之后，"系统里过滤
@@ -226,7 +232,6 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {
-        currentIsDeviceBound = isDeviceBound
         currentPolicy = WebFilterPolicySnapshot(
             configuration: configuration,
             isDeviceBound: isDeviceBound
