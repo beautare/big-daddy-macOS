@@ -35,6 +35,9 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     /// 两句话——"还在确认"和"已经被人关掉了"。凭一次都没读到就报后者，会在每次开机的
     /// 头几秒给家长一个假警报。
     private var systemFilterEnabled: Bool?
+    /// 检测到"过滤被外部关掉"之后已经自动重开过几次。见 repairSystemFilterIfPossible。
+    private var filterRepairAttempts = 0
+    private static let maxFilterRepairAttempts = 3
     private let providerConnection = WebFilterProviderConnection()
 
     private var filterConfigurationObserver: NSObjectProtocol?
@@ -176,10 +179,50 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         guard systemFilterEnabled != enabled else { return }
         let hadValue = systemFilterEnabled != nil
         systemFilterEnabled = enabled
-        if hadValue && !enabled && shouldRunContentFilter && activationCompleted {
+        if enabled {
+            // 确实恢复了，重试预算归零，下次再被关掉还能再自愈三次
+            filterRepairAttempts = 0
+        } else if hadValue && shouldRunContentFilter && activationCompleted {
             AuditLog.record("WEB_FILTER_DISABLED_EXTERNALLY")
+            repairSystemFilterIfPossible()
         }
         notifyStateChanged()
+    }
+
+    /// 被关掉之后自己重新打开。
+    ///
+    /// 这是监护类产品的本分：孩子（或任何坐在这台机器前的人）在系统设置里把网络过滤
+    /// 关掉之后，客户端不能只是如实上报一句"已被关闭"然后干等——那等于把开关交到了
+    /// 被监护的一方手里。NEFilterManager 那份配置归本 App 所有，把 isEnabled 重新置
+    /// true 并保存不需要任何用户交互。
+    ///
+    /// 这条恢复路径此前整个不存在：`updateSystemFilterEnabled` 只观察不修复，而
+    /// `enableContentFilter()` 只在配置变更或激活完成时才被调用。于是"在系统设置里把
+    /// 网络扩展关掉再打开"会让客户端永久停在"已被关闭"——菜单里那条「点此恢复」也只是
+    /// 打开系统设置，并不真的恢复什么。等于任何人只要拨一次那个开关，就能把整个网站
+    /// 访问限制永久关掉。
+    ///
+    /// 必须有次数上限：如果系统扩展本身被停用、或 macOS 因为别的原因拒绝保存，无限重试
+    /// 会变成一个"每次配置变更都自我触发"的死循环。用完预算就停手，如实上报 DISABLED，
+    /// 由家长按引导去系统设置处理。
+    private func repairSystemFilterIfPossible() {
+        guard shouldRunContentFilter, activationCompleted else { return }
+        guard filterRepairAttempts < Self.maxFilterRepairAttempts else {
+            AuditLog.record("WEB_FILTER_REPAIR_GAVE_UP attempts=\(filterRepairAttempts)")
+            return
+        }
+        filterRepairAttempts += 1
+        AuditLog.record("WEB_FILTER_REPAIR_ATTEMPT attempt=\(filterRepairAttempts)")
+        enableContentFilter()
+    }
+
+    /// 家长在菜单/「关于」窗口里点「重新开启」时调用。
+    ///
+    /// 与自动恢复共用同一条路径，区别只是重置重试预算：这是一次明确的人类意图，
+    /// 不该被之前那几次自动重试用掉的额度挡住。
+    func repairSystemFilterNow() {
+        filterRepairAttempts = 0
+        applyDesiredFilterState()
     }
 
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {

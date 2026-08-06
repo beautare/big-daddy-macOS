@@ -3472,9 +3472,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 en: "Website Access Restrictions Are Turned Off"
             )
             alert.informativeText = Localization.string(
-                zh: "BigDaddy 的网络扩展在系统设置里被关掉了，家长设置的域名当前一个都没有拦截。点「继续」后，在“网络扩展”列表里把 BigDaddy.app 的开关重新打开即可。\n\n如果没有直接跳到“网络扩展”：在“登录项与扩展”页面拉到底部的“扩展”，点“网络扩展”右侧的“显示细节”。",
-                en: "BigDaddy's network extension was turned off in System Settings, so none of the configured domains are being blocked right now. Continue, then turn BigDaddy.app back on in the Network Extensions list.\n\nIf it doesn't jump straight to Network Extensions: scroll to Extensions at the bottom of Login Items & Extensions and click Details next to Network Extensions."
+                zh: "BigDaddy 的网络扩展被关掉了，家长设置的域名当前一个都没有拦截。\n\n多数情况下点「重新开启」就能直接恢复，不用去系统设置。如果点完仍然显示已关闭，再走「打开系统设置」：在“登录项与扩展”页面拉到底部的“扩展”，点“网络扩展”右侧的“显示细节”，把 BigDaddy.app 的开关打开。",
+                en: "BigDaddy's network extension was turned off, so none of the configured domains are being blocked right now.\n\nIn most cases \"Turn It Back On\" restores it directly — no trip to System Settings needed. If it still shows as off afterwards, use \"Open System Settings\": scroll to Extensions at the bottom of Login Items & Extensions, click Details next to Network Extensions, and switch BigDaddy.app on."
             )
+            // 这一种给三颗按钮：先给最省事的那条（直接重开），系统设置退居备选。
+            // 其余两种情况没有"App 自己就能修好"的可能，仍然只能把人送去系统设置。
+            alert.addButton(withTitle: Localization.string(zh: "重新开启", en: "Turn It Back On"))
+            alert.addButton(withTitle: Localization.string(zh: "打开系统设置", en: "Open System Settings"))
+            alert.addButton(withTitle: Localization.string(zh: "稍后再说", en: "Later"))
+            NSApp.activate(ignoringOtherApps: true)
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                webFilterController.repairSystemFilterNow()
+            case .alertSecondButtonReturn:
+                openNetworkExtensionSettings()
+            default:
+                break
+            }
+            return
         case .failed(let message):
             alert.messageText = Localization.string(
                 zh: "网站访问限制启用失败",
