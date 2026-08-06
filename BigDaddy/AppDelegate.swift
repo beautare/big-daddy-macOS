@@ -3349,8 +3349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             en: "Website Access Restrictions Need Approval"
         )
         alert.informativeText = Localization.string(
-            zh: "点「继续」后，系统会打开“登录项与扩展”。在“网络扩展”中打开 BigDaddy.app 即可；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。",
-            en: "Continue to open Login Items & Extensions, then turn on BigDaddy.app under Network Extensions. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval."
+            zh: "点「继续」后，系统会打开“登录项与扩展”。在页面底部“扩展”的“网络扩展”右侧点“显示细节”，再打开 BigDaddy.app；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。",
+            en: "Continue to open Login Items & Extensions. Under Extensions at the bottom, click Details next to Network Extensions, then turn on BigDaddy.app. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval."
         )
         alert.addButton(withTitle: Localization.string(zh: "继续", en: "Continue"))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))

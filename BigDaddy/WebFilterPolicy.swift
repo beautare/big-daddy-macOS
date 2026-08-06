@@ -15,7 +15,6 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     static let schemaVersion = 1
 
     let schemaVersion: Int
-    let policyID: UUID
     let enabled: Bool
     let revision: Int64
     let blockedDomains: [WebFilterRule]
@@ -24,11 +23,9 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     init(
         configuration: WebFilterConfiguration,
         isDeviceBound: Bool,
-        policyID: UUID = UUID(),
         appliedAt: Date = Date()
     ) {
         self.schemaVersion = Self.schemaVersion
-        self.policyID = policyID
         self.enabled = isDeviceBound && configuration.enabled
         self.revision = configuration.revision
         self.blockedDomains = configuration.blockedDomains
@@ -83,7 +80,6 @@ enum WebFilterPolicyTransport {
 }
 
 struct WebFilterProviderAcknowledgement: Codable, Equatable {
-    let policyID: UUID
     let appliedRevision: Int64
     let ruleCount: Int
     let blockedDomains: [WebFilterRule]
@@ -91,7 +87,6 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     let appliedAt: Date
 
     init(policy: WebFilterPolicySnapshot, appliedAt: Date = Date()) {
-        policyID = policy.policyID
         appliedRevision = policy.revision
         ruleCount = policy.blockedDomains.count
         blockedDomains = policy.blockedDomains
@@ -100,8 +95,7 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     }
 
     func confirms(_ policy: WebFilterPolicySnapshot) -> Bool {
-        policyID == policy.policyID
-            && appliedRevision == policy.revision
+        appliedRevision == policy.revision
             && ruleCount == policy.blockedDomains.count
             && blockedDomains == policy.blockedDomains
             && enforcementEnabled == policy.enabled

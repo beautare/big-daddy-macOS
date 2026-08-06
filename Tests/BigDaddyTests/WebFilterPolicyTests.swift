@@ -69,34 +69,51 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertTrue(WebFilterProviderAcknowledgement(policy: policy).confirms(policy))
     }
 
+    func testProviderAcknowledgementConfirmsSamePolicyAfterClientRestart() {
+        let configuration = WebFilterConfiguration(
+            enabled: true,
+            revision: 7,
+            blockedDomains: [WebFilterRule(domain: "example.com", includeSubdomains: true)]
+        )
+        let appliedPolicy = WebFilterPolicySnapshot(
+            configuration: configuration,
+            isDeviceBound: true,
+            appliedAt: Date(timeIntervalSince1970: 0)
+        )
+        let restartedClientPolicy = WebFilterPolicySnapshot(
+            configuration: configuration,
+            isDeviceBound: true,
+            appliedAt: Date(timeIntervalSince1970: 1)
+        )
+
+        XCTAssertTrue(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(restartedClientPolicy))
+    }
+
     func testProviderAcknowledgementRejectsStaleOrDifferentPolicy() {
-        let policyID = UUID()
         let appliedPolicy = makePolicy(enabled: false, rules: [
             WebFilterRule(domain: "example.com", includeSubdomains: true)
-        ], policyID: policyID)
+        ])
         let currentPolicy = makePolicy(enabled: true, rules: [
             WebFilterRule(domain: "example.com", includeSubdomains: true)
-        ], policyID: policyID)
+        ])
 
         XCTAssertFalse(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(currentPolicy))
     }
 
     func testProviderAcknowledgementRejectsDifferentRulesWithSameRevisionAndCount() {
-        let policyID = UUID()
         let appliedPolicy = makePolicy(enabled: true, rules: [
             WebFilterRule(domain: "example.com", includeSubdomains: true)
-        ], policyID: policyID)
+        ])
         let currentPolicy = makePolicy(enabled: true, rules: [
             WebFilterRule(domain: "example.org", includeSubdomains: true)
-        ], policyID: policyID)
+        ])
 
         XCTAssertFalse(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(currentPolicy))
     }
 
     private func makePolicy(
         enabled: Bool,
-        rules: [WebFilterRule],
-        policyID: UUID = UUID()
+        rules: [WebFilterRule]
     ) -> WebFilterPolicySnapshot {
         WebFilterPolicySnapshot(
             configuration: WebFilterConfiguration(
@@ -105,7 +122,6 @@ final class WebFilterPolicyTests: XCTestCase {
                 blockedDomains: rules
             ),
             isDeviceBound: true,
-            policyID: policyID,
             appliedAt: Date(timeIntervalSince1970: 0)
         )
     }
