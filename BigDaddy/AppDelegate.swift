@@ -3452,8 +3452,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         applyShieldIcon(to: alert)
         alert.alertStyle = .warning
 
-        // 三种情况共用同一个落点（那张"网络扩展"表单），但开场白必须不同：
-        // "还没批准"和"被人关掉了"对家长意味着完全不同的两件事。
+        // 只有"还没批准"落到函数末尾共用的两按钮弹窗；"被人关掉了"和"启用失败"
+        // 都有 App 自己能触发的修复动作，各自三个按钮、各自 runModal，处理完直接
+        // return，不再往下走。
         switch attention {
         case .none:
             return
@@ -3476,7 +3477,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 en: "BigDaddy's network extension was turned off, so none of the configured domains are being blocked right now.\n\nIn most cases \"Turn It Back On\" restores it directly — no trip to System Settings needed. If it still shows as off afterwards, use \"Open System Settings\": scroll to Extensions at the bottom of Login Items & Extensions, click Details next to Network Extensions, and switch BigDaddy.app on."
             )
             // 这一种给三颗按钮：先给最省事的那条（直接重开），系统设置退居备选。
-            // 其余两种情况没有"App 自己就能修好"的可能，仍然只能把人送去系统设置。
             alert.addButton(withTitle: Localization.string(zh: "重新开启", en: "Turn It Back On"))
             alert.addButton(withTitle: Localization.string(zh: "打开系统设置", en: "Open System Settings"))
             alert.addButton(withTitle: Localization.string(zh: "稍后再说", en: "Later"))
@@ -3495,10 +3495,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 zh: "网站访问限制启用失败",
                 en: "Website Access Restrictions Failed to Start"
             )
+            // 启用这项功能实际要过两道系统关卡：「登录项与扩展→网络扩展」里的开关（一次性，
+            // 批准过就不会再问），和每次真正保存过滤配置时系统弹出的"允许网络过滤"确认框。
+            // 孩子在任一处点了"不允许"/"取消"都会落到这个分支，但家长光看错误原因分不清是
+            // 哪一处——所以文案把两处都点名，并且明确告诉家长点「重试」之后要盯着屏幕看
+            // 有没有新弹窗，而不是无差别地建议重启。
             alert.informativeText = Localization.string(
-                zh: "系统给出的原因：\(message)\n\n先点「继续」，在“网络扩展”里确认 BigDaddy.app 的开关是打开的。如果开关本来就是开的，重启这台 Mac 后通常就能恢复。",
-                en: "The system reported: \(message)\n\nContinue and confirm BigDaddy.app is switched on under Network Extensions. If it already is, restarting this Mac usually clears it."
+                zh: "系统给出的原因：\(message)\n\n启用网站访问限制需要两处系统授权都通过：「登录项与扩展→网络扩展」里 BigDaddy.app 的开关，以及点「重试」时系统会弹出的“允许网络过滤”确认框——这次没能生效，多半是其中一处被跳过或点了“不允许”。\n\n点「重试」后请留意 Mac 屏幕上新弹出的系统确认框，选择“允许”。如果没有新弹窗出现，说明卡在开关那一步：先点「打开系统设置」，在“网络扩展”里确认 BigDaddy.app 的开关是打开的，再回来点一次「重试」。",
+                en: "The system reported: \(message)\n\nTurning on website restrictions needs two separate system approvals: BigDaddy.app's switch under Network Extensions in Login Items & Extensions, and the \"Allow filtering network content\" confirmation macOS shows when saving the filter. This attempt likely missed or declined one of them.\n\nClick Retry and watch this Mac's screen for a new system confirmation — choose Allow. If no new prompt appears, the switch is the one that's off: use Open System Settings to confirm BigDaddy.app is on under Network Extensions, then click Retry again."
             )
+            // 「重试」放第一位、且真的调用 repairSystemFilterNow() 重新走一遍
+            // enableContentFilter()：这是家长在孩子 Mac 前唯一需要做的事——不管刚才是
+            // 开关没打开还是过滤确认框被拒，重新触发一次保存都会让系统把该问的再问一遍，
+            // 不需要重启整台 Mac。系统设置退居备选，给"开关到底有没有打开"存疑时用。
+            alert.addButton(withTitle: Localization.string(zh: "重试", en: "Retry"))
+            alert.addButton(withTitle: Localization.string(zh: "打开系统设置", en: "Open System Settings"))
+            alert.addButton(withTitle: Localization.string(zh: "稍后再说", en: "Later"))
+            NSApp.activate(ignoringOtherApps: true)
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                webFilterController.repairSystemFilterNow()
+            case .alertSecondButtonReturn:
+                openNetworkExtensionSettings()
+            default:
+                break
+            }
+            return
         }
 
         alert.addButton(withTitle: Localization.string(zh: "继续", en: "Continue"))
