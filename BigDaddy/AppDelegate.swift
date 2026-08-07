@@ -3464,8 +3464,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 en: "Website Access Restrictions Need Approval"
             )
             alert.informativeText = Localization.string(
-                zh: "点「继续」后，系统会打开“登录项与扩展”里的“网络扩展”。在列表里找到 BigDaddy.app，把它右边的开关打开；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。\n\n如果没有直接跳到“网络扩展”：在“登录项与扩展”页面拉到底部的“扩展”，点“网络扩展”右侧的“显示细节”。",
-                en: "Continue to open Network Extensions under Login Items & Extensions. Find BigDaddy.app in the list and turn on its switch. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval.\n\nIf it doesn't jump straight to Network Extensions: scroll to Extensions at the bottom of Login Items & Extensions and click Details next to Network Extensions."
+                zh: "点「继续」后，系统会打开“登录项与扩展”里的“网络扩展”。在列表里找到 BigDaddy.app，把它右边的开关打开；这是 macOS 为网络过滤设置的安全确认，批准后会自动继续同步策略。\n\n如果没有直接跳到“网络扩展”：在“登录项与扩展”页面拉到底部的“扩展”，找到“网络扩展”这一行，点它最右边的小图标（不同 macOS 版本样子不太一样，有的是三个点，有的是一个圆圈里带个 i）。",
+                en: "Continue to open Network Extensions under Login Items & Extensions. Find BigDaddy.app in the list and turn on its switch. macOS requires this security confirmation for network filtering; policy synchronization resumes automatically after approval.\n\nIf it doesn't jump straight to Network Extensions: scroll to Extensions at the bottom of Login Items & Extensions, find the Network Extensions row, and click the small icon at its right end (its look varies by macOS version — sometimes three dots, sometimes a circled i)."
             )
         case .disabledExternally:
             alert.messageText = Localization.string(
@@ -3473,8 +3473,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 en: "Website Access Restrictions Are Turned Off"
             )
             alert.informativeText = Localization.string(
-                zh: "BigDaddy 的网络扩展被关掉了，家长设置的域名当前一个都没有拦截。\n\n多数情况下点「重新开启」就能直接恢复，不用去系统设置。如果点完仍然显示已关闭，再走「打开系统设置」：在“登录项与扩展”页面拉到底部的“扩展”，点“网络扩展”右侧的“显示细节”，把 BigDaddy.app 的开关打开。",
-                en: "BigDaddy's network extension was turned off, so none of the configured domains are being blocked right now.\n\nIn most cases \"Turn It Back On\" restores it directly — no trip to System Settings needed. If it still shows as off afterwards, use \"Open System Settings\": scroll to Extensions at the bottom of Login Items & Extensions, click Details next to Network Extensions, and switch BigDaddy.app on."
+                zh: "BigDaddy 的网络扩展被关掉了，家长设置的域名当前一个都没有拦截。\n\n多数情况下点「重新开启」就能直接恢复，不用去系统设置。如果点完仍然显示已关闭，再走「打开系统设置」：在“登录项与扩展”页面拉到底部的“扩展”，找到“网络扩展”这一行，点它最右边的小图标（不同 macOS 版本样子不太一样，有的是三个点，有的是一个圆圈里带个 i），把 BigDaddy.app 的开关打开。",
+                en: "BigDaddy's network extension was turned off, so none of the configured domains are being blocked right now.\n\nIn most cases \"Turn It Back On\" restores it directly — no trip to System Settings needed. If it still shows as off afterwards, use \"Open System Settings\": scroll to Extensions at the bottom of Login Items & Extensions, find the Network Extensions row, click the small icon at its right end (its look varies by macOS version — sometimes three dots, sometimes a circled i), and switch BigDaddy.app on."
             )
             // 这一种给三颗按钮：先给最省事的那条（直接重开），系统设置退居备选。
             alert.addButton(withTitle: Localization.string(zh: "重新开启", en: "Turn It Back On"))
@@ -3534,8 +3534,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 直接落到「网络扩展」那张详情表单，而不是「登录项与扩展」整页。
     ///
-    /// 整页打开的话，家长还得自己滚到底部、在“扩展”里找到“网络扩展”、点“显示细节”，
-    /// 三步之后才是那个开关——而这正是最容易走丢的三步。
+    /// 整页打开的话，家长还得自己滚到底部、在“扩展”里找到“网络扩展”、点它右边那个
+    /// 详情图标（这个图标的样子本身也随 macOS 版本变过，实测 macOS 27 上是个圆圈
+    /// 带 i，不是老版本常说的“显示细节”/三个点），三步之后才是那个开关——而这正是
+    /// 最容易走丢的三步。
     /// com.apple.ExtensionsPreferences 是「登录项与扩展」面板自己声明的 url_alias
     /// （见 /System/Library/ExtensionKit/Extensions/LoginItems.appex 的 Info.plist），
     /// 带上 extensionPointIdentifier 可以直接把对应那张表单弹出来。
