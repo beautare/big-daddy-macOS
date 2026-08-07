@@ -1571,6 +1571,17 @@ final class BigDaddyClient {
     /// 都不应该回执 SUCCEEDED，此前命令通道无条件回执成功，是一种"假成功"）。
     @discardableResult
     func captureAndSendScreenshot(reason: String) async -> Bool {
+        // 未绑定设备只做最基础登记、不采集行为明细——这是给孩子看的明确承诺（见「守护
+        // 说明」弹窗）。screenshotEnabled 单独判断不够：解绑时 refreshConfig() 只翻转
+        // bound、刻意保留 screenshotEnabled 原值（不能用"未绑定"信号覆盖整份本地配置），
+        // 所以"曾经绑定且开过截图的设备被解绑后"，光看 screenshotEnabled 这一个字段
+        // 会认为截图仍应该继续——实际发生过：这个函数在 pollCommands（已有 config.bound
+        // 门禁）之外还有定时和手动两条路径，此前都没有独立的 bound 检查，真的会在未绑定
+        // 状态下截屏（哪怕上传大概率被后端拒收，本机截屏动作本身已经发生）。
+        guard config.bound else {
+            NSLog("BigDaddy: device not bound, ignoring capture request (reason: \(reason)).")
+            return false
+        }
         // screenshotEnabled 由后端配置控制，默认关闭。
         // 任何路径（定时/手动/命令）都必须在开启后才允许截屏，命令通道不再绕过此开关。
         guard config.screenshotEnabled else {

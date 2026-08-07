@@ -1187,7 +1187,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 它缺失时家长一张截图都收不到，比"有标题没链接"更严重。
     private func updateStatusItemAppearance(capturing: Bool = false) {
         guard let button = statusItem?.button else { return }
-        let on = client.config.screenshotEnabled
+        // 不能只看 screenshotEnabled：解绑时 refreshConfig() 只翻转 bound，刻意保留
+        // screenshotEnabled 原值不动（见该函数注释——不能用"未绑定"信号覆盖整份本地
+        // 配置）。结果是"曾经绑定且开过截图的设备被解绑后"，screenshotEnabled 仍是
+        // true，图标会一直挂着"正在看着"的圆环角标，跟菜单里"尚未绑定"的文字自相矛盾。
+        let on = client.config.bound && client.config.screenshotEnabled
         let missingScreenRecording = on && !checkScreenRecordingPermission()
         let missingAutomation = client.config.bound && !automationDeniedBundleIDs.isEmpty
         // 待批准、被人关掉、启用失败三种都要变警示态：它们都是"家长配置了、实际却不
@@ -2487,11 +2491,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             zh: "这台电脑上装了什么？",
             en: "What's running on this Mac?"
         )
-        // 采集说明随当前真实状态变化，避免"文案说没开、实际已开"的表里不一
-        let shotStatusZh = client.config.screenshotEnabled
+        // 采集说明随当前真实状态变化，避免"文案说没开、实际已开"的表里不一。
+        // 这个弹窗在首次启动、尚未绑定时也会弹出（见 presentFirstRunDisclosureIfNeeded），
+        // 而 screenshotEnabled 单独判断在"曾经绑定并开过截图、之后被解绑"这种情况下
+        // 会残留 true（解绑只翻转 bound，见 refreshConfig 的注释）——不加 bound 这道
+        // 门禁，孩子会被明确告知"截图现在是开着的"，而实际上（配合上面 captureAndSendScreenshot
+        // 的 bound 门禁）这台未绑定的设备根本不会截图，是当着孩子的面撒谎。
+        let shotEffectivelyOn = client.config.bound && client.config.screenshotEnabled
+        let shotStatusZh = shotEffectivelyOn
             ? "截图现在是开着的——家长可以看到你的屏幕画面。每拍一次，这台电脑上都会弹通知告诉你，并且记进下面说的那个文件里。"
             : "截图现在是关着的，只记上面这些文字，不会拍你的屏幕。"
-        let shotStatusEn = client.config.screenshotEnabled
+        let shotStatusEn = shotEffectivelyOn
             ? "Screenshots are on right now — your parent can see your screen. Every time one is taken, this Mac pops up a notice to tell you, and writes it into the file mentioned below."
             : "Screenshots are off right now. It only notes the text above; it does not capture your screen."
         alert.informativeText = Localization.string(
