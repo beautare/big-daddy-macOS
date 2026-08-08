@@ -85,13 +85,27 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     let blockedDomains: [WebFilterRule]
     let enforcementEnabled: Bool
     let appliedAt: Date
+    /// **provider 进程自身的启动时刻**，与 appliedAt 是两件不同的事，别混用。
+    ///
+    /// appliedAt 每次重新应用策略都会刷新，因此它证明不了"provider 进程没重启过"——主 App
+    /// 每次启动都会无条件重写一次 vendorConfiguration（见 WebFilterController.enableContentFilter），
+    /// provider 收到 KVO 就 reloadPolicy 并发一份 appliedAt=now 的新回执。拿 appliedAt 去判断
+    /// 进程存活，结论会**恒为否**。
+    ///
+    /// 这个字段只在 provider 进程构造时取一次值、此后再不改变，正好回答"这个 provider 进程
+    /// 是什么时候起来的"——也就是 WebFilterController.extensionSurvivedGap 真正需要的信号。
+    ///
+    /// 可选是为了容忍版本错位：主 App 与系统扩展在更新期间可能短暂不同版本，旧 provider 发来
+    /// 的回执没有这个字段，解码成 nil ⇒ 调用方按"问不出来"处理，而不是误判成"没存活"。
+    let providerStartedAt: Date?
 
-    init(policy: WebFilterPolicySnapshot, appliedAt: Date = Date()) {
+    init(policy: WebFilterPolicySnapshot, appliedAt: Date = Date(), providerStartedAt: Date? = nil) {
         appliedRevision = policy.revision
         ruleCount = policy.blockedDomains.count
         blockedDomains = policy.blockedDomains
         enforcementEnabled = policy.enabled
         self.appliedAt = appliedAt
+        self.providerStartedAt = providerStartedAt
     }
 
     func confirms(_ policy: WebFilterPolicySnapshot) -> Bool {

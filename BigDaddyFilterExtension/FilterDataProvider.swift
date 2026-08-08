@@ -50,6 +50,11 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// 可以忽略；取太小会把扩展塞进热路径，取太大则没有意义——反正只是保持挂载。
     private static let passThroughChunkBytes = 4 * 1024 * 1024
 
+    /// 本 provider 进程的启动时刻，构造时取一次、此后不变。主 App 靠它回答"这个扩展在那段
+    /// 空窗期里有没有重启过"（见 WebFilterController.extensionSurvivedGap）——**不能**用
+    /// 回执里的 appliedAt 代替，那个每次重新应用策略都会刷新，详见
+    /// WebFilterProviderAcknowledgement.providerStartedAt 的注释。
+    private let providerStartedAt = Date()
     private let policyLock = NSLock()
     private var policy = WebFilterPolicySnapshot(
         configuration: WebFilterConfiguration(),
@@ -234,7 +239,8 @@ final class FilterDataProvider: NEFilterDataProvider {
         let isStillCurrent = policy == nextPolicy
         policyLock.unlock()
         guard isStillCurrent else { return }
-        ipcListener?.publish(WebFilterProviderAcknowledgement(policy: nextPolicy))
+        ipcListener?.publish(WebFilterProviderAcknowledgement(
+            policy: nextPolicy, providerStartedAt: providerStartedAt))
     }
 
     // MARK: - 判定与记账

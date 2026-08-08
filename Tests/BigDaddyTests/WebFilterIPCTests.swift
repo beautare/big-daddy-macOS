@@ -75,4 +75,46 @@ final class WebFilterIPCTests: XCTestCase {
         // 过完这一圈还得认得出自己确认的是哪份策略——家长端"实际版本/已生效"整列都靠它
         XCTAssertTrue(decoded?.confirms(policy) == true)
     }
+
+    /// providerStartedAt 是"扩展熬过空窗期了吗"的唯一判据（见 WebFilterController
+    /// .extensionSurvivedGap），它必须真的能过 XPC 这条线——这个字段是后加的，
+    /// 而回执正是靠 Codable 编解码跨进程传递的。
+    func testProcessStartTimestampSurvivesTheWire() {
+        let policy = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(
+                enabled: true,
+                revision: 6,
+                blockedDomains: [WebFilterRule(domain: "youtube.com", includeSubdomains: true)]
+            ),
+            isDeviceBound: true,
+            appliedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let providerStartedAt = Date(timeIntervalSince1970: 1_699_990_000)
+        let acknowledgement = WebFilterProviderAcknowledgement(
+            policy: policy,
+            appliedAt: Date(timeIntervalSince1970: 1_700_000_123),
+            providerStartedAt: providerStartedAt
+        )
+
+        let decoded = WebFilterAcknowledgementCodec.encode(acknowledgement)
+            .flatMap(WebFilterAcknowledgementCodec.decode)
+
+        XCTAssertEqual(decoded?.providerStartedAt, providerStartedAt)
+    }
+
+    /// 缺字段的旧版回执必须解码成功且 providerStartedAt 为 nil——版本错位时
+    /// 要退化成"问不出来"，而不是解码整体失败（那会连策略回执一起丢掉，
+    /// 家长端的"实际版本/已生效"整列都会跟着变成未知）。
+    func testLegacyAcknowledgementWithoutProcessStartStillDecodes() {
+        let legacyJSON = """
+        {"appliedRevision":6,"ruleCount":1,\
+        "blockedDomains":[{"domain":"youtube.com","includeSubdomains":true}],\
+        "enforcementEnabled":true,"appliedAt":"2023-11-14T22:13:20Z"}
+        """.data(using: .utf8)!
+
+        let decoded = WebFilterAcknowledgementCodec.decode(legacyJSON)
+
+        XCTAssertNotNil(decoded, "旧版回执必须仍然解码得出来")
+        XCTAssertNil(decoded?.providerStartedAt)
+    }
 }
