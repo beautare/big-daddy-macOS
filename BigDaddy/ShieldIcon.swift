@@ -49,6 +49,14 @@ enum ShieldIcon {
     ///
     /// 需要更丰富的图形（真正的眼睛、带框三角）的地方是「关于」窗口和各种弹窗——那里
     /// 尺寸够，可以放；菜单栏这 16pt 就老实用剪影。
+    ///
+    /// 6. **右上角独立开第二个徽章位**（网站访问受限）：一开始想把"受限"也塞进右下角
+    ///    这同一枚徽章里，跟 warning/watching/capturing 四选一。放弃的理由是信息会丢：
+    ///    如果孩子的 Mac 同时"缺辅助功能权限"又"网站正被限制"，四选一的话家长/孩子
+    ///    只会看到感叹号，"网站受限"这个事实被完全盖住。改成右上角单独一枚徽章、只表达
+    ///    "受限/不受限"这一件事，跟右下角那枚各管一段、互不覆盖——两件独立的事，天生
+    ///    就该是两个独立的信号，不必也不该挤进同一个徽章位再靠优先级去抢。盾牌顶边是
+    ///    一条直线（0.16w~0.84w），比靠近盾牌尖端的右下角更宽敞，放得下。
     enum Variant {
         /// 已守护、未开启截图：只有盾牌，不带任何徽章
         case brand
@@ -60,31 +68,59 @@ enum ShieldIcon {
         case warning
     }
 
-    /// 徽章直径相对盾牌宽度的比例。
+    /// 右下角徽章（Variant 四选一）直径相对盾牌宽度的比例。
     private static let badgeSizeRatio: CGFloat = 0.58
+    /// 右上角"受限"徽章直径相对盾牌宽度的比例。比右下角略大一圈：它裁的是圈+斜杠，
+    /// 环带本身需要比裸感叹号的竖杠更宽的绝对像素才读得清（见 cutProhibition 的注释），
+    /// 而它是独占一个角、不需要跟其他图案共享视觉预算，放大这一点点划算。
+    private static let restrictedBadgeSizeRatio: CGFloat = 0.62
     /// 挖洞半径相对徽章半径的倍数：挖洞比徽章本身大一圈，在徽章和盾牌之间留一条
-    /// 干净的呼吸缝，避免徽章边缘和盾牌的棋盘格/描边线像素级硬碰硬。
+    /// 干净的呼吸缝，避免徽章边缘和盾牌的棋盘格/描边线像素级硬碰硬。两个徽章位共用
+    /// 这一个比例。
     private static let knockoutRatio: CGFloat = 1.22
     /// 徽章圆心位置，取盾牌自身坐标系（0...pointSize 宽、0...shieldHeight 高）的比例。
-    /// 偏右下——贴近盾牌的尖角，是徽章"挂"在盾牌上最自然的位置，也符合角标的
-    /// 通行放法（iOS App 角标同样是右上/右下角，不会放在图形正中间）。
+    /// 右下角贴近盾牌的尖角，是徽章"挂"在盾牌上最自然的位置，也符合角标的通行放法
+    /// （iOS App 角标同样是右上/右下角，不会放在图形正中间）。
     private static let badgeCenterXRatio: CGFloat = 0.80
     private static let badgeCenterYRatio: CGFloat = 0.24
+    /// 右上角"受限"徽章圆心的纵向位置，横向与右下角共用 badgeCenterXRatio（两枚徽章
+    /// 贴着盾牌右边缘上下排开，视觉上对齐成一条线）。这个数字目前只是起始值——两枚
+    /// 徽章同时出现时是否留出了足够的呼吸间隙，需要用 render_icon_preview.swift
+    /// 渲染真实大小之后眼看确认，不是靠算出来的。
+    private static let restrictedBadgeCenterYRatio: CGFloat = 0.90
 
-    /// - Parameter pointSize: 盾牌的宽度。带徽章的状态整体会比盾牌本身略宽/略高一点
-    ///   （徽章会有一小部分探出盾牌的右下角轮廓，这是角标的常见画法），菜单栏用的是
-    ///   `NSStatusItem.variableLength`，尺寸随状态变化本来就是支持的。
-    static func image(pointSize: CGFloat, variant: Variant = .brand) -> NSImage {
+    /// - Parameters:
+    ///   - pointSize: 盾牌的宽度。带徽章的状态整体会比盾牌本身略宽/略高一点（徽章会
+    ///     有一小部分探出盾牌轮廓，这是角标的常见画法），菜单栏用的是
+    ///     `NSStatusItem.variableLength`，尺寸随状态变化本来就是支持的。
+    ///   - variant: 右下角徽章——"守护本身现在是什么状态"，四选一。
+    ///   - restricted: 右上角徽章开关——"网站访问现在是不是受限"，独立于 variant，
+    ///     两者可以同时为真同时显示（比如同时缺权限又在限网）。
+    static func image(pointSize: CGFloat, variant: Variant = .brand, restricted: Bool = false) -> NSImage {
         let shieldBox = NSSize(width: pointSize, height: pointSize * aspectRatio)
         let badgeR = pointSize * badgeSizeRatio / 2
         let knockoutR = badgeR * knockoutRatio
-        // 徽章圆心在"盾牌本身矩形"坐标系里的位置；如果徽章需要探出盾牌右边/顶边/
-        // 底边，画布要跟着放大，否则探出去的部分会被裁掉。整个画布以盾牌左下角为
-        // 原点，plainCenter 是徽章圆心相对盾牌矩形左下角的坐标。
-        let plainCenter = NSPoint(x: pointSize * badgeCenterXRatio, y: shieldBox.height * badgeCenterYRatio)
-        let overflowRight = variant == .brand ? 0 : max(0, plainCenter.x + knockoutR - shieldBox.width)
-        let overflowBottom = variant == .brand ? 0 : max(0, knockoutR - plainCenter.y)
-        let overflowTop = variant == .brand ? 0 : max(0, plainCenter.y + knockoutR - shieldBox.height)
+        let restrictedR = pointSize * restrictedBadgeSizeRatio / 2
+        let restrictedKnockoutR = restrictedR * knockoutRatio
+
+        // 两枚徽章各自在"盾牌本身矩形"坐标系里的圆心位置；哪个探出盾牌边界，画布就要
+        // 跟着往那个方向放大，否则探出去的部分会被裁掉。整个画布以盾牌左下角为原点。
+        let bottomCenter = NSPoint(x: pointSize * badgeCenterXRatio, y: shieldBox.height * badgeCenterYRatio)
+        let topCenter = NSPoint(x: pointSize * badgeCenterXRatio, y: shieldBox.height * restrictedBadgeCenterYRatio)
+
+        var overflowRight: CGFloat = 0
+        var overflowBottom: CGFloat = 0
+        var overflowTop: CGFloat = 0
+        if variant != .brand {
+            overflowRight = max(overflowRight, bottomCenter.x + knockoutR - shieldBox.width)
+            overflowBottom = max(overflowBottom, knockoutR - bottomCenter.y)
+            overflowTop = max(overflowTop, bottomCenter.y + knockoutR - shieldBox.height)
+        }
+        if restricted {
+            overflowRight = max(overflowRight, topCenter.x + restrictedKnockoutR - shieldBox.width)
+            overflowBottom = max(overflowBottom, restrictedKnockoutR - topCenter.y)
+            overflowTop = max(overflowTop, topCenter.y + restrictedKnockoutR - shieldBox.height)
+        }
         let size = NSSize(width: shieldBox.width + overflowRight,
                           height: shieldBox.height + overflowBottom + overflowTop)
 
@@ -97,8 +133,12 @@ enum ShieldIcon {
         drawBrandShield(in: shieldRect, lineWidth: pointSize * 0.09)
 
         if variant != .brand {
-            let center = NSPoint(x: plainCenter.x, y: plainCenter.y + overflowBottom)
+            let center = NSPoint(x: bottomCenter.x, y: bottomCenter.y + overflowBottom)
             drawBadge(center: center, radius: badgeR, knockoutRadius: knockoutR, variant: variant)
+        }
+        if restricted {
+            let center = NSPoint(x: topCenter.x, y: topCenter.y + overflowBottom)
+            drawRestrictedBadge(center: center, radius: restrictedR, knockoutRadius: restrictedKnockoutR)
         }
 
         image.unlockFocus()
@@ -222,5 +262,84 @@ enum ShieldIcon {
         NSBezierPath(ovalIn: NSRect(x: center.x - dotD / 2, y: center.y - badgeRadius * 0.52,
                                     width: dotD, height: dotD)).fill()
         NSGraphicsContext.restoreGraphicsState()
+    }
+
+    // MARK: - 右上角"受限"徽章
+
+    /// 右上角徽章走跟右下角完全一样的"挖洞 → 填实心 → 镂空刻图案"三段式，只是图案
+    /// 固定是圈+斜杠，没有 switch——这个徽章位只表达一件事，不需要多态。
+    private static func drawRestrictedBadge(center: NSPoint, radius: CGFloat, knockoutRadius: CGFloat) {
+        clearCircle(center: center, radius: knockoutRadius)
+        NSColor.black.setFill()
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2)).fill()
+        cutProhibition(center: center, badgeRadius: radius)
+    }
+
+    /// 圈 + 斜杠镂空——"网站访问受限"，对应软件里通行的"禁止/不可用"图形（🚫、系统
+    /// "不可放置"光标），而不是裸感叹号那种警示语义——受限是预期状态，不是故障。
+    ///
+    /// 这是本文件里唯一一处明知故犯地违反第 5 条教训（"环带+内容"这类两段式结构在
+    /// 徽章尺寸下读不清）：圈和斜杠客观上就是两段式。用两处补偿：① 这枚徽章本身用
+    /// restrictedBadgeSizeRatio 放大过一圈；② 环带厚度按 capturing 那圈已经验证过
+    /// 清晰的比例来（outerRadius-innerRadius ≈ 0.28×badgeRadius），不是随手取的数字。
+    /// 即便如此，这依然是这份文件里风险最高的一笔图案，务必用
+    /// render_icon_preview.swift 渲染实际大小确认，不要只看这段代码就当它没问题——
+    /// 如果实测还是糊，退回单独一根贯穿横杠（cutNoEntry，见该函数注释里的备选方案）
+    /// 是风险更低的选项。
+    private static func cutProhibition(center: NSPoint, badgeRadius: CGFloat) {
+        let outerRadius = badgeRadius * 0.62
+        let innerRadius = badgeRadius * 0.34
+        let ring = NSBezierPath(ovalIn: NSRect(x: center.x - outerRadius, y: center.y - outerRadius,
+                                               width: outerRadius * 2, height: outerRadius * 2))
+        ring.windingRule = .evenOdd
+        ring.append(NSBezierPath(ovalIn: NSRect(x: center.x - innerRadius, y: center.y - innerRadius,
+                                                width: innerRadius * 2, height: innerRadius * 2)))
+        let bar = rotatedBarPath(center: center, length: outerRadius * 2.1,
+                                 thickness: badgeRadius * 0.22, angleDegrees: 45)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.compositingOperation = .clear
+        ring.fill()
+        bar.fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// 备选方案（未采用，留作记录）：单独一根贯穿徽章的横杠，对应交通标志里的
+    /// "禁止通行"（红底白杠），而不是圈+斜杠这种国际通用"禁止"图形。跟裸感叹号的
+    /// 竖杠是同一种单一实心色块结构，只是转 90 度、拉长到贯穿直径——不需要放大徽章
+    /// 也不需要担心两段式的糊字问题，是风险最低的选项。如果 cutProhibition 实测不
+    /// 清晰，把 drawRestrictedBadge 里的调用换成这个即可，不用改其余任何地方。
+    private static func cutNoEntry(center: NSPoint, badgeRadius: CGFloat) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.compositingOperation = .clear
+        let barH = badgeRadius * 0.30
+        let barW = badgeRadius * 2.2
+        NSBezierPath(roundedRect: NSRect(x: center.x - barW / 2, y: center.y - barH / 2,
+                                         width: barW, height: barH),
+                     xRadius: barH / 2, yRadius: barH / 2).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    /// 中心在 center、沿自身长轴转过 angleDegrees 度的圆角矩形（用于斜杠）。直接用
+    /// 三角函数算四个角坐标，不借助 AffineTransform——变换矩阵的组合顺序（先转后移
+    /// 还是先移后转）容易搞反，三角函数没有这层歧义，所见即所得。
+    private static func rotatedBarPath(center: NSPoint, length: CGFloat, thickness: CGFloat, angleDegrees: CGFloat) -> NSBezierPath {
+        let angle = angleDegrees * .pi / 180
+        let ux = cos(angle), uy = sin(angle)   // 长轴方向单位向量
+        let vx = -sin(angle), vy = cos(angle)  // 垂直于长轴的单位向量
+        let hl = length / 2, ht = thickness / 2
+        let corners = [
+            NSPoint(x: center.x + ux * hl + vx * ht, y: center.y + uy * hl + vy * ht),
+            NSPoint(x: center.x + ux * hl - vx * ht, y: center.y + uy * hl - vy * ht),
+            NSPoint(x: center.x - ux * hl - vx * ht, y: center.y - uy * hl - vy * ht),
+            NSPoint(x: center.x - ux * hl + vx * ht, y: center.y - uy * hl + vy * ht),
+        ]
+        let path = NSBezierPath()
+        path.move(to: corners[0])
+        for point in corners.dropFirst() {
+            path.line(to: point)
+        }
+        path.close()
+        return path
     }
 }

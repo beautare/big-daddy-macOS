@@ -81,6 +81,23 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         shouldRunContentFilter && activationCompleted && systemFilterEnabled == false
     }
 
+    /// 网站访问是否正被限制——菜单栏右上角"受限"徽章用的信号。
+    ///
+    /// 不区分这个 true 是家长自己长期开着的黑名单造成的，还是"时间到限网"临时加的：
+    /// 两者对客户端呈现为同一个 policy.enabled=true（见 intelli-sight
+    /// BigDaddyService#applyWebLockdownOverride），调用方不需要、也不应该知道是谁触发的。
+    ///
+    /// 黑名单为空时即使 enabled=true 也不算"正在限制"——那种情况下什么都拦不住，
+    /// 显示"受限"会是一句谎言（与仪表盘 currentlyWebFilterOnEmpty 同一条纪律）。
+    ///
+    /// 注意这里只反映"策略意图"，不等于"扩展真的在拦"：扩展被人从系统设置里关掉时
+    /// （isSystemFilterDisabledExternally），这个属性依然会是 true。调用方（AppDelegate）
+    /// 必须优先处理"扩展本身有问题"这一类信号，再决定要不要显示这个徽章——否则会在
+    /// 防线实际失守的那一刻，图标却说"正在限制"。
+    var isRestrictingWebAccess: Bool {
+        shouldRunContentFilter && !currentPolicy.blockedDomains.isEmpty
+    }
+
     func statusReport(requestedRevision: Int64) async -> WebFilterStatusReport {
         var systemExtensionState: WebFilterStatusReport.SystemExtensionState
         let error: String?

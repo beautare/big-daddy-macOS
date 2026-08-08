@@ -1206,44 +1206,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             || webFilterAttention != .none
 
         let variant: ShieldIcon.Variant
-        let desc: String
+        let baseDesc: String
         if capturing {
             variant = .capturing
-            desc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
+            baseDesc = Localization.string(zh: "BigDaddy 正在截图", en: "BigDaddy capturing screenshot")
         } else if missingPermission {
             variant = .warning
             // 优先说最严重的那一条：缺辅助功能连窗口标题都记不到，比"有标题没链接"更致命。
             if missingAccessibility {
-                desc = Localization.string(zh: "BigDaddy 缺少辅助功能权限",
+                baseDesc = Localization.string(zh: "BigDaddy 缺少辅助功能权限",
                                            en: "BigDaddy is missing Accessibility access")
             } else if webFilterAttention == .disabledExternally {
                 // 排在"待批准"前面：待批准是"还没开始生效"，被人关掉是"本来在拦、
                 // 现在不拦了"，后者对家长是一次实实在在的失守。
-                desc = Localization.string(zh: "BigDaddy 的网站访问限制已被关闭",
+                baseDesc = Localization.string(zh: "BigDaddy 的网站访问限制已被关闭",
                                            en: "BigDaddy website restrictions were turned off")
             } else if case .failed = webFilterAttention {
-                desc = Localization.string(zh: "BigDaddy 的网站访问限制启用失败",
+                baseDesc = Localization.string(zh: "BigDaddy 的网站访问限制启用失败",
                                            en: "BigDaddy website restrictions failed to start")
             } else if webFilterAttention != .none {
-                desc = Localization.string(zh: "BigDaddy 等待授权网站访问限制",
+                baseDesc = Localization.string(zh: "BigDaddy 等待授权网站访问限制",
                                            en: "BigDaddy is waiting for website restriction approval")
             } else if missingScreenRecording {
-                desc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限",
+                baseDesc = Localization.string(zh: "BigDaddy 截图已开启但缺少系统权限",
                                            en: "BigDaddy screenshots on but missing system permission")
             } else {
-                desc = Localization.string(zh: "BigDaddy 缺少浏览器网址读取权限",
+                baseDesc = Localization.string(zh: "BigDaddy 缺少浏览器网址读取权限",
                                            en: "BigDaddy is missing browser URL access")
             }
         } else if on {
             variant = .watching
-            desc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
+            baseDesc = Localization.string(zh: "BigDaddy 截图已开启", en: "BigDaddy screenshots on")
         } else {
             variant = .brand
-            desc = Localization.string(zh: "BigDaddy 守护中，未开启截图",
+            baseDesc = Localization.string(zh: "BigDaddy 守护中，未开启截图",
                                        en: "BigDaddy on guard, screenshots off")
         }
 
-        let image = ShieldIcon.image(pointSize: 16, variant: variant)
+        // 右上角"受限"徽章：独立于上面右下角那枚，两者可以同时显示（比如同时缺权限
+        // 又在限网）。webFilterAttention == .none 这道守卫是正确性要求，不是可选项——
+        // isRestrictingWebAccess 只反映"策略要求启用"，扩展被人从系统设置里关掉时
+        // （webFilterAttention == .disabledExternally）它依然会是 true；那种情况下
+        // 一条都没拦，显示"受限"会是一句谎言，此时应该只靠上面已经在显示的警示徽章
+        // 说清楚"防线失守了"，不能再让右上角同时说"正在限制"自相矛盾。
+        let isRestricted = webFilterController.isRestrictingWebAccess && webFilterAttention == .none
+        let desc: String
+        if isRestricted {
+            let restrictedDesc = Localization.string(zh: "网站访问受限", en: "website access restricted")
+            desc = baseDesc + " · " + restrictedDesc
+        } else {
+            desc = baseDesc
+        }
+
+        let image = ShieldIcon.image(pointSize: 16, variant: variant, restricted: isRestricted)
         image.accessibilityDescription = desc
         button.image = image
         button.title = ""
