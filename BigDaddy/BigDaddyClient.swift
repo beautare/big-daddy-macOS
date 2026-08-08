@@ -476,8 +476,13 @@ final class BigDaddyClient {
     // （见 BigDaddyService.classifyAppCategory），客户端这份既没人消费、词表又窄，已移除。
 
     /// 发送心跳。返回是否成功送达后端，供强杀/退出等需要"确认上报后才清理本地状态"的调用方判断。
+    ///
+    /// - Parameter filterExtensionSurvivedGap: 仅在补报"上次运行没有正常结束"的那次 START
+    ///   心跳上才有意义，其余调用方一律留 nil。见 WebFilterController.extensionSurvivedGap
+    ///   的注释——这是内容过滤系统扩展能否证明"本机在那段空窗期里其实一直通电在线"的
+    ///   事后取证信号，nil 表示问不出来（不代表"否"）。
     @discardableResult
-    func sendHeartbeat(event: EventType) async -> Bool {
+    func sendHeartbeat(event: EventType, filterExtensionSurvivedGap: Bool? = nil) async -> Bool {
         // 墓碑刷成"此刻仍然在线"。放在函数最前面（第一个 await 之前）是刻意的：正常退出/
         // 强杀路径会在发完这条心跳后退休墓碑，刷新必须发生在退休之前，不能被下面那些
         // 可能很慢的采集调用推到退休之后（真会推过去时由退休标记兜底，见 touchRuntimeLock）。
@@ -539,7 +544,9 @@ final class BigDaddyClient {
                 // 还有多少条断网期间的记录尚未补传。家长端据此显示"正在补传 N 条"——
                 // 限速补发要花几十分钟，没有这个数字的话家长只会看到时间线在自己眼前
                 // 不断长出新内容，读起来像系统在乱跳。
-                "pendingQueueDepth": PendingQueue.depth
+                "pendingQueueDepth": PendingQueue.depth,
+                // 只在补报上次异常终止的那条 START 心跳上才非 nil，见本函数参数文档。
+                "filterExtensionSurvivedGap": filterExtensionSurvivedGap as Any? ?? NSNull()
             ]
         ]
         // 如果有截图记录，一并上报
@@ -1859,8 +1866,12 @@ final class BigDaddyClient {
     /// 每次心跳都刷，于是文件里记的是**上次运行最后一次还活着的时刻**，而不是上次运行的
     /// 启动时刻。只在启动时写一次的话，一台连开三天的机器被强杀后，补报上去的
     /// previousCrashAt 会指向三天前——家长端会看到"上次异常终止发生在三天前"，可那三天里
-    /// 明明有连续的正常记录，自相矛盾，等于把这个信号变成噪音。按心跳刷新之后，这个值与
-    /// 真实终止时刻的误差不超过一个心跳间隔（活跃时 60 秒，空闲时 15 分钟）。
+    /// 明明有连续的正常记录，自相矛盾，等于把这个信号变成噪音。
+    ///
+    /// 除了心跳，AppDelegate 里还有一个独立的 30 秒定时器专门刷它（见 refreshTombstone），
+    /// 与心跳节奏解耦：空闲态心跳间隔长达 15 分钟，若只靠心跳刷新，被强杀时"最后确认在线"
+    /// 的误差最长可能是 15 分钟；独立定时器把这个误差压到 30 秒左右，代价只是一次几十字节
+    /// 的本地文件写入，不发任何网络请求。
     private static func touchRuntimeLock() {
         runtimeLockGuard.lock()
         defer { runtimeLockGuard.unlock() }
@@ -1868,6 +1879,13 @@ final class BigDaddyClient {
         let lock = lockFileURL
         try? FileManager.default.createDirectory(at: lock.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
+    }
+
+    /// 供 AppDelegate 里独立的墓碑刷新定时器调用（每 30 秒一次），把"最后确认在线"的
+    /// 误差从心跳间隔（空闲态最长 15 分钟）压到这个定时器自己的周期。是 touchRuntimeLock
+    /// 唯一的非 private 入口——心跳节奏之外还需要刷新墓碑的场景只有这一个。
+    static func refreshTombstone() {
+        touchRuntimeLock()
     }
 
     /// 移除墓碑，并从此不再刷新它：本次运行已经如实报告过自己的结束（SHUTDOWN，或已确认

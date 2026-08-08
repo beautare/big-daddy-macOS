@@ -174,6 +174,25 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         )
     }
 
+    /// 「上次运行没有正常结束」发生时，内容过滤系统扩展是否曾在整段空窗期里连续存活。
+    ///
+    /// 系统扩展由 systemextensionsd 独立管理，进程生命周期与主 App 不同——孩子在活动监视器
+    /// 强杀 BigDaddy 主进程杀不到它。它的策略回执只存内存、从不落盘（见
+    /// WebFilterProviderIPCListener.publish 的注释），扩展进程一旦重启这份回执就归零、
+    /// appliedAt 会被刷新成重启后的新时间。于是：只要现在还能问到一份 appliedAt **早于**
+    /// gapStartedAt 的回执，就说明扩展这段时间里从未重启过——从而说明本机全程通电在线，
+    /// 这次异常终止更可能是主进程本身被单独杀掉，而不是整机断电/重启/断网。
+    ///
+    /// 这是一个**事后取证**信号，不是实时判据：主进程一旦被杀就什么都报不出去了，这里能做的
+    /// 只是在下次启动时，问一问"有没有别的独立进程能证明机器其实一直开着"。
+    ///
+    /// 返回 nil 表示"问不出来"（没开网站过滤、扩展当前不可达、或还从未应用过任何策略），
+    /// 调用方不能把 nil 当结论用；只有明确的 true/false 才能拿去说话。
+    func extensionSurvivedGap(since gapStartedAt: Date) async -> Bool? {
+        guard let acknowledgement = await providerConnection.acknowledgement() else { return nil }
+        return acknowledgement.appliedAt < gapStartedAt
+    }
+
     /// 回读系统里那份过滤配置的真实开关状态。
     ///
     /// 没有这一步的话，孩子在「系统设置 → 登录项与扩展」里把网络扩展一关，客户端内存

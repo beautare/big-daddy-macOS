@@ -69,6 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var idleActivityTimer: Timer?
     private let idleActivityPollInterval: TimeInterval = 5
     private var configTimer: Timer?
+    /// 独立于心跳节奏的墓碑刷新定时器，见 BigDaddyClient.refreshTombstone 与
+    /// touchRuntimeLock 的注释：把"最后确认在线"的误差从空闲态最长 15 分钟的心跳间隔
+    /// 压到这个定时器自己的 30 秒周期。
+    private var tombstoneRefreshTimer: Timer?
     private var webFilterStatusReportTask: Task<Void, Never>?
     private var webFilterStatusRetryCount = 0
     private static let maxWebFilterStatusRetries = 5
@@ -313,10 +317,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 时间戳的取走与清空都在 sendHeartbeat 内部完成（送达或写入补发队列都算已持久
             // 记录），这里不再"仅在心跳成功时清空"：离线启动时那样会让它留在内存里，被本次
             // 会话往后的每一条心跳反复带上，库里堆出一串 previous_crash_at 相同的记录。
+            // 借内容过滤系统扩展当一次事后取证：它由 systemextensionsd 独立管理，主进程
+            // 被强杀时杀不到它，回执只存内存、扩展一旦重启就归零。若还能问到一份 appliedAt
+            // 早于这次空窗期开始时刻的回执，说明扩展全程没重启过、本机大概率一直通电在线，
+            // 这次异常终止更可能是主进程被单独杀掉，而非整机断电/重启/断网。只在这一条
+            // 补报的 START 心跳上才计算，其余调用方留 nil，见 sendHeartbeat 的参数文档。
+            var filterExtensionSurvivedGap: Bool?
             if let crashedAt = client.detectedPreviousCrash {
                 AuditLog.record("PREVIOUS_CRASH_DETECTED at=\(ISO8601DateFormatter().string(from: crashedAt))")
+                filterExtensionSurvivedGap = await webFilterController.extensionSurvivedGap(since: crashedAt)
             }
-            await client.sendHeartbeat(event: .start)
+            await client.sendHeartbeat(event: .start, filterExtensionSurvivedGap: filterExtensionSurvivedGap)
             // 如果配置有变化，额外发送 CONFIG_UPDATED 事件
             if configChanged {
                 await client.sendHeartbeat(event: .configUpdated)
@@ -1660,6 +1671,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         configTimer?.invalidate()
         configTimer = scheduleCommonModeTimer(interval: 60, repeats: true) { [weak self] _ in
             Task { [weak self] in await self?.pollConfigForChildVisibility() }
+        }
+
+        // 墓碑刷新独立于心跳节奏，见 tombstoneRefreshTimer 声明处注释。纯本地文件写入，
+        // 不发网络请求，30 秒一次的开销可以忽略。
+        tombstoneRefreshTimer?.invalidate()
+        tombstoneRefreshTimer = scheduleCommonModeTimer(interval: 30, repeats: true) { _ in
+            BigDaddyClient.refreshTombstone()
         }
     }
 
