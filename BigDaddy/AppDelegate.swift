@@ -462,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         if client.config.bound {
             let statusItem = NSMenuItem(
-                title: Localization.string(zh: "状态: 已受保护", en: "Status: Protected"),
+                title: Localization.string(zh: "状态: 已开启守护", en: "Status: Active"),
                 action: nil, keyEquivalent: ""
             )
             statusItem.isEnabled = false
@@ -477,7 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(statusItem)
 
             let hintItem = NSMenuItem(
-                title: Localization.string(zh: "💡 未绑定时仅进行最基础登记，不采集行为明细", en: "💡 Unbound: Coarse registry only, no activity details logged"),
+                title: Localization.string(zh: "💡 未绑定家长账号时，不会记录详细应用使用情况", en: "💡 Unbound: Detailed app activity will not be recorded"),
                 action: nil, keyEquivalent: ""
             )
             hintItem.isEnabled = false
@@ -976,7 +976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         var rows: [AboutInfoRow] = []
         if client.config.bound {
             rows.append(.text(label: Localization.string(zh: "状态", en: "Status"),
-                              value: Localization.string(zh: "已受保护", en: "Protected")))
+                              value: Localization.string(zh: "已开启守护", en: "Active")))
             // 有进行中的约定时排在"状态"之后：这是家长"现在正在发生"的一件事，
             // 比下面截图/通知渠道这些长期不变的配置摘要更值得靠前看到。
             if let timeSessionText = currentTimeSessionRemainingText() {
@@ -988,7 +988,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     ? Localization.string(zh: "已开启（家长可远程截屏）", en: "ON (parent can capture)")
                     : Localization.string(zh: "未开启", en: "OFF")
             ))
-            rows.append(.text(label: Localization.string(zh: "最近心跳", en: "Last heartbeat"), value: client.lastHeartbeatDescription))
+            rows.append(.text(label: Localization.string(zh: "最近连接时间", en: "Last connected"), value: client.lastHeartbeatDescription))
             if client.config.screenshotEnabled {
                 // 截图开启时始终渲染"下次截屏"行——它同时承载实时倒计时和"测试截图"按钮；
                 // 拿不到 fireDate（理论上不该发生）时退回 --:--，但按钮照常可用。
@@ -1252,11 +1252,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             } else if webFilterAttention == .disabledExternally {
                 // 排在"待批准"前面：待批准是"还没开始生效"，被人关掉是"本来在拦、
                 // 现在不拦了"，后者对家长是一次实实在在的失守。
-                baseDesc = Localization.string(zh: "BigDaddy 的网站访问限制已被关闭",
-                                           en: "BigDaddy website restrictions were turned off")
+                baseDesc = Localization.string(zh: "网站访问限制已被关闭",
+                                           en: "Website restrictions were turned off")
             } else if case .failed = webFilterAttention {
-                baseDesc = Localization.string(zh: "BigDaddy 的网站访问限制启用失败",
-                                           en: "BigDaddy website restrictions failed to start")
+                baseDesc = Localization.string(zh: "网站访问限制启动失败",
+                                           en: "Website restrictions failed to start")
             } else if webFilterAttention != .none {
                 baseDesc = Localization.string(zh: "BigDaddy 等待授权网站访问限制",
                                            en: "BigDaddy is waiting for website restriction approval")
