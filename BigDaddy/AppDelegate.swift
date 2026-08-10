@@ -539,15 +539,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 想搞清楚是怎么回事——这条就得在这儿等着，而且是一点就完事的。
         //
         // 少了这条，最坏情况就是家长的原始抱怨："我明明授权了，怎么还是警示图标？"
-        if client.config.bound && client.config.screenshotEnabled
-            && awaitingScreenRecordingGrant && !checkScreenRecordingPermission() {
-            menu.addItem(NSMenuItem(
-                title: Localization.string(
-                    zh: "✅ 已在设置里授权？点此重启生效",
-                    en: "✅ Granted in Settings? Restart to Apply"
-                ),
-                action: #selector(promptRestartForScreenRecording), keyEquivalent: ""
-            ))
+        if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
+            if awaitingScreenRecordingGrant {
+                menu.addItem(NSMenuItem(
+                    title: Localization.string(
+                        zh: "✅ 已在设置里授权？点此重启生效",
+                        en: "✅ Granted in Settings? Restart to Apply"
+                    ),
+                    action: #selector(promptRestartForScreenRecording), keyEquivalent: ""
+                ))
+            } else {
+                // 第 1 步也要在菜单里有落点。此前这里只有第 2 步：家长如果从没点过任何
+                // "去授权"按钮（绑定自检那一步跳过了、也没打开过「关于」窗口），
+                // awaitingScreenRecordingGrant 就一直是 false，于是截图开着、权限缺着，
+                // 菜单里却一条相关的都没有——图标上的警示徽章没有任何可点的落点，
+                // 和辅助功能/浏览器网址那两条待办的待遇不一致。
+                menu.addItem(NSMenuItem(
+                    title: Localization.string(
+                        zh: "⚠️ 屏幕录制未授权 · 点此修复",
+                        en: "⚠️ Screen recording off · Fix it"
+                    ),
+                    action: #selector(openScreenRecordingSettings), keyEquivalent: ""
+                ))
+            }
             menu.addItem(.separator())
         }
 
@@ -3036,6 +3050,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         client.hasScreenRecordingAccess()
     }
 
+    /// 绑定自检清单里"网络扩展"那一行怎么呈现：状态、按钮上写什么、说明写什么。
+    ///
+    /// 三态必须分清，**不能一律 ❌ +「去授权」**。这条纪律在本文件里已经交过两次学费：
+    /// webFilterAttention 对 `.unavailable` 的处理（"家长去系统设置里也找不到任何可开的
+    /// 东西，指过去只会让他白跑一趟"），以及浏览器行对 targetNotRunning 的处理（"摆一个
+    /// 点了没反应的'去授权'按钮，比不摆更伤信任"）。逐个说明为什么不是 needsAction：
+    ///
+    /// - `.activationRequested`：刚提交激活请求、系统还没回话。这张清单是**同步渲染**的，
+    ///   而激活结果走异步回调，渲染这一刻通常还没回来——一台早就批准过扩展的机器上，
+    ///   报 ❌ 等于把"还不知道"说成"没有"，是这份清单里最不该犯的错。
+    /// - `.restartRequired`：要做的事是重启 Mac，不是去网络扩展设置页翻开关。
+    /// - `.unavailable`：这台机器上压根没装出扩展（DEBUG 构建恒定如此，Release 下则是
+    ///   打包问题），家长做什么都没用。
+    ///
+    /// 只有 `.awaitingUserApproval` 和 `.failed` 才真的有一个"去系统设置把开关打开"的
+    /// 动作可做，也只有这两种给 ❌。
+    private var webFilterChecklistRow: (status: PermissionRowStatus, pendingTitle: String, description: String) {
+        switch webFilterController.state {
+        case .approved, .configurationEnabled:
+            return (.granted, "", Localization.string(
+                zh: "供家长日后开启网站访问限制时使用；当前未开启该功能就不会拦截任何网址",
+                en: "Used only if your parent turns on website restrictions later; nothing is blocked while that's off"
+            ))
+        case .awaitingUserApproval, .failed:
+            return (.needsAction, "", Localization.string(
+                zh: "在「登录项与扩展 → 网络扩展」里把 BigDaddy.app 的开关打开，家长日后开启网站访问限制才能生效",
+                en: "Switch BigDaddy.app on under Login Items & Extensions → Network Extensions so website restrictions can work when your parent turns them on"
+            ))
+        case .activationRequested:
+            return (.indeterminate, Localization.string(zh: "确认中", en: "Checking"), Localization.string(
+                zh: "正在向系统确认扩展状态；如果系统随后弹出批准提示，选择「允许」即可",
+                en: "Checking the extension's status with macOS; if a system approval prompt appears, choose Allow"
+            ))
+        case .restartRequired:
+            return (.indeterminate, Localization.string(zh: "需重启", en: "Restart"), Localization.string(
+                zh: "系统已接受扩展，重启这台 Mac 后才会正式生效",
+                en: "macOS accepted the extension; it takes effect after this Mac restarts"
+            ))
+        case .unavailable:
+            return (.indeterminate, Localization.string(zh: "不适用", en: "N/A"), Localization.string(
+                zh: "这个客户端版本没有附带网络扩展，此项无需处理",
+                en: "This client build ships without the network extension; nothing to do here"
+            ))
+        }
+    }
+
     /// 绑定自检里"浏览器网址"这些行的状态。
     ///
     /// 列的是**本机已安装的每一个受支持浏览器**，不是只看默认浏览器：自动化权限按
@@ -3096,6 +3156,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             action: #selector(openAccessibilitySettings)
         )
         container.addArrangedSubview(accRow)
+
+        // 屏幕录制：现在提前到绑定这一步就索取，不再等家长远程打开截图开关才索取
+        // （见 checkAndRequestPermissions 顶部注释）。此刻是否授权只会影响"截图功能
+        // 一旦被打开时截得到还是截不到"，跟绑定本身无关，所以不阻断。
+        let screenRecordingRow = createPermissionRow(
+            title: Localization.string(zh: "屏幕录制权限", en: "Screen Recording Permission"),
+            description: Localization.string(
+                zh: "供家长日后开启截图查看时使用；当前未开启该功能就不会真的截屏",
+                en: "Used only if your parent turns on screenshots later; nothing is captured while that's off"
+            ),
+            status: checkScreenRecordingPermission() ? .granted : .needsAction,
+            action: #selector(requestScreenRecordingPermissionFromChecklist)
+        )
+        container.addArrangedSubview(screenRecordingRow)
+
+        // 网络扩展（内容过滤系统扩展）：同上，提前索取"系统扩展批准"这一步，
+        // 是否真正启用过滤仍然只取决于家长是否远程打开网站访问限制。
+        // 这一行的三态判定见 webFilterChecklistRow——不是简单的"批准了没有"。
+        let webFilterState = webFilterChecklistRow
+        let webFilterRow = createPermissionRow(
+            title: Localization.string(zh: "网络扩展（网站访问限制）", en: "Network Extension (Website Restrictions)"),
+            description: webFilterState.description,
+            status: webFilterState.status,
+            action: #selector(openNetworkExtensionSettingsFromChecklist),
+            indeterminateTitle: webFilterState.pendingTitle
+        )
+        container.addArrangedSubview(webFilterRow)
 
         // 浏览器网址读取（Apple Events 自动化）：与辅助功能、屏幕录制是三种彼此独立的
         // TCC 权限，缺了它家长端只有页面标题、没有链接。每个已安装的受支持浏览器一行——
@@ -3189,8 +3276,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         case indeterminate
     }
 
+    /// - Parameter indeterminateTitle: ⏸ 态按钮上的字。默认"未运行"是给浏览器行用的，
+    ///   别的权限"查不出来"的原因不一样（扩展还在确认中、要重启、本构建不带扩展……），
+    ///   照搬"未运行"会是一句与事实无关的话，所以让调用方按自己的情况给。
     private func createPermissionRow(title: String, description: String,
-                                     status: PermissionRowStatus, action: Selector) -> NSView {
+                                     status: PermissionRowStatus, action: Selector,
+                                     indeterminateTitle: String = Localization.string(
+                                        zh: "未运行", en: "Not running"
+                                     )) -> NSView {
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 12
@@ -3241,7 +3334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             button.title = Localization.string(zh: "已授权", en: "Authorized")
             button.isEnabled = false
         case .indeterminate:
-            button.title = Localization.string(zh: "未运行", en: "Not running")
+            button.title = indeterminateTitle
             button.isEnabled = false
         case .needsAction:
             button.title = Localization.string(zh: "去授权", en: "Authorize")
@@ -3258,27 +3351,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         return row
     }
 
-    /// 绑定前的权限自检。两项权限的"必要程度"不同，处理方式也不同：
+    /// 绑定前的权限自检 —— 这是本客户端唯一的"安装/设置"时机点，四项系统权限
+    /// （辅助功能、浏览器自动化、屏幕录制、网络扩展）统一在这里一并索取，不再各自
+    /// 等到对应功能被家长远程打开（screenshotEnabled / webFilter.enabled）才索取。
+    /// 家长很可能压根不会去用某项功能，但"用得到时才发现还要走一遍系统授权"的打断，
+    /// 比"设置这一步一次性问完"更影响体验，也更容易被孩子看到系统弹窗后心生警觉。
+    ///
+    /// 四项权限的"必要程度"不同，处理方式也不同：
     /// - 辅助功能：缺了连窗口标题都拿不到，守护基本失效，**阻断绑定**；
-    /// - 浏览器网址读取（自动化）：缺了只是家长端看不到链接、仍有标题，属于降级而非
-    ///   失效，所以只在弹窗里如实展示 ❌ 和"去授权"按钮，**不阻断绑定**——为一个可降级
-    ///   的能力挡住整个绑定流程，代价和收益完全不成比例。
+    /// - 浏览器网址读取（自动化）、屏幕录制、网络扩展：缺了是功能性降级（对应功能
+    ///   开启后才会真正影响体验），所以只在弹窗里如实展示 ❌ 和"去授权"按钮，
+    ///   **不阻断绑定**——为几个当下用不用得上都不确定的能力挡住整个绑定流程，
+    ///   代价和收益不成比例。真正用到时权限仍缺失的兜底提醒见 rebuildMenu /
+    ///   showAboutWindow 里对应的"点此修复"入口。
     private func checkAndRequestPermissions() -> Bool {
         let hasAccessibility = AXIsProcessTrustedWithOptions(nil)
         let automationNeedsAttention = !browserAutomationNeedingAttention().isEmpty
+        let hasScreenRecording = checkScreenRecordingPermission()
 
-        if hasAccessibility && !automationNeedsAttention {
+        // 屏幕录制、网络扩展这两项都是"请求一次就会在系统里留下记录、必要时弹出询问"的
+        // 类型（不像辅助功能/自动化，本函数对它们只是查询状态、请求另有独立入口）。
+        // 顺带在这里把请求动作也做掉，下面清单里的"去授权"按钮打开系统设置时，
+        // BigDaddy 才会出现在对应名单里——原因同 openAccessibilitySettings 的注释：
+        // 从未被请求过的权限，系统设置里连一行灰色条目都不会有。
+        if !hasScreenRecording {
+            CGRequestScreenCaptureAccess()
+        }
+        webFilterController.requestSystemExtensionApprovalEagerly()
+
+        // 网络扩展的状态必须在发起请求**之后**再读：requestSystemExtensionApprovalEagerly
+        // 会把 state 从 .unavailable 推进到 .activationRequested，而这两者在清单上是
+        // 完全不同的两句话（"本构建不带扩展" vs "正在确认"）。先读会稳定地说错。
+        let webFilterNeedsAttention = webFilterChecklistRow.status == .needsAction
+
+        if hasAccessibility && !automationNeedsAttention && hasScreenRecording && !webFilterNeedsAttention {
             return true
         }
 
+        // 标题里的数字如实数一遍，不写死"几项"：多数机器上其实只差一项，一句
+        // "还有几项"会让家长以为自己漏掉了一堆东西。自动化按"一类"计（清单里可能
+        // 展开成好几个浏览器行，但对家长而言是同一件事）。
+        let pendingCount = (automationNeedsAttention ? 1 : 0)
+            + (hasScreenRecording ? 0 : 1)
+            + (webFilterNeedsAttention ? 1 : 0)
         let alert = NSAlert()
         alert.messageText = hasAccessibility
-            ? Localization.string(zh: "还有一项权限建议开启", en: "One More Permission Recommended")
+            ? Localization.string(
+                zh: "还有 \(pendingCount) 项权限建议开启",
+                en: pendingCount == 1 ? "One More Permission Recommended" : "\(pendingCount) More Permissions Recommended"
+            )
             : Localization.string(zh: "需要系统辅助功能权限", en: "Accessibility Permission Required")
         alert.informativeText = hasAccessibility
             ? Localization.string(
-                zh: "辅助功能已就绪。还差浏览器网址读取权限——没有它，家长端只能看到网页标题、看不到可点击的网址。可以点击右侧「去授权」现在开启，也可以先继续绑定、之后从菜单栏「关于 BigDaddy…」里补上。",
-                en: "Accessibility is ready. Browser URL access is still missing — without it the dashboard shows page titles but no clickable links. Grant it now with 'Authorize', or continue binding and enable it later from “About BigDaddy…”."
+                zh: "辅助功能已就绪。下面这些还没开启——不会阻塞现在继续绑定，但建议趁现在一起开好，省得孩子日后用到对应功能时再单独打断一次。可以逐项点击「去授权」，也可以先继续绑定、之后从菜单栏「关于 BigDaddy…」里补上。",
+                en: "Accessibility is ready. The items below aren't on yet — this won't block binding now, but it's best to grant them together here rather than being interrupted again later. Use “Authorize” on each row, or continue binding and finish later from “About BigDaddy…”."
             )
             : Localization.string(
                 zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要辅助功能权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
@@ -3406,6 +3532,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 菜单栏一级菜单里那条"已授权？点此重启生效"的提醒也依赖这个状态
         rebuildMenu()
         showAboutWindow()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// 绑定自检清单里"屏幕录制"那一行的"去授权"响应。
+    ///
+    /// 不复用 openScreenRecordingSettings：那个方法会重建并弹出「关于」窗口——是
+    /// "家长已经打开截图开关、还差最后一步"那个两步向导专用的收尾动作，在绑定自检的
+    /// NSAlert 还开着的当口再叠一层非模态窗口只会让界面更乱。这里只做最必要的两件事：
+    /// 发起系统请求（把 BigDaddy 记进 TCC，之后设置页里才找得到它）、打开设置页。
+    /// 仍然置位 awaitingScreenRecordingGrant，好让日后截图功能真正打开时，菜单/
+    /// 「关于」窗口能正确识别"已经问过一次，只差重启"而不是从头再问一遍。
+    @objc private func requestScreenRecordingPermissionFromChecklist() {
+        awaitingScreenRecordingGrant = true
+        CGRequestScreenCaptureAccess()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
@@ -3594,6 +3736,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if let url = URL(string: deepLink) {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// 绑定自检清单里"网络扩展"那一行的"去授权"响应：直接跳「网络扩展」详情页。
+    @objc private func openNetworkExtensionSettingsFromChecklist() {
+        openNetworkExtensionSettings()
     }
 
     /// "允许读取浏览器网址"按钮：先对每个被拒的浏览器重新查一次当前状态。

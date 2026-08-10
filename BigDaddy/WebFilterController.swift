@@ -366,6 +366,24 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             enableContentFilter()
             return
         }
+        submitActivationRequestIfNeeded()
+    }
+
+    /// 绑定阶段（AppDelegate.checkAndRequestPermissions）提前索取系统扩展批准的入口。
+    ///
+    /// 与 ensureInfrastructure 的关键区别：**不看 shouldRunContentFilter**。系统扩展的
+    /// 批准（出现在「登录项与扩展」列表里、必要时弹出批准提示）和"是否真的启用过滤"是
+    /// 两件事——本方法只负责前者，把它提前到绑定那一刻，不必等家长日后远程打开网站
+    /// 访问限制才发生（同 AppDelegate 里屏幕录制/辅助功能的一次性预热逻辑）。是否真正
+    /// 启用过滤仍然完全由 shouldRunContentFilter 决定：批准完成后 handleActivationFinished
+    /// 会照常按当时的 shouldRunContentFilter 决定 enableContentFilter 还是
+    /// disableContentFilter，本方法不改变这一点。
+    func requestSystemExtensionApprovalEagerly() {
+        guard !activationCompleted else { return }
+        submitActivationRequestIfNeeded()
+    }
+
+    private func submitActivationRequestIfNeeded() {
         guard !activationSubmitted else { return }
 
         let extensionURL = Bundle.main.bundleURL
