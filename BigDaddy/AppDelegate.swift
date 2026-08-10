@@ -157,6 +157,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 主按钮，菜单栏一级菜单也会多出一条同样的提醒。见 showAboutWindow / rebuildMenu。
     private var awaitingScreenRecordingGrant = false
 
+    /// 绑定自检流程里是否已经向系统发起过屏幕录制授权请求。
+    ///
+    /// 需要这个闸，是因为 checkAndRequestPermissions 在辅助功能缺失时会递归重来，
+    /// 而 CGPreflightScreenCaptureAccess() 有进程级缓存——家长即使在系统询问框里点了
+    /// 「允许」，本进程这一轮里查到的仍然是 false。没有这个闸，每递归一层就会再弹一次
+    /// 系统询问框，家长会被同一个框反复堵住。
+    private var screenRecordingAccessRequested = false
+
     private weak var aboutWindow: NSWindow?
     /// 与"关于"窗口里按钮的 tag 一一对应，点击时按下标取出对应动作执行（见 aboutActionTapped）。
     private var aboutWindowActions: [() -> Void] = []
@@ -3160,6 +3168,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 屏幕录制：现在提前到绑定这一步就索取，不再等家长远程打开截图开关才索取
         // （见 checkAndRequestPermissions 顶部注释）。此刻是否授权只会影响"截图功能
         // 一旦被打开时截得到还是截不到"，跟绑定本身无关，所以不阻断。
+        //
+        // 渲染这张清单本身**不**发起系统询问，只查询状态（下面这行的 status）。
+        // 真正的 CGRequestScreenCaptureAccess() 有两个触发点，都在这张弹窗不再占屏
+        // 或已经稳定显示之后：家长点这一行的「去授权」，以及家长点「继续绑定」把弹窗
+        // 关掉的那一刻（见 checkAndRequestPermissions 里 runModal 之后那段）。
+        // 都不在渲染前触发，是为了避免系统弹窗抢在我们把话说清楚之前就冒出来。
         let screenRecordingRow = createPermissionRow(
             title: Localization.string(zh: "屏幕录制权限", en: "Screen Recording Permission"),
             description: Localization.string(
@@ -3369,14 +3383,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let automationNeedsAttention = !browserAutomationNeedingAttention().isEmpty
         let hasScreenRecording = checkScreenRecordingPermission()
 
-        // 屏幕录制、网络扩展这两项都是"请求一次就会在系统里留下记录、必要时弹出询问"的
-        // 类型（不像辅助功能/自动化，本函数对它们只是查询状态、请求另有独立入口）。
-        // 顺带在这里把请求动作也做掉，下面清单里的"去授权"按钮打开系统设置时，
-        // BigDaddy 才会出现在对应名单里——原因同 openAccessibilitySettings 的注释：
-        // 从未被请求过的权限，系统设置里连一行灰色条目都不会有。
-        if !hasScreenRecording {
-            CGRequestScreenCaptureAccess()
-        }
+        // 网络扩展的批准提示是**非模态通知横幅**（"系统扩展被阻止"，右上角那种），
+        // 不会跟下面即将弹出的清单弹窗抢前台，所以可以放心在渲染清单之前就提前
+        // 请求——这也是清单能准确区分"正在确认"和"这个构建压根没带扩展"的前提
+        // （见 webFilterChecklistRow 的注释）。
+        //
+        // 屏幕录制则相反：CGRequestScreenCaptureAccess() 会弹出**系统的模态询问框**，
+        // 在这里调用就会和紧接着 runModal() 的清单弹窗一起占屏。所以它不在这里发起，
+        // 而是挪到弹窗关掉之后（见下面 runModal 之后那段）——那里既保证了"一并索取"，
+        // 又不会叠窗口。
         webFilterController.requestSystemExtensionApprovalEagerly()
 
         // 网络扩展的状态必须在发起请求**之后**再读：requestSystemExtensionApprovalEagerly
@@ -3419,6 +3434,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
+            // 屏幕录制的系统询问框在**这里**弹，而不是在函数开头。
+            //
+            // 这一行同时满足两个互相拉扯的要求：
+            // - 「安装时一并索取」：不管家长有没有在清单里点过那一行的「去授权」，
+            //   只要他选择继续绑定，这次请求就一定会发出去，屏幕录制不会被漏掉。
+            //   （只在「继续」这条路上发；点「取消」等于中止绑定，不该再弹系统框。）
+            // - 「不要窗口叠加」：CGRequestScreenCaptureAccess() 会弹出系统的模态
+            //   询问框，此刻我们自己的清单弹窗**已经关掉了**，屏幕上只剩系统这一个框。
+            //   放在函数开头会变成两个框同时占屏，放在这里就是干净的先后顺序——
+            //   跟本文件里 promptAccessibilityPermission「先解释、后索取」的节奏一致。
+            requestScreenRecordingAccessIfNeeded()
             // 家长配置好后点击“继续”，递归刷新自检状态。
             // 辅助功能已就绪时不再递归——否则用户选择"网址权限以后再说"就会陷入
             // 同一个弹窗反复出现、点不掉的死循环；"不阻断"靠的是这颗"继续"按钮放行，
@@ -3537,6 +3563,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
+    /// 向系统发起一次屏幕录制授权请求，进程内只发一次（原因见
+    /// screenRecordingAccessRequested 的注释）。
+    ///
+    /// 刻意**不**置位 awaitingScreenRecordingGrant：那个标志的语义是"家长已经被送去
+    /// 系统设置、正处在两步流程的第 2 步"，而这里只是弹了系统询问框，家长完全可能当场
+    /// 点「拒绝」。置位了就会让菜单显示"✅ 已在设置里授权？点此重启生效"，把一个拒绝过
+    /// 的人指去做一次没有意义的重启；不置位则显示"⚠️ 屏幕录制未授权 · 点此修复"，
+    /// 对"允许了"和"拒绝了"两种人都说得通，而且前者点一下就能进到第 2 步。
+    private func requestScreenRecordingAccessIfNeeded() {
+        guard !screenRecordingAccessRequested, !checkScreenRecordingPermission() else { return }
+        screenRecordingAccessRequested = true
+        CGRequestScreenCaptureAccess()
+    }
+
     /// 绑定自检清单里"屏幕录制"那一行的"去授权"响应。
     ///
     /// 不复用 openScreenRecordingSettings：那个方法会重建并弹出「关于」窗口——是
@@ -3544,10 +3584,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// NSAlert 还开着的当口再叠一层非模态窗口只会让界面更乱。这里只做最必要的两件事：
     /// 发起系统请求（把 BigDaddy 记进 TCC，之后设置页里才找得到它）、打开设置页。
     /// 仍然置位 awaitingScreenRecordingGrant，好让日后截图功能真正打开时，菜单/
-    /// 「关于」窗口能正确识别"已经问过一次，只差重启"而不是从头再问一遍。
+    /// 「关于」窗口能正确识别"已经问过一次，只差重启"而不是从头再问一遍——这一点和上面
+    /// 那个自动路径不同，因为点了这颗按钮的家长确实是被我们送去系统设置的。
+    ///
+    /// 走同一个 requestScreenRecordingAccessIfNeeded 而不是直接调 CGRequest…：
+    /// 共用那道一次性闸，家长在这里点过之后，绑定弹窗关掉时就不会再被弹第二次。
     @objc private func requestScreenRecordingPermissionFromChecklist() {
         awaitingScreenRecordingGrant = true
-        CGRequestScreenCaptureAccess()
+        requestScreenRecordingAccessIfNeeded()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
