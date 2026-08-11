@@ -462,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         if client.config.bound {
             let statusItem = NSMenuItem(
-                title: Localization.string(zh: "状态: 已开启守护", en: "Status: Active"),
+                title: Localization.string(zh: "守护状态：正常运行中", en: "Status: Active"),
                 action: nil, keyEquivalent: ""
             )
             statusItem.isEnabled = false
@@ -470,14 +470,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(.separator())
         } else {
             let statusItem = NSMenuItem(
-                title: Localization.string(zh: "⚠️ 状态: 尚未绑定家长账号 (未开启守护)", en: "⚠️ Status: Unbound (Guardianship Pending)"),
+                title: Localization.string(zh: "⚠️ 提醒：电脑尚未连接家长手机/账号", en: "⚠️ Status: Unbound (Guardianship Pending)"),
                 action: nil, keyEquivalent: ""
             )
             statusItem.isEnabled = false
             menu.addItem(statusItem)
 
             let hintItem = NSMenuItem(
-                title: Localization.string(zh: "💡 未绑定家长账号时，不会记录详细应用使用情况", en: "💡 Unbound: Detailed app activity will not be recorded"),
+                title: Localization.string(zh: "💡 提示：在连接家长账号前，电脑不会收集软件使用明细", en: "💡 Unbound: Detailed app activity will not be recorded"),
                 action: nil, keyEquivalent: ""
             )
             hintItem.isEnabled = false
@@ -499,7 +499,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 之前拆成"显示本机绑定码"和"输入家长给的码"两条平行菜单项，两者都叫"绑定"，
             // 孩子分不清该点哪个。改成一条入口，点开后再用弹窗把两种方式说清楚。
             menu.addItem(NSMenuItem(
-                title: Localization.string(zh: "⚡️ 绑定本设备…", en: "⚡️ Bind This Mac…"),
+                title: Localization.string(zh: "🔗 连接家长手机 / 显示绑定码…", en: "⚡️ Bind This Mac…"),
                 action: #selector(showBindEntry), keyEquivalent: "b"
             ))
             menu.addItem(.separator())
@@ -629,14 +629,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 版本/配置摘要/心跳/截图倒计时/守护说明/导出记录/检查更新——这些都是次要或
         // 只读信息，收进"关于 BigDaddy"里，一级菜单只留状态和最关键的操作。
         menu.addItem(NSMenuItem(
-            title: Localization.string(zh: "关于 BigDaddy…", en: "About BigDaddy…"),
+            title: Localization.string(zh: "软件版本与运行状态", en: "About BigDaddy…"),
             action: #selector(showAboutWindow), keyEquivalent: ""
         ))
 
         // 默认开启，孩子可自行开启（无需验证）；关闭是敏感操作，需要家长验证码才能
         // 生效，见 toggleLaunchAtLogin/disableLaunchAtLoginWithVerification。
         let launchAtLoginItem = NSMenuItem(
-            title: Localization.string(zh: "开机自动启动", en: "Start at Login"),
+            title: Localization.string(zh: "开机时自动运行守护程序", en: "Start at Login"),
             action: #selector(toggleLaunchAtLogin), keyEquivalent: ""
         )
         launchAtLoginItem.state = LaunchAtLoginPreference.isEnabled ? .on : .off
@@ -644,7 +644,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(
-            title: Localization.string(zh: "安全退出", en: "Secure Exit"),
+            title: Localization.string(zh: "关闭守护程序（需家长验证码）", en: "Secure Exit"),
             action: #selector(quitWithPassword), keyEquivalent: "q"
         ))
         statusItem?.menu = menu
@@ -756,7 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 因为它比下面两条影响更大——没有它，连窗口标题这种最基本的记录都是空的。
         if client.config.bound && !AXIsProcessTrustedWithOptions(nil) {
             actions.append((
-                Localization.string(zh: "⚠️ 开启辅助功能权限", en: "⚠️ Turn On Accessibility"),
+                Localization.string(zh: "⚠️ 允许电脑监测软件使用（开启系统权限）", en: "⚠️ Turn On Accessibility"),
                 promptAccessibilityPermission,
                 false
             ))
@@ -766,7 +766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 被拒的浏览器就该出现（未绑定时没有任何上报，提示也就没有意义）。
         if client.config.bound && !automationDeniedBundleIDs.isEmpty {
             actions.append((
-                Localization.string(zh: "⚠️ 允许读取浏览器网址", en: "⚠️ Allow Browser URL Access"),
+                Localization.string(zh: "⚠️ 允许记录访问网址（网页管理权限）", en: "⚠️ Allow Browser URL Access"),
                 promptAutomationPermission,
                 false
             ))
@@ -781,7 +781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
         // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
         // （见 createAboutContentView 的 .nextScreenshot 分支）。
-        actions.append((Localization.string(zh: "守护说明", en: "Guardian Info"), showTransparencyInfo, false))
+        actions.append((Localization.string(zh: "家庭守护与隐私说明", en: "Guardian Info"), showTransparencyInfo, false))
         // 注：导出记录（“看看它都记了什么”）不再单独占一个按钮——“守护说明”弹窗里
         // 已有同样的导出入口，避免重复。
         // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字）。
@@ -2691,12 +2691,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     @objc private func quitWithPassword() {
         guard let code = promptParentVerificationCode(
-            title: Localization.string(zh: "退出 BigDaddy 客户端", en: "Exit BigDaddy Client"),
+            title: Localization.string(zh: "关闭 BigDaddy 守护程序", en: "Exit BigDaddy Client"),
             message: Localization.string(
-                zh: "请在家长控制端 Dashboard 生成安全退出验证码，输入后即可正常关闭客户端。",
+                zh: "请输入家长手机端仪表盘生成的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭守护程序。",
                 en: "Please generate a secure exit verification code on the parent dashboard, enter it to close the client."
             ),
-            confirmTitle: Localization.string(zh: "安全退出", en: "Secure Exit")
+            confirmTitle: Localization.string(zh: "关闭守护程序", en: "Secure Exit")
         ) else { return }
 
         Task {
@@ -3422,7 +3422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 en: "Accessibility is ready. The items below aren't on yet — this won't block binding now, but it's best to grant them together here rather than being interrupted again later. Use “Authorize” on each row, or continue binding and finish later from “About BigDaddy…”."
             )
             : Localization.string(
-                zh: "为了能够正常守护您的孩子，BigDaddy 客户端需要辅助功能权限支持。请点击右侧的“去授权”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
+                zh: "为了能了解孩子正在使用的软件名称，电脑需要您授予“软件监测”权限。请点击右侧的“去设置”按钮，在弹出的系统设置中勾选允许 `BigDaddy`，然后点击“我已开启，继续绑定”。",
                 en: "To protect your child, BigDaddy needs Accessibility permission. Click 'Authorize' to grant access in System Settings, then click 'I've enabled, continue'."
             )
 
