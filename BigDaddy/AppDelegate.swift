@@ -367,8 +367,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.alertStyle = .warning
         alert.messageText = Localization.string(zh: "设备凭据失效", en: "Device Credentials Invalid")
         alert.informativeText = Localization.string(
-            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长端会显示设备离线。\n\n恢复方法：请家长在仪表盘中解绑本设备，然后重启客户端并重新绑定。",
-            en: "This Mac's device key no longer matches the server record (usually after reinstalling or switching client builds). Guardian data cannot be reported and the dashboard will show this device as offline.\n\nTo recover: unbind this device on the parent dashboard, then restart the client and bind again."
+            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长端会显示设备离线。\n\n恢复方法：请家长在仪表盘中点击「重新授权」按钮，设备将在 1 分钟内自动恢复。",
+            en: "This Mac's device key no longer matches the server record (usually after reinstalling or switching client builds). Guardian data cannot be reported and the dashboard will show this device as offline.\n\nTo recover: tap the \"Re-authorize\" button on the parent dashboard. The device will automatically recover within 1 minute."
         )
         alert.runModal()
     }
@@ -450,8 +450,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if client.credentialsInvalid {
             let credentialItem = NSMenuItem(
                 title: Localization.string(
-                    zh: "⚠️ 设备凭据失效：请家长在仪表盘解绑后重新绑定",
-                    en: "⚠️ Device credentials invalid: unbind on dashboard, then re-bind"
+                    zh: "⚠️ 设备凭据需要重新授权：请家长在仪表盘点击「重新授权」",
+                    en: "⚠️ Credentials need re-authorization: tap \"Re-authorize\" on the dashboard"
                 ),
                 action: nil, keyEquivalent: ""
             )

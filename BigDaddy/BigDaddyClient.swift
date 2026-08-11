@@ -385,14 +385,16 @@ final class BigDaddyClient {
             if self.credentialsInvalid && !wasInvalid {
                 NSLog("BigDaddy: device secret rejected by backend (device is bound); signed requests will fail until re-bind")
             }
-            // register 不走设备签名，是验签通道失效时唯一可靠的绑定状态来源。只向
-            // "未绑定"方向修正：后端说已解绑就立即翻转本地状态（旧后端无 bound 字段时
-            // 退回用 boundAt 判断）；反向的"已绑定"要携带完整守护策略，交给签名的
-            // refreshConfig 拉取权威配置，这里不能凭空置 true。
+            // register 不走设备签名，是验签通道失效时唯一可靠的绑定状态来源。
+            // 向两个方向同步：后端确认已解绑就立即翻转本地状态；后端确认已绑定但
+            // 本地认为未绑定时（本地凭据文件丢失后的常见情形）也立即修正。config.bound
+            // 本身不携带守护策略，完整配置等凭据恢复后由 refreshConfig 补全。
             let remoteBound = response.data.bound ?? (response.data.boundAt != nil)
-            if config.bound && !remoteBound {
-                config.bound = false
-                config.hasPendingCommand = false
+            if config.bound != remoteBound {
+                config.bound = remoteBound
+                if !remoteBound {
+                    config.hasPendingCommand = false
+                }
                 ConfigStore.save(config)
                 NotificationCenter.default.post(
                     name: Self.webFilterConfigChangedNotification,
