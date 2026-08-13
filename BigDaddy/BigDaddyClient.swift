@@ -112,6 +112,9 @@ struct ClientConfig: Codable, Equatable {
     /// 当前活跃的时间约定（nil = 没有）。这是客户端获取会话状态的**唯一权威来源**：
     /// SYNC_TIME_SESSION 命令只是门铃，冷启动、断网恢复、睡眠唤醒全部走这条路恢复。
     var timeSession: TimeSession? = nil
+    /// 家长在 Dashboard 打开的"连续性模式"：崩溃 / 强制退出后由用户级 LaunchAgent
+    /// KeepAlive 拉起。缺省 false；旧后端不下发此字段时保持关闭，行为与今天一致。
+    var continuityMode: Bool = false
 
     init() {
     }
@@ -134,6 +137,7 @@ struct ClientConfig: Codable, Equatable {
         hasPendingCommand = try container.decodeIfPresent(Bool.self, forKey: .hasPendingCommand) ?? false
         webFilter = try container.decodeIfPresent(WebFilterConfiguration.self, forKey: .webFilter) ?? WebFilterConfiguration()
         timeSession = try container.decodeIfPresent(TimeSession.self, forKey: .timeSession)
+        continuityMode = try container.decodeIfPresent(Bool.self, forKey: .continuityMode) ?? false
     }
 }
 
@@ -439,6 +443,11 @@ final class BigDaddyClient {
                 object: self
             )
         }
+        // 家长从关闭→打开连续性，清掉孩子在本机用验证码打下的关闭覆盖，让家长策略重新生效。
+        if config.continuityMode && !previous.continuityMode {
+            ContinuityModePreference.isEnabled = true
+        }
+        ContinuityModeController.sync(enabled: config.continuityMode && ContinuityModePreference.isEnabled)
         return config != previous ? .successChanged : .successUnchanged
     }
 
@@ -543,6 +552,11 @@ final class BigDaddyClient {
                 // 家长端应据此告警。
                 "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled,
                 "launchAtLoginOsStatus": LaunchAtLoginController.osLevelStatusDescription,
+                // 连续性模式：continuityModeEnabled 是家长配置的意图（config.continuityMode），
+                // continuityModeOsStatus 是本机 launchd KeepAlive 的实际状态。孩子用验证码
+                // 在本机关闭后，两者会分叉，家长端应据此告警。
+                "continuityModeEnabled": config.continuityMode,
+                "continuityModeOsStatus": ContinuityModeController.osLevelStatusDescription,
                 // 还有多少条断网期间的记录尚未补传。家长端据此显示"正在补传 N 条"——
                 // 限速补发要花几十分钟，没有这个数字的话家长只会看到时间线在自己眼前
                 // 不断长出新内容，读起来像系统在乱跳。
@@ -1906,6 +1920,12 @@ final class BigDaddyClient {
     /// 只清墓碑、不发心跳：更新重启既不是走验证码的正常退出（SHUTDOWN），也不是被强制
     /// 关闭（FORCE_KILL），套用哪一个都是谎报。
     static func noteUpdateRestart() {
+        notePlannedRelaunch()
+    }
+
+    /// 计划内重启（Sparkle、连续性模式把进程交给 launchd 托管）退休墓碑，避免下次
+    /// 启动被当成异常终止补报。
+    static func notePlannedRelaunch() {
         retireRuntimeLock()
     }
 }
@@ -2111,11 +2131,15 @@ enum LaunchAtLoginPreference {
 
 /// 开机自启的统一入口：macOS 13+ 用官方 SMAppService（能查询 OS 级实际状态、从而
 /// 察觉用户在「系统设置 → 登录项」里的手动关闭，且用 bundle 身份、不受 .app 被移动
-/// 影响），12.x 回退到手写 LaunchAgent plist。全项目对"开机自启"的启停/查询都应经过
-/// 这里，不要再直接调用 LaunchAgentInstaller（它退化为 12.x 的 plist 实现细节）。
+/// 影响），12.x 回退到手写 LaunchAgent plist。连续性模式打开时改由 ContinuityModeController
+/// 托管同一份用户级 LaunchAgent（RunAtLoad + KeepAlive），13+ 会先注销 SMAppService，
+/// 避免登录时双启动。全项目对"开机自启"的启停/查询都应经过这里；连续性模式打开期间
+/// enable/disable 直接 return，避免把 KeepAlive agent 拆掉。
 enum LaunchAtLoginController {
-    /// 按 LaunchAtLoginPreference（默认开启）同步 OS 层的自启状态，启动时调用一次。
+    /// 按 LaunchAtLoginPreference（默认开启）同步 OS 层的自启状态。连续性关闭时由
+    /// ContinuityModeController.sync(false) 调用；启动路径也走那一次 sync。
     static func syncWithPreference() {
+        if ContinuityModeController.isActive { return }
         if LaunchAtLoginPreference.isEnabled {
             enable()
         } else {
@@ -2124,9 +2148,12 @@ enum LaunchAtLoginController {
     }
 
     static func enable() {
+        if ContinuityModeController.isActive { return }
         if #available(macOS 13.0, *) {
             // 迁移：老版本可能已用手写 plist 装过自启；13+ 改用 SMAppService 后必须把
             // 遗留 plist 删掉，否则登录时两条机制各拉起一次、进程被重复启动。
+            // 连续性模式打开时不会走到这里（isActive 已 return），KeepAlive agent 由
+            // ContinuityModeController 持有。
             LaunchAgentInstaller.uninstall()
             // .enabled 已经生效、.requiresApproval 已经注册只是在等家长去系统设置批准——
             // 这两种状态下都不用再调 register()。syncWithPreference() 每次启动都会跑
@@ -2142,11 +2169,12 @@ enum LaunchAtLoginController {
                 NSLog("BigDaddy: SMAppService register failed: \(error.localizedDescription)")
             }
         } else {
-            LaunchAgentInstaller.installIfNeeded()
+            LaunchAgentInstaller.installIfNeeded(crashRelaunch: false, runAtLoad: true)
         }
     }
 
     static func disable() {
+        if ContinuityModeController.isActive { return }
         if #available(macOS 13.0, *) {
             LaunchAgentInstaller.uninstall() // 遗留 plist 一并清掉，双保险
             // 只有确实处于"已注册"的某种状态（enabled / requiresApproval）时才需要
@@ -2166,9 +2194,13 @@ enum LaunchAtLoginController {
 
     /// OS 层实际状态字符串，供心跳上报。它与本地偏好 LaunchAtLoginPreference 可能不一致：
     /// 家长端据此能看出"孩子在系统设置里手动关掉了自启"（偏好还是 enabled，但这里变成
-    /// notRegistered）这类客户端 App 内开关拦不住的绕过。13+ 返回 SMAppService 的四态；
-    /// 12.x 无等价查询 API，用 plist 是否存在近似表达。
+    /// notRegistered）这类客户端 App 内开关拦不住的绕过。
+    /// 连续性模式打开时 13+ 会注销 SMAppService、改用 LaunchAgent RunAtLoad，所以这里
+    /// 先看 agent 的 RunAtLoad，再回退到 SMAppService / 文件是否存在。
     static var osLevelStatusDescription: String {
+        if let plist = LaunchAgentInstaller.readInstalled(), LaunchAgentPlist.runAtLoad(from: plist) {
+            return Launchctl.isLoaded() ? "enabled" : "plistPresent"
+        }
         if #available(macOS 13.0, *) {
             switch SMAppService.mainApp.status {
             case .enabled: return "enabled"
@@ -2178,53 +2210,364 @@ enum LaunchAtLoginController {
             @unknown default: return "unknown"
             }
         } else {
-            return FileManager.default.fileExists(atPath: LaunchAgentInstaller.launchAgentURL.path)
-                ? "plistPresent" : "plistAbsent"
+            return "plistAbsent"
         }
     }
 }
 
-/// 用户级 LaunchAgent（RunAtLoad，不使用特权 daemon）——macOS 12.x 的开机自启实现，
-/// 13+ 已由 LaunchAtLoginController 改走 SMAppService。注：不设置 KeepAlive——"崩溃后
-/// 自动拉起"这类连续性模式按设计需要家长在 Dashboard 显式开启，后端暂无此配置项，暂缓。
-/// 对孩子在系统设置的登录项列表里始终可见，也可随时自行移除（本地关闭开关见
-/// LaunchAtLoginPreference）。不要在业务代码里直接调用本类型，统一走 LaunchAtLoginController。
+/// 用户级 LaunchAgent plist 的纯数据形状，便于单测断言 KeepAlive 结构，不碰磁盘、不调 launchctl。
+enum LaunchAgentPlist {
+    static let label = "com.bigdaddy.client"
+    static let launchedByLaunchdEnvKey = "BIGDADDY_LAUNCHED_BY_LAUNCHD"
+
+    static func make(executablePath: String, runAtLoad: Bool, crashRelaunch: Bool) -> [String: Any] {
+        var plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [executablePath],
+            "RunAtLoad": runAtLoad,
+            "EnvironmentVariables": [launchedByLaunchdEnvKey: "1"]
+        ]
+        if crashRelaunch {
+            // exit 0（验证退出、Sparkle 正常结束）不拉起；非 0 / 崩溃 / SIGKILL 拉起。
+            plist["KeepAlive"] = ["SuccessfulExit": false]
+        } else {
+            plist["KeepAlive"] = false
+        }
+        return plist
+    }
+
+    static func parse(_ data: Data) -> [String: Any]? {
+        try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+    }
+
+    static func data(from plist: [String: Any]) -> Data? {
+        try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    }
+
+    static func plistBool(_ value: Any?) -> Bool? {
+        if let flag = value as? Bool { return flag }
+        if let number = value as? NSNumber { return number.boolValue }
+        return nil
+    }
+
+    static func crashRelaunch(from plist: [String: Any]) -> Bool {
+        if let dict = plist["KeepAlive"] as? [String: Any] {
+            return plistBool(dict["SuccessfulExit"]) == false
+        }
+        return false
+    }
+
+    static func runAtLoad(from plist: [String: Any]) -> Bool {
+        plistBool(plist["RunAtLoad"]) ?? false
+    }
+}
+
+enum Launchctl {
+    static var uid: uid_t { getuid() }
+    static var domain: String { "gui/\(uid)" }
+    static var serviceTarget: String { "\(domain)/\(LaunchAgentPlist.label)" }
+
+    @discardableResult
+    static func run(_ arguments: [String]) -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let out = Pipe()
+        let err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        do {
+            try process.run()
+        } catch {
+            return (1, "")
+        }
+        process.waitUntilExit()
+        let combined = out.fileHandleForReading.readDataToEndOfFile()
+            + err.fileHandleForReading.readDataToEndOfFile()
+        return (process.terminationStatus, String(data: combined, encoding: .utf8) ?? "")
+    }
+
+    static func isLoaded() -> Bool {
+        run(["print", serviceTarget]).status == 0
+    }
+
+    static func jobPid() -> pid_t? {
+        let result = run(["print", serviceTarget])
+        guard result.status == 0 else { return nil }
+        guard let match = result.output.range(of: #"pid\s*=\s*(\d+)"#, options: .regularExpression) else {
+            return nil
+        }
+        let digits = result.output[match].filter(\.isNumber)
+        return pid_t(digits)
+    }
+
+    static func bootout() {
+        _ = run(["bootout", serviceTarget])
+    }
+
+    static func bootstrap(plistURL: URL) -> Bool {
+        run(["bootstrap", domain, plistURL.path]).status == 0
+    }
+
+    static func kickstart() {
+        _ = run(["kickstart", "-k", serviceTarget])
+    }
+}
+
+/// 用户级 LaunchAgent（不使用特权 daemon / SMJobBless）。macOS 12.x 开机自启、以及
+/// 连续性模式的 KeepAlive，都写 `~/Library/LaunchAgents/com.bigdaddy.client.plist`。
+/// 对孩子在系统设置的登录项 / LaunchAgents 列表里始终可见。
+///
+/// KeepAlive 一旦打开，当前会话要生效就必须 `launchctl bootstrap/bootout`：只改 plist
+/// 而不加载 job，launchd 不会盯着正在跑的进程。反过来，对本进程自己的 job 做 bootout
+/// 会把本进程杀掉，所以 bootout 时机由 ContinuityModeController 决定，uninstall()
+/// 只删文件。
 enum LaunchAgentInstaller {
     static var launchAgentURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/com.bigdaddy.client.plist")
     }
 
-    static func installIfNeeded() {
+    static func installIfNeeded(crashRelaunch: Bool = false, runAtLoad: Bool = true) {
         guard let executablePath = Bundle.main.executablePath else { return }
-        let plist: [String: Any] = [
-            "Label": "com.bigdaddy.client",
-            "ProgramArguments": [executablePath],
-            "RunAtLoad": true,
-            "KeepAlive": false
-        ]
+        let plist = LaunchAgentPlist.make(
+            executablePath: executablePath,
+            runAtLoad: runAtLoad,
+            crashRelaunch: crashRelaunch
+        )
         let url = launchAgentURL
-        // 已存在且内容一致就跳过，避免每次启动都重写文件
         if let existingData = try? Data(contentsOf: url),
-           let existingPlist = try? PropertyListSerialization.propertyList(from: existingData, format: nil) as? NSDictionary,
-           existingPlist == (plist as NSDictionary) {
+           let existingPlist = LaunchAgentPlist.parse(existingData),
+           (existingPlist as NSDictionary) == (plist as NSDictionary) {
             return
         }
-        guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) else { return }
+        guard let data = LaunchAgentPlist.data(from: plist) else { return }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: url, options: .atomic)
-        AuditLog.record("LAUNCH_AGENT_INSTALLED path=\(executablePath)")
+        AuditLog.record("LAUNCH_AGENT_INSTALLED path=\(executablePath) keepAlive=\(crashRelaunch) runAtLoad=\(runAtLoad)")
     }
 
-    /// 移除 LaunchAgent plist，让本机从下一次登录起不再自动启动。不调用
-    /// launchctl unload——RunAtLoad 且未设 KeepAlive 的 agent 只在"登录时"读取一次
-    /// 这份 plist，删除文件本身已经足够；当前已经在跑的进程不受影响，与"安全退出"
-    /// 是两个独立动作一致（关闭自启动不等于立刻退出客户端）。
+    static func readInstalled() -> [String: Any]? {
+        guard let data = try? Data(contentsOf: launchAgentURL) else { return nil }
+        return LaunchAgentPlist.parse(data)
+    }
+
     static func uninstall() {
         let url = launchAgentURL
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         try? FileManager.default.removeItem(at: url)
         AuditLog.record("LAUNCH_AGENT_UNINSTALLED")
+    }
+}
+
+/// 孩子用验证码在本机关闭连续性之后为 false。默认 true（不拦截家长配置）。
+/// 家长在 Dashboard 把 continuityMode 从关拨到开时会清掉这份覆盖。
+enum ContinuityModePreference {
+    private static let key = "ContinuityModeLocallyEnabled"
+
+    static var isEnabled: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: key) != nil else { return true }
+            return UserDefaults.standard.bool(forKey: key)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: key) }
+    }
+}
+
+/// 连续性模式：家长打开后，用用户级 LaunchAgent 的 KeepAlive `{ SuccessfulExit: false }`
+/// 在崩溃 / 强制退出后拉起客户端。SMAppService.mainApp 是登录项，崩了不会拉，所以
+/// 13+ 打开连续性时注销登录项、改由 launchd 托管。不隐藏第二份 .app，删除应用后
+/// launchd 拉不起来——那是产品限制，不是没做完的恢复。
+enum ContinuityModeController {
+    /// 最近一次 sync 的目标状态。LaunchAtLoginController 用它避免拆掉 KeepAlive agent。
+    private(set) static var isActive = false
+
+    static var isLaunchdManaged: Bool {
+        if ProcessInfo.processInfo.environment[LaunchAgentPlist.launchedByLaunchdEnvKey] == "1" {
+            return true
+        }
+        return Launchctl.jobPid() == ProcessInfo.processInfo.processIdentifier
+    }
+
+    static var osLevelStatusDescription: String {
+        guard let plist = LaunchAgentInstaller.readInstalled(),
+              LaunchAgentPlist.crashRelaunch(from: plist) else {
+            return "off"
+        }
+        guard Launchctl.isLoaded() else { return "keepAlivePlistNotLoaded" }
+        return isLaunchdManaged ? "keepAliveLoaded" : "keepAliveLoadedUnmanaged"
+    }
+
+    static func sync(enabled: Bool) {
+        if enabled {
+            enableKeepAlive()
+        } else {
+            disableKeepAlive()
+        }
+    }
+
+    /// 验证退出 / Sparkle：先安排延迟 bootout，再让本进程把 SHUTDOWN / 更新收尾做完。
+    /// 对本进程自己的 job 立刻 bootout 会直接杀掉还在跑的退出流程。
+    /// SuccessfulExit=false 下 exit 0 本身不会被立刻拉起；延迟 bootout 是卸掉本会话的 job。
+    static func prepareForPlannedExit() {
+        let keepAlive = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
+        guard isActive || keepAlive else { return }
+        scheduleDelayedBootout()
+        AuditLog.record("CONTINUITY_KEEPALIVE_BOOTED_OUT reason=planned-exit")
+    }
+
+    /// 屏幕录制授权后的重启：已经在 launchd 手里时 kickstart -k，不要再 Process() 拉一份。
+    static func restartViaLaunchdIfManaged() -> Bool {
+        guard isLaunchdManaged, Launchctl.isLoaded() else { return false }
+        AuditLog.record("CONTINUITY_KEEPALIVE_KICKSTART")
+        Launchctl.kickstart()
+        return true
+    }
+
+    /// 启动最开头调用：已有实例时，非 launchd 的后来者直接退出；launchd 拉起的新实例
+    /// 等旧实例把进程交出来（连续性刚打开时的交接）。
+    static func shouldExitAsDuplicate() -> Bool {
+        guard let bundleId = Bundle.main.bundleIdentifier else { return false }
+        let own = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+            .filter { $0.processIdentifier != own }
+        guard !others.isEmpty else { return false }
+        if isLaunchdManaged {
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                let remaining = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
+                    .filter { $0.processIdentifier != own }
+                if remaining.isEmpty { return false }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
+        return true
+    }
+
+    private static func enableKeepAlive() {
+        // launchd 必须在加载 job 时把进程拉起来，KeepAlive 才能盯着。连续性打开期间
+        // 因此强制 RunAtLoad：否则 bootstrap 后交接 exit(0)，job 停着没人拉，守护直接没了。
+        LaunchAgentInstaller.installIfNeeded(crashRelaunch: true, runAtLoad: true)
+        unregisterLoginItemIfNeeded()
+        isActive = true
+
+        let keepAliveInstalled = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
+        let launchedWithKeepAliveEnv = ProcessInfo.processInfo.environment[LaunchAgentPlist.launchedByLaunchdEnvKey] == "1"
+        // 磁盘上已是 KeepAlive plist 还不够：12.x 登录进来的旧 job 定义可能仍是 KeepAlive=false，
+        // 必须看到 launchd 注入的环境变量，才说明当前这份进程真的被 KeepAlive 盯着。
+        if isLaunchdManaged && Launchctl.isLoaded() && keepAliveInstalled && launchedWithKeepAliveEnv {
+            return
+        }
+
+        if Launchctl.isLoaded() && isLaunchdManaged {
+            AuditLog.record("CONTINUITY_MODE_ENABLED via=reload-job")
+            scheduleReloadAfterExit()
+            handoverExit()
+            return
+        }
+
+        if Launchctl.isLoaded() {
+            if Launchctl.jobPid() == nil {
+                _ = Launchctl.run(["kickstart", Launchctl.serviceTarget])
+                AuditLog.record("CONTINUITY_MODE_ENABLED via=kickstart-idle")
+                if !isLaunchdManaged {
+                    handoverExit()
+                }
+                return
+            }
+            Launchctl.bootout()
+        }
+        let bootstrapped = Launchctl.bootstrap(plistURL: LaunchAgentInstaller.launchAgentURL)
+        AuditLog.record("CONTINUITY_MODE_ENABLED via=bootstrap success=\(bootstrapped)")
+        if bootstrapped && !isLaunchdManaged {
+            handoverExit()
+        }
+    }
+
+    private static func disableKeepAlive() {
+        let hadKeepAlive = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
+        isActive = false
+        guard hadKeepAlive else {
+            LaunchAtLoginController.syncWithPreference()
+            return
+        }
+        AuditLog.record("CONTINUITY_MODE_DISABLED")
+        if isLaunchdManaged && Launchctl.isLoaded() {
+            restorePlistForLaunchAtLoginWithoutKeepAlive()
+            spawnUnmanagedSuccessor()
+            Launchctl.bootout()
+            return
+        }
+        Launchctl.bootout()
+        restorePlistForLaunchAtLoginWithoutKeepAlive()
+        LaunchAtLoginController.syncWithPreference()
+    }
+
+    private static func restorePlistForLaunchAtLoginWithoutKeepAlive() {
+        if #available(macOS 13.0, *) {
+            LaunchAgentInstaller.uninstall()
+        } else {
+            LaunchAgentInstaller.installIfNeeded(
+                crashRelaunch: false,
+                runAtLoad: LaunchAtLoginPreference.isEnabled
+            )
+        }
+    }
+
+    private static func unregisterLoginItemIfNeeded() {
+        if #available(macOS 13.0, *) {
+            let status = SMAppService.mainApp.status
+            guard status == .enabled || status == .requiresApproval else { return }
+            do {
+                try SMAppService.mainApp.unregister()
+                AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService reason=continuity")
+            } catch {
+                NSLog("BigDaddy: SMAppService unregister for continuity failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static func handoverExit() {
+        AuditLog.record("CONTINUITY_HANDOVER_TO_LAUNCHD")
+        BigDaddyClient.notePlannedRelaunch()
+        exit(0)
+    }
+
+    private static func spawnUnmanagedSuccessor() {
+        guard let executablePath = Bundle.main.executablePath else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: LaunchAgentPlist.launchedByLaunchdEnvKey)
+        process.environment = env
+        try? process.run()
+        Thread.sleep(forTimeInterval: 0.4)
+    }
+
+    private static func scheduleReloadAfterExit() {
+        let plistPath = LaunchAgentInstaller.launchAgentURL.path
+        let script = """
+        sleep 0.5
+        /bin/launchctl bootout \(Launchctl.serviceTarget)
+        /bin/launchctl bootstrap \(Launchctl.domain) '\(plistPath)'
+        """
+        spawnDetachedShell(script)
+    }
+
+    private static func scheduleDelayedBootout() {
+        spawnDetachedShell("""
+        sleep 1
+        /bin/launchctl bootout \(Launchctl.serviceTarget)
+        """)
+    }
+
+    private static func spawnDetachedShell(_ script: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
     }
 }
 

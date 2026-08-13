@@ -240,13 +240,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("BigDaddy: applicationDidFinishLaunching started")
+        if ContinuityModeController.shouldExitAsDuplicate() {
+            print("BigDaddy: exiting duplicate instance")
+            exit(0)
+        }
+        client.prepareRuntime()
+        print("BigDaddy: runtime prepared")
+        if ContinuityModeController.isLaunchdManaged, client.detectedPreviousCrash != nil {
+            AuditLog.record("CONTINUITY_RELAUNCHED_BY_KEEPALIVE")
+        }
+        // 可能 exit(0) 把进程交给 launchd，必须在创建菜单栏图标之前，避免交接期间出现两枚盾牌。
+        ContinuityModeController.sync(enabled: client.config.continuityMode && ContinuityModePreference.isEnabled)
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         print("BigDaddy: StatusItem created")
         NSApp.setActivationPolicy(.accessory)
         installSignalHandlers()
         print("BigDaddy: signal handlers installed")
-        client.prepareRuntime()
-        print("BigDaddy: runtime prepared")
         client.startNetworkMonitoring()
         print("BigDaddy: network monitoring started")
         webFilterController.onStateChanged = { [weak self] in
@@ -284,7 +293,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         #else
         print("BigDaddy: Sparkle updater skipped in DEBUG build")
         #endif
-        LaunchAtLoginController.syncWithPreference()
         print("BigDaddy: launch agent checked")
         // 菜单栏图标随"截图是否开启"状态变化，孩子端始终可见当前是否处于可截屏状态
         updateStatusItemAppearance()
@@ -647,6 +655,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         )
         launchAtLoginItem.state = LaunchAtLoginPreference.isEnabled ? .on : .off
         menu.addItem(launchAtLoginItem)
+
+        // 家长在 Dashboard 打开；菜单不能本地打开。已开启时可点，走与关闭开机自启相同的验证码。
+        let continuityOn = client.config.continuityMode && ContinuityModePreference.isEnabled
+        let continuityItem = NSMenuItem(
+            title: Localization.string(
+                zh: continuityOn ? "崩溃后自动恢复（家长已开启）" : "崩溃后自动恢复（由家长在仪表盘开启）",
+                en: continuityOn ? "Relaunch After Crash (Parent Enabled)" : "Relaunch After Crash (Enable on Parent Dashboard)"
+            ),
+            action: continuityOn ? #selector(disableContinuityWithVerification) : nil,
+            keyEquivalent: ""
+        )
+        continuityItem.state = continuityOn ? .on : .off
+        continuityItem.isEnabled = continuityOn
+        menu.addItem(continuityItem)
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(
@@ -2489,6 +2511,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     nonisolated func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
         AuditLog.record("UPDATE_INSTALL_RELAUNCH")
         BigDaddyClient.noteUpdateRestart()
+        // 不 bootout、不拦 Sparkle relaunch：安装完成时本进程还要以 exit 0 结束，
+        // SuccessfulExit=false 不会让 launchd 再拉一份，因此不会和 Sparkle 双启动。
+        // 新版本起来后 ContinuityModeController.sync 再把进程交回 launchd。
     }
 
     /// 新版本已下载完毕：记下待安装状态，让下拉菜单/「关于」窗口冒出提示，并开始
@@ -2617,7 +2642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             屏幕最上面那一排里有个小盾牌，一直都在，你随时能点开。盾牌旁边什么都没有，就是没在截图；多出一个小圆点，就是截图开着；圆点变成一个圈，就是这一刻正在截图——扫一眼就知道现在是哪种。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
 
             想暂停或者卸载？
-            跟家长说一声。家长会在他那边生成一个一次性的数字码，你输进去就能退出。
+            跟家长说一声。家长会在他那边生成一个一次性的数字码，你输进去就能退出。家长如果打开了"崩溃后自动恢复"，程序意外退出后会自己再打开；关掉程序仍然需要家长的一次性数字码。这不是偷偷装的第二份软件，把 BigDaddy 从这台电脑上删掉之后它不会自己回来。
 
             ——如果你是家长，而这就是你自己的电脑：BigDaddy 应该装在孩子的电脑上，装在这里不会有任何用。
             """,
@@ -2634,7 +2659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             There's a small shield in the strip along the very top of the screen. It's always there, and you can open it any time. Nothing next to the shield means no screenshots are being taken; a small dot means they're on; the dot turning into a ring means a screenshot is being taken right this moment — one glance tells you which. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.
 
             Want to pause it or take it off?
-            Talk to your parent. They can generate a one-time code on their side, and typing it in lets you quit.
+            Talk to your parent. They can generate a one-time code on their side, and typing it in lets you quit. If your parent turned on "relaunch after crash", the app comes back after an unexpected quit; closing it still needs that one-time code. This is not a hidden second copy — deleting BigDaddy from this Mac will not bring it back.
 
             — If you're a parent and this is your own computer: BigDaddy belongs on your child's computer. Installed here, it won't do anything useful.
             """
@@ -2747,6 +2772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             let success = await client.verifyExitPassword(code)
             await MainActor.run {
                 if success {
+                    ContinuityModeController.prepareForPlannedExit()
                     client.sendShutdownSync()
                     NSApp.terminate(nil)
                 } else {
@@ -2789,11 +2815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 不必等下一次定时心跳，家长端近实时可见。
     private func applyLaunchAtLogin(enabled: Bool, source: String) {
         LaunchAtLoginPreference.isEnabled = enabled
-        if enabled {
-            LaunchAtLoginController.enable()
-        } else {
-            LaunchAtLoginController.disable()
-        }
+        ContinuityModeController.sync(enabled: client.config.continuityMode && ContinuityModePreference.isEnabled)
         AuditLog.record("LAUNCH_AT_LOGIN_TOGGLE state=\(enabled ? "ENABLED" : "DISABLED") source=\(source)")
         rebuildMenu()
         Task { await client.sendHeartbeat(event: .heartbeat) }
@@ -2805,7 +2827,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func enforceLaunchAtLoginOnBind() {
         let wasEnabled = LaunchAtLoginPreference.isEnabled
         LaunchAtLoginPreference.isEnabled = true
-        LaunchAtLoginController.enable()
+        ContinuityModeController.sync(enabled: client.config.continuityMode && ContinuityModePreference.isEnabled)
         if !wasEnabled {
             AuditLog.record("LAUNCH_AT_LOGIN_REENABLED_ON_BIND")
         }
@@ -2831,6 +2853,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             await MainActor.run {
                 if success {
                     applyLaunchAtLogin(enabled: false, source: "local-verified")
+                } else {
+                    let errorAlert = NSAlert()
+                    errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
+                    errorAlert.informativeText = Localization.string(
+                        zh: "验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                    )
+                    errorAlert.addButton(withTitle: "OK")
+                    errorAlert.runModal()
+                }
+            }
+        }
+    }
+
+    /// 关闭连续性模式：菜单不能打开它（只由家长配置下发），关闭与开机自启一样走验证码。
+    /// 本机覆盖会挡住家长配置，直到家长在仪表盘把连续性关掉再打开。
+    @objc private func disableContinuityWithVerification() {
+        guard client.config.bound else {
+            ContinuityModePreference.isEnabled = false
+            ContinuityModeController.sync(enabled: false)
+            AuditLog.record("CONTINUITY_MODE_TOGGLE state=DISABLED source=local-unbound")
+            rebuildMenu()
+            Task { await client.sendHeartbeat(event: .heartbeat) }
+            return
+        }
+        guard let code = promptParentVerificationCode(
+            title: Localization.string(zh: "关闭崩溃后自动恢复", en: "Turn Off Relaunch After Crash"),
+            message: Localization.string(
+                zh: "请输入在网页端「守护主页」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
+                en: "Please generate a secure exit verification code on the parent dashboard, enter it to turn off relaunch after crash."
+            ),
+            confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
+        ) else { return }
+
+        Task {
+            let success = await client.verifyExitPassword(code)
+            await MainActor.run {
+                if success {
+                    ContinuityModePreference.isEnabled = false
+                    ContinuityModeController.sync(enabled: false)
+                    AuditLog.record("CONTINUITY_MODE_TOGGLE state=DISABLED source=local-verified")
+                    rebuildMenu()
+                    Task { await client.sendHeartbeat(event: .heartbeat) }
                 } else {
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
@@ -3502,9 +3567,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     private func restartApplication() {
+        if ContinuityModeController.restartViaLaunchdIfManaged() {
+            return
+        }
         guard let executablePath = Bundle.main.executablePath else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: LaunchAgentPlist.launchedByLaunchdEnvKey)
+        process.environment = env
         try? process.run()
         NSApp.terminate(nil)
     }
@@ -4114,8 +4185,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 不到（菜单栏图标不会从 ⚠️ 变 👁️），实际也截不了图。我们没法从代码里判断用户到底
     /// 有没有真的去授权过，所以这个按钮和"前往设置授权"按钮平级并列，让用户自己判断
     /// 该点哪个，而不是猜错了给用户来一套没预期到的流程。
-    /// （不会误杀守护：LaunchAgent 未设 KeepAlive，靠 restartApplication 显式重新拉起，
-    /// 不会产生双实例；重启是家长授权动作触发、从"关于"面板发起，不是孩子在规避监护。）
+    /// （不会误杀守护：连续性模式打开且已由 launchd 托管时走 kickstart -k；否则
+    /// restartApplication 显式拉起再退出。重启是家长授权动作触发、从"关于"面板发起，
+    /// 不是孩子在规避监护。）
     @objc private func promptRestartForScreenRecording() {
         let alert = NSAlert()
         alert.messageText = Localization.string(zh: "重启后屏幕录制权限才会生效", en: "Restart to Apply Screen Recording Permission")
