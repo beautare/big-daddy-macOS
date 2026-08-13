@@ -141,8 +141,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 就什么时候装好并重启。Sparkle 2.3 起该闭包允许重复调用。
     private var pendingUpdateInstall: (() -> Void)?
     /// 等设备空闲、伺机静默安装的轮询计时器（见 scheduleIdleInstallCheck），只在有
-    /// 待装更新期间存活。
+    /// 待装更新期间存活。安装发起之后它改当看门狗用（见 installPendingUpdate）。
     private var updateIdleInstallTimer: Timer?
+    /// 已经对 pendingUpdateInstall 发起过几次安装尝试。正常路径下这个值最多到 1——装上
+    /// 就重启，本进程根本没机会再读它；只有安装没生效、进程还活着时才会累加，用来把
+    /// 重试的看门狗间隔逐次拉长（见 installPendingUpdate）。
+    private var updateInstallAttempts = 0
     /// "关于"窗口（自绘 NSWindow，见 showAboutWindow）当前是否已打开，再次点击菜单项时
     /// 先关掉旧的再重建，避免残留一个数据已过期的旧窗口。
     /// 家长已经点过"前往系统设置授权"，正处在"去设置里开开关 → 回来重启生效"这段
@@ -218,7 +222,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     // 后台检查；SUEnableAutomaticChecks/SUAutomaticallyUpdate 已在 Info.plist 里直接置为
     // true，跳过 Sparkle 首次运行询问用户的对话框，检查与静默下载都无条件自动进行。
     //
-    // updaterDelegate 指向 self 是"下载好之后弹窗问用户"的唯一入口。这里曾经挂的是
+    // updaterDelegate 指向 self 是"下载好之后由本 App 接管安装时机"的唯一入口——接管
+    // 之后的策略是等设备空闲了静默装上并重启，不弹任何询问框（理由见
+    // scheduleIdleInstallCheck）。这里曾经挂的是
     // userDriverDelegate（SPUStandardUserDriverDelegate 的 gentle reminders 那套接口），
     // 那段代码从未生效过：SUAutomaticallyUpdate=true 时 Sparkle 选的是
     // SPUAutomaticUpdateDriver，它的 showingUpdate 恒为 NO、从头到尾不调用 user driver，
@@ -787,7 +793,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字）。
         // 点击直接调用 Sparkle 交给我们的安装闭包（installPendingUpdate），不走
         // checkForUpdates()——文件已经下载好、安装器也已就绪，再发起一次检查是多余的往返。
-        // 用户在弹窗里点过"稍后再说"之后，这里就是他改主意时的入口。
+        // 安装本身是不打扰的（等空闲了自己装，全程无弹窗），这个按钮是给不想等的人
+        // 提前触发用的——点击就是"现在就装"的明确信号，跳过等空闲那一步。
         if let version = pendingUpdateVersion {
             actions.append((
                 Localization.string(zh: "安装新版本 \(version) 并重启", en: "Install \(version) & Restart"),
@@ -2489,6 +2496,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func noteUpdateDownloaded(version: String, install: @escaping () -> Void) {
         pendingUpdateVersion = version
         pendingUpdateInstall = install
+        // 换了一个待装的更新，重试退避从头算起（正常路径下这里本来就是 0：Sparkle 在
+        // 我们调用 immediateInstallHandler 之前不会再回调，也就不会有第二次下载完成）。
+        updateInstallAttempts = 0
         AuditLog.record("UPDATE_DOWNLOADED version=\(version)")
         rebuildMenu()
         scheduleIdleInstallCheck()
@@ -2505,6 +2515,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 心跳节奏由服务端下发的活跃/空闲间隔决定、且可能变化，这里只想要"有待装更新期间，
     /// 定期看看孩子是不是已经离开了"，跟心跳节奏没有耦合关系。60 秒一次的粒度足够——
     /// 装上就立刻重启，晚个几十秒发现空闲不影响什么。
+    ///
+    /// 安装失败后的重试也回到这里（见 installPendingUpdate 的看门狗），因此重来一次
+    /// 同样要先等到空闲，不会在孩子正用着电脑时反复尝试重启。
     private func scheduleIdleInstallCheck() {
         updateIdleInstallTimer?.invalidate()
         updateIdleInstallTimer = nil
@@ -2523,14 +2536,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 装上已下载好的更新并重启本 App。空闲检测到点后自动调用；下拉菜单那条"有更新
     /// 待装"提示和「关于」窗口里的高亮按钮也走这条路径，供家长手动提前触发——点击本身
     /// 就是"现在就装"的明确信号，跳过等空闲这一步。
+    ///
+    /// 刻意**不**在调用 install() 之前（也不在之后）清空 pendingUpdateInstall /
+    /// pendingUpdateVersion。这里曾经先清空再调用，代价在安装没生效时才显现：
+    /// updater(_:willInstallUpdateOnQuit:…) 返回 true 已经让 Sparkle 停掉了当前及后续
+    /// 的全部检查周期——在 immediateInstallHandler 生效之前不会再有任何回调，而闭包和
+    /// 版本号都已经被丢掉，本次运行内于是再也没有任何一条路能装上这个更新，菜单里还
+    /// 留着一条点了毫无反应的死按钮（guard 直接 return）。对一个可以连续跑几周不退出
+    /// 的后台守护进程来说，这个窗口可以很长。
+    ///
+    /// 现在的做法是留着状态、装完不做任何清理，转而挂一个看门狗：安装成功的话本进程
+    /// 几秒内就被 Sparkle 结束了，这个计时器压根没机会开火；只要它开火了，就说明安装
+    /// 没生效，回到等空闲的轮询里重来一次（Sparkle 2.3 起 immediateInstallHandler 允许
+    /// 重复调用，见其文档）。
+    ///
+    /// 重试间隔逐次翻倍、封顶 6 小时，且**不设次数上限**——目标是"这台设备最终一定会
+    /// 装上"。封顶取 6 小时而不是 1 小时，是因为少数失败场景（.app 装在当前用户无写权限
+    /// 的位置时，Sparkle 的安装器会弹系统授权框）重试意味着再弹一次框；每小时弹一次
+    /// 对孩子是骚扰，一天四次则既不至于烦人、又不会让设备永远停在旧版本上。
     @objc private func installPendingUpdate() {
         guard let install = pendingUpdateInstall else { return }
         updateIdleInstallTimer?.invalidate()
         updateIdleInstallTimer = nil
-        pendingUpdateInstall = nil
-        pendingUpdateVersion = nil
-        AuditLog.record("UPDATE_INSTALLING")
+        updateInstallAttempts += 1
+        AuditLog.record(
+            "UPDATE_INSTALLING version=\(pendingUpdateVersion ?? "unknown") attempt=\(updateInstallAttempts)"
+        )
         install()
+        // 首次给 5 分钟——安装器要解包、替换 .app 再重启，正常情况下远用不到这么久，
+        // 留足余量才不会把"装得慢"误判成"没装上"、在安装器正干活时又戳它一次。
+        let watchdogDelay = min(300 * pow(2, Double(updateInstallAttempts - 1)), 6 * 3600)
+        updateIdleInstallTimer = scheduleCommonModeTimer(
+            interval: watchdogDelay, repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.pendingUpdateInstall != nil else { return }
+                AuditLog.record("UPDATE_INSTALL_NOT_APPLIED attempt=\(self.updateInstallAttempts)")
+                self.scheduleIdleInstallCheck()
+            }
+        }
     }
 
     /// 知情透明：向使用本机的孩子清楚说明这是什么、谁能看到、采集了什么、如何暂停。
