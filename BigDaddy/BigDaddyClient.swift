@@ -517,6 +517,9 @@ final class BigDaddyClient: @unchecked Sendable {
         // 强杀路径会在发完这条心跳后退休墓碑，刷新必须发生在退休之前，不能被下面那些
         // 可能很慢的采集调用推到退休之后（真会推过去时由退休标记兜底，见 touchRuntimeLock）。
         Self.touchRuntimeLock()
+        // 凭据已知失效（register() 报过 credentialsValid=false）时，签名请求注定会被
+        // BigDaddyDeviceAuthService 拒绝——不再徒劳重试，等下一轮 register() 恢复。
+        guard !credentialsInvalid else { return false }
         let version = AppVersion.current
         let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         // activeWindowInfo 浏览器场景下靠 NSAppleScript 给目标浏览器发 Apple Event 并同步
@@ -1696,7 +1699,7 @@ final class BigDaddyClient: @unchecked Sendable {
     }
 
     func pollCommands() async {
-        guard config.bound else { return }
+        guard config.bound, !credentialsInvalid else { return }
         let data: Data
         do {
             data = try await request(path: "/bigdaddy/client/commands?limit=10", method: "GET", body: nil, signed: true)
