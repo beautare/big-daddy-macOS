@@ -117,7 +117,14 @@ struct ClientConfig: Codable, Equatable {
     var continuityMode: Bool = false
     /// continuityMode 最近一次被家长实际改变（真的翻转过，不是每次保存表单）的时间。
     /// 旧后端不下发时为 nil，refreshConfig() 退回纯 false→true 边沿判断，行为与今天一致。
-    var continuityModeUpdatedAt: Date? = nil
+    ///
+    /// 刻意保留**后端下发的原始字符串**而不解析成 Date：客户端要回答的问题是"这个值
+    /// 跟我上次记下的相比变了没有"，是等值判断，不是时间先后判断。而后端下发的是不带
+    /// 时区的 LocalDateTime，客户端按 `.current` 时区解释——同一个字符串在夏令时切换
+    /// 前后会解析出相差一小时的绝对时刻，一旦拿去做 `>` 比较，一个从没变过的时间戳会
+    /// 在入冬后凭空显得"更新了"，把孩子的本地覆盖无端清掉。存原文比就没有这个问题，
+    /// 也顺带不依赖后端时钟单调（NTP 回拨同样会破坏先后比较）。
+    var continuityModeUpdatedAt: String? = nil
 
     init() {
     }
@@ -141,7 +148,7 @@ struct ClientConfig: Codable, Equatable {
         webFilter = try container.decodeIfPresent(WebFilterConfiguration.self, forKey: .webFilter) ?? WebFilterConfiguration()
         timeSession = try container.decodeIfPresent(TimeSession.self, forKey: .timeSession)
         continuityMode = try container.decodeIfPresent(Bool.self, forKey: .continuityMode) ?? false
-        continuityModeUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .continuityModeUpdatedAt)
+        continuityModeUpdatedAt = try container.decodeIfPresent(String.self, forKey: .continuityModeUpdatedAt)
     }
 }
 
@@ -2376,7 +2383,7 @@ enum LaunchAgentInstaller {
 /// 家长在 Dashboard 把 continuityMode 从关拨到开时会清掉这份覆盖。
 enum ContinuityModePreference {
     private static let key = "ContinuityModeLocallyEnabled"
-    private static let overrideBaselineKey = "ContinuityModeOverrideBaselineUpdatedAt"
+    private static let overrideBaselineKey = "ContinuityModeOverrideBaselineToken"
 
     static var isEnabled: Bool {
         get {
@@ -2386,13 +2393,13 @@ enum ContinuityModePreference {
         set { UserDefaults.standard.set(newValue, forKey: key) }
     }
 
-    /// 本地覆盖生效那一刻，服务端 config.continuityModeUpdatedAt 的快照。refreshConfig()
-    /// 靠比较这个快照和服务端最新时间戳来判断"家长是否在本地覆盖之后又重新动过这个
-    /// 开关"，不再要求恰好观察到一次 false→true 边沿（旧办法在轮询节奏不巧漏过中间的
-    /// false 时，覆盖永远清不掉）。isEnabled 变回 true 时必须同步清掉，避免下次覆盖
-    /// 复用一份过期快照。
-    static var overrideBaseline: Date? {
-        get { UserDefaults.standard.object(forKey: overrideBaselineKey) as? Date }
+    /// 本地覆盖生效那一刻，服务端 config.continuityModeUpdatedAt 的快照（存原始字符串，
+    /// 理由见 ClientConfig.continuityModeUpdatedAt）。refreshConfig() 拿它跟服务端最新值
+    /// 做**等值**比较，判断"家长是否在本地覆盖之后又重新动过这个开关"，不再要求恰好
+    /// 观察到一次 false→true 边沿（旧办法在轮询节奏不巧漏过中间的 false 时，覆盖永远
+    /// 清不掉）。isEnabled 变回 true 时必须同步清掉，避免下次覆盖复用一份过期快照。
+    static var overrideBaseline: String? {
+        get { UserDefaults.standard.object(forKey: overrideBaselineKey) as? String }
         set {
             if let newValue {
                 UserDefaults.standard.set(newValue, forKey: overrideBaselineKey)
@@ -2418,22 +2425,30 @@ enum ContinuityModeController {
     /// 两种信号任一命中都清：
     /// 1) 边沿：这次轮询看到 continuityMode 从 false 变 true。轮询节奏凑巧时才会
     ///    观察到，但胜在不依赖后端有没有下发时间戳，旧后端也能用。
-    /// 2) 时间戳更新：remoteUpdatedAt 比创建覆盖那一刻记下的 overrideBaseline 更新，
+    /// 2) 时间戳变了：remoteUpdatedAt 跟创建覆盖那一刻记下的 overrideBaseline **不相等**，
     ///    说明家长确实在覆盖生效之后又重新动过这个开关——不管中间有没有一次轮询真的
     ///    落在"已经变回 false"的那一拍。这是给 1) 补的洞：家长把开关关了又立刻打开，
     ///    两次保存之间如果没轮询到，光看边沿会永远漏判，覆盖清不掉。
+    ///
+    /// 用等值而不是先后比较，是因为要回答的问题本来就是"这个值变了没有"。先后比较需要
+    /// 把不带时区的 LocalDateTime 解析成绝对时刻，夏令时切换会让一个从没变过的时间戳
+    /// 凭空显得更新（详见 ClientConfig.continuityModeUpdatedAt 的说明）。
+    ///
+    /// nil 的两种含义都能正确落地：
+    /// - 两边都 nil（旧后端从不下发）→ 相等 → 只剩边沿判断，行为退回改动前，不会更差。
+    /// - baseline 为 nil、remote 有值 → 不等 → 清。这正是**老部署**的主场景：升级前就
+    ///   已经打开连续性的设备，新列是 NULL，孩子建立覆盖时快照只能是 nil；此后家长任何
+    ///   一次真正的开关翻转都会写出时间戳，从 nil 变成有值本身就是"家长动过"的证据。
     static func shouldClearOverride(
         remoteContinuityMode: Bool,
         previousContinuityMode: Bool,
-        remoteUpdatedAt: Date?,
-        overrideBaseline: Date?
+        remoteUpdatedAt: String?,
+        overrideBaseline: String?
     ) -> Bool {
         guard remoteContinuityMode else { return false }
         let sawEdge = !previousContinuityMode
-        let sawFreshTimestamp = overrideBaseline.map { baseline in
-            (remoteUpdatedAt ?? .distantPast) > baseline
-        } == true
-        return sawEdge || sawFreshTimestamp
+        let tokenChanged = remoteUpdatedAt != overrideBaseline
+        return sawEdge || tokenChanged
     }
 
     static var isLaunchdManaged: Bool {
@@ -2842,13 +2857,17 @@ extension JSONDecoder {
 }
 
 extension JSONEncoder {
-    /// 与 JSONDecoder.bigDaddy 配对。ConfigStore 用它把 ClientConfig 存到本地磁盘再读回来
-    /// （跟服务器无关的纯本机往返）。普通 JSONEncoder() 默认把 Date 编码成距 2001 参考日的
-    /// 秒数（Double），而 JSONDecoder.bigDaddy 的自定义策略无条件按字符串解析——两者一旦
-    /// 用来编解码同一份数据就对不上，ClientConfig 只要携带一个非 nil 的 Date 字段存盘，
-    /// 下次启动 ConfigStore.load() 就会在这个字段上解码失败，进而让**整份本地配置**
-    /// 静默退回默认值。这里改成输出 BigDaddyDateParser 认得的带小数秒 ISO 8601 字符串，
-    /// 消除这个此前从未被触发过（ClientConfig 里从没出现过 Date 字段）的潜在坑。
+    /// 与 JSONDecoder.bigDaddy 配对，给 ConfigStore 把 ClientConfig 存盘再读回来用。
+    ///
+    /// 这是**预防性**的：ClientConfig 目前一个 Date 字段都没有（continuityModeUpdatedAt
+    /// 存的是后端原文字符串），所以换不换编码器眼下没有任何行为差别。留着是因为
+    /// save() 和 load() 之间存在一处很容易踩、且踩了没有任何报错的不对称——普通
+    /// JSONEncoder() 默认把 Date 编成距 2001 参考日的秒数（Double），而
+    /// JSONDecoder.bigDaddy 的自定义策略无条件按字符串解析。将来只要有人往
+    /// ClientConfig 里加一个 Date 字段，存盘再读回来就会在那个字段上解码失败，
+    /// 而 load() 是 `try?`，失败的后果不是这一个字段丢了，是**整份本地配置**
+    /// 静默退回默认值。这里让编码端输出 BigDaddyDateParser 认得的 ISO 8601 字符串，
+    /// 把这个陷阱一次性堵死。
     static var bigDaddy: JSONEncoder {
         let encoder = JSONEncoder()
         let formatter = ISO8601DateFormatter()

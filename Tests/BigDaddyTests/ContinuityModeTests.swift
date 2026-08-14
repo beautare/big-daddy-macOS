@@ -74,63 +74,59 @@ final class ContinuityModeTests: XCTestCase {
         XCTAssertEqual(parsed["Label"] as? String, LaunchAgentPlist.label)
     }
 
-    // MARK: - continuityModeUpdatedAt decoding
+    // MARK: - continuityModeUpdatedAt 解码（保留后端原文，不解析成 Date）
 
     func testMissingContinuityModeUpdatedAtDecodesNil() throws {
         let config = try JSONDecoder.bigDaddy.decode(ClientConfig.self, from: Data("{}".utf8))
         XCTAssertNil(config.continuityModeUpdatedAt)
     }
 
-    func testContinuityModeUpdatedAtDecodesJacksonLocalDateTimeFormat() throws {
-        // 后端 Jackson 序列化 LocalDateTime 就长这样：无时区、带小数秒。
+    func testContinuityModeUpdatedAtKeepsRawBackendString() throws {
+        // 后端 Jackson 序列化 LocalDateTime 就长这样：无时区、带小数秒。必须原样留着——
+        // 一旦解析成 Date，夏令时切换会让同一个字符串对应到不同的绝对时刻。
+        let raw = "2026-07-16T23:01:02.123456"
         let config = try JSONDecoder.bigDaddy.decode(
             ClientConfig.self,
-            from: Data(#"{"continuityModeUpdatedAt":"2026-07-16T23:01:02.123456"}"#.utf8)
+            from: Data(#"{"continuityModeUpdatedAt":"\#(raw)"}"#.utf8)
         )
-        XCTAssertNotNil(config.continuityModeUpdatedAt)
+        XCTAssertEqual(config.continuityModeUpdatedAt, raw)
     }
 
     // MARK: - ConfigStore 本地往返（JSONEncoder.bigDaddy / JSONDecoder.bigDaddy 必须配对）
     //
-    // 这三条钉住此前从未被触发过的一个坑：ConfigStore.save() 一旦用普通 JSONEncoder()
-    // （默认把 Date 编码成距 2001 参考日的秒数），而 ConfigStore.load() 用的
-    // JSONDecoder.bigDaddy 无条件按字符串解析 Date——ClientConfig 只要携带一个非 nil
-    // 的 Date 字段存盘，下次启动就会在这个字段上解码失败，进而让整份本地配置静默退回
-    // 默认值。continuityModeUpdatedAt 是 ClientConfig 里第一个 Date 字段，直接会踩中。
+    // ClientConfig 目前没有 Date 字段，这几条钉的是那个**尚未被触发**的陷阱本身：
+    // save() 若用普通 JSONEncoder()（Date -> 数字），而 load() 用 JSONDecoder.bigDaddy
+    // （无条件按字符串解析 Date），两者对不上；又因为 load() 是 try?，后果不是丢一个
+    // 字段，而是整份本地配置静默退回默认值。用一个独立小结构验证这对编解码器的对称性，
+    // 不依赖 ClientConfig 当下有没有 Date 字段。
+    private struct DateBox: Codable, Equatable {
+        var stamp: Date?
+    }
 
     func testDateRoundTripsThroughBigDaddyEncoderAndDecoder() throws {
-        var config = ClientConfig()
-        config.continuityMode = true
-        config.continuityModeUpdatedAt = Date(timeIntervalSince1970: 1_755_000_000)
+        let box = DateBox(stamp: Date(timeIntervalSince1970: 1_755_000_000))
+        let data = try JSONEncoder.bigDaddy.encode(box)
+        let decoded = try JSONDecoder.bigDaddy.decode(DateBox.self, from: data)
 
-        let data = try JSONEncoder.bigDaddy.encode(config)
-        let decoded = try JSONDecoder.bigDaddy.decode(ClientConfig.self, from: data)
-
-        let original = try XCTUnwrap(config.continuityModeUpdatedAt)
-        let restored = try XCTUnwrap(decoded.continuityModeUpdatedAt)
+        let original = try XCTUnwrap(box.stamp)
+        let restored = try XCTUnwrap(decoded.stamp)
         // ISO 8601 格式化到毫秒精度，不奢求跟原始 Date 完全相等，但秒级必须对得上。
         XCTAssertEqual(original.timeIntervalSince1970, restored.timeIntervalSince1970, accuracy: 0.001)
     }
 
     func testNilDateRoundTripsAsNil() throws {
-        let config = ClientConfig()
-        let data = try JSONEncoder.bigDaddy.encode(config)
-        let decoded = try JSONDecoder.bigDaddy.decode(ClientConfig.self, from: data)
-        XCTAssertNil(decoded.continuityModeUpdatedAt)
+        let data = try JSONEncoder.bigDaddy.encode(DateBox(stamp: nil))
+        XCTAssertNil(try JSONDecoder.bigDaddy.decode(DateBox.self, from: data).stamp)
     }
 
     func testPlainJSONEncoderIsNotSymmetricWithBigDaddyDecoder() throws {
-        // 反证：证明这个坑是真实存在的，不是臆造的风险。用错误的编码器（旧 ConfigStore.save()
-        // 用过的那个）编码一个带 Date 的 config，再拿 JSONDecoder.bigDaddy 解码，必须失败——
-        // 如果这条用例哪天开始通过，说明 Foundation 悄悄改了默认行为，上面两条"往返成功"的
-        // 用例就不再能证明什么，需要重新审视。
-        var config = ClientConfig()
-        config.continuityModeUpdatedAt = Date()
-        let data = try JSONEncoder().encode(config)
-        XCTAssertThrowsError(try JSONDecoder.bigDaddy.decode(ClientConfig.self, from: data))
+        // 反证：证明这个陷阱真实存在，不是臆造的风险。如果这条哪天开始不抛错，说明
+        // Foundation 改了默认行为，上面两条"往返成功"就不再能证明什么，需要重新审视。
+        let data = try JSONEncoder().encode(DateBox(stamp: Date()))
+        XCTAssertThrowsError(try JSONDecoder.bigDaddy.decode(DateBox.self, from: data))
     }
 
-    // MARK: - shouldClearOverride 决策逻辑
+    // MARK: - shouldClearOverride 决策逻辑（等值比较，不比先后）
 
     func testClearOverrideOnFalseToTrueEdge() {
         XCTAssertTrue(ContinuityModeController.shouldClearOverride(
@@ -142,56 +138,53 @@ final class ContinuityModeTests: XCTestCase {
     }
 
     func testDoesNotClearWhenRemoteStillFalse() {
+        // 家长那边还是关着：无论时间戳怎么变都不该清（清了等于替家长把它打开）。
         XCTAssertFalse(ContinuityModeController.shouldClearOverride(
             remoteContinuityMode: false,
             previousContinuityMode: false,
-            remoteUpdatedAt: Date(),
-            overrideBaseline: Date.distantPast
-        ))
-    }
-
-    func testDoesNotClearWhenNoEdgeAndNoBaseline() {
-        // 家长从未真正动过这个开关（没有 baseline 可比），也没观察到边沿：不该清。
-        XCTAssertFalse(ContinuityModeController.shouldClearOverride(
-            remoteContinuityMode: true,
-            previousContinuityMode: true,
-            remoteUpdatedAt: nil,
+            remoteUpdatedAt: "2026-08-14T10:00:00",
             overrideBaseline: nil
         ))
     }
 
-    func testClearsOnFreshTimestampEvenWithoutObservingEdge() {
-        // 核心场景：家长关了又开，两次保存都发生在客户端两次轮询之间——本次轮询看到的
-        // 仍是 true→true（没有边沿），但时间戳比创建覆盖时的快照新，照样要清。
-        let baseline = Date(timeIntervalSince1970: 1000)
-        let newerUpdate = Date(timeIntervalSince1970: 2000)
+    func testClearsOnChangedTokenEvenWithoutObservingEdge() {
+        // 核心场景：家长关了又开，两次保存都落在客户端两次轮询之间——本次轮询看到的
+        // 仍是 true→true（没有边沿），但时间戳变了，照样要清。
         XCTAssertTrue(ContinuityModeController.shouldClearOverride(
             remoteContinuityMode: true,
             previousContinuityMode: true,
-            remoteUpdatedAt: newerUpdate,
-            overrideBaseline: baseline
+            remoteUpdatedAt: "2026-08-14T10:00:00",
+            overrideBaseline: "2026-08-01T09:00:00"
         ))
     }
 
-    func testDoesNotClearOnStaleOrEqualTimestamp() {
-        let baseline = Date(timeIntervalSince1970: 2000)
+    func testDoesNotClearWhenTokenUnchanged() {
+        // 家长自打孩子建立覆盖之后就没动过：时间戳一字不差，必须保持覆盖。
+        // 这条同时钉住"不跨夏令时误清"——原文相同就是相同，不经过时区解析。
+        let token = "2026-08-14T10:00:00"
         XCTAssertFalse(ContinuityModeController.shouldClearOverride(
             remoteContinuityMode: true,
             previousContinuityMode: true,
-            remoteUpdatedAt: baseline,
-            overrideBaseline: baseline
-        ))
-        XCTAssertFalse(ContinuityModeController.shouldClearOverride(
-            remoteContinuityMode: true,
-            previousContinuityMode: true,
-            remoteUpdatedAt: Date(timeIntervalSince1970: 500),
-            overrideBaseline: baseline
+            remoteUpdatedAt: token,
+            overrideBaseline: token
         ))
     }
 
-    func testOldBackendWithoutTimestampFallsBackToEdgeOnly() {
-        // 旧后端不下发 continuityModeUpdatedAt：remoteUpdatedAt 恒 nil，baseline 也恒 nil
-        // （从未存过），行为必须退回纯边沿判断，不能因为新逻辑而“坏得更差”。
+    func testClearsWhenBaselineWasNilAndBackendNowHasToken() {
+        // 老部署主场景：升级前就打开了连续性，新列是 NULL，孩子建立覆盖时快照只能是 nil。
+        // 此后家长任何一次真正的翻转都会写出时间戳——从 nil 变成有值本身就是"家长动过"。
+        // 这条曾经是 false（用先后比较时 nil baseline 让整条时间戳路径失效），
+        // 意味着恰恰是存量用户拿不到这次修复。
+        XCTAssertTrue(ContinuityModeController.shouldClearOverride(
+            remoteContinuityMode: true,
+            previousContinuityMode: true,
+            remoteUpdatedAt: "2026-08-14T10:00:00",
+            overrideBaseline: nil
+        ))
+    }
+
+    func testOldBackendWithoutTokenFallsBackToEdgeOnly() {
+        // 旧后端从不下发这个字段：两边恒 nil，相等，退回纯边沿判断，不能比改动前更差。
         XCTAssertFalse(ContinuityModeController.shouldClearOverride(
             remoteContinuityMode: true,
             previousContinuityMode: true,
@@ -209,7 +202,7 @@ final class ContinuityModeTests: XCTestCase {
     // MARK: - ContinuityModePreference.overrideBaseline 存取
 
     func testOverrideBaselineDefaultsNilAndRoundTrips() {
-        let key = "ContinuityModeOverrideBaselineUpdatedAt"
+        let key = "ContinuityModeOverrideBaselineToken"
         let original = UserDefaults.standard.object(forKey: key)
         defer {
             if let original { UserDefaults.standard.set(original, forKey: key) }
@@ -219,9 +212,8 @@ final class ContinuityModeTests: XCTestCase {
         ContinuityModePreference.overrideBaseline = nil
         XCTAssertNil(ContinuityModePreference.overrideBaseline)
 
-        let snapshot = Date(timeIntervalSince1970: 1_700_000_000)
-        ContinuityModePreference.overrideBaseline = snapshot
-        XCTAssertEqual(ContinuityModePreference.overrideBaseline, snapshot)
+        ContinuityModePreference.overrideBaseline = "2026-08-14T10:00:00"
+        XCTAssertEqual(ContinuityModePreference.overrideBaseline, "2026-08-14T10:00:00")
 
         ContinuityModePreference.overrideBaseline = nil
         XCTAssertNil(ContinuityModePreference.overrideBaseline)
