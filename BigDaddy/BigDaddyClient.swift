@@ -102,7 +102,7 @@ struct ClientConfig: Codable, Equatable {
     var aiEnabled: Bool = false
     var allowScreenshotAiProcessing: Bool = false
     /// 已绑定设备恒为 true：退出验证不是持久化开关，而是家长每次都要在 Dashboard
-    /// 实时生成一次性验证码（见 verifyExitPassword），这里只用于 UI 展示"是否需要验证退出"。
+    /// 实时生成临时验证码（见 verifyExitPassword），这里只用于 UI 展示"是否需要验证退出"。
     var hasExitPassword: Bool = false
     var heartbeatActiveSeconds: Int = 60
     var heartbeatIdleSeconds: Int = 900
@@ -1759,7 +1759,7 @@ final class BigDaddyClient {
     }
 
     func verifyExitPassword(_ value: String) async -> Bool {
-        // 未绑定设备没有家长账户可以生成退出验证码，允许直接退出。
+        // 未绑定设备没有家长账户可以生成临时验证码，允许直接退出。
         // 已绑定设备必须始终远程校验——不能因为本地状态判断就跳过，
         // 否则任意 6 位数字都能绕过退出确认（曾经的漏洞：旧代码在
         // config.exitPasswordHash == nil 时直接放行，而该字段现在恒为空）。
@@ -2389,6 +2389,28 @@ enum ContinuityModeController {
         return Launchctl.jobPid() == ProcessInfo.processInfo.processIdentifier
     }
 
+    /// "本进程主动拉起一份继任者、然后自己退出"这套交接，有两个调用点：
+    /// disableKeepAlive()（关闭连续性时从 launchd 手里接管）和 AppDelegate.restartApplication()
+    /// （非 launchd 托管时的重启）。两者都先 spawn 再让自己死，于是继任者启动那一刻旧进程
+    /// 通常还活着。没有这个标记时，shouldExitAsDuplicate() 会把继任者当成"非 launchd 的
+    /// 后来者"——检测到"已有实例在跑"就直接把自己也退出，跟随后死掉的旧进程一起两个全灭
+    /// （用户看到的"点关闭崩溃后自动恢复，整个 App 退出了"）。带上标记后，
+    /// shouldExitAsDuplicate() 对它按 isLaunchdManaged 同等处理：等旧实例真正退出，而不是自杀。
+    private static let handoverSuccessorEnvKey = "BIGDADDY_HANDOVER_SUCCESSOR"
+
+    private static var isHandoverSuccessor: Bool {
+        ProcessInfo.processInfo.environment[handoverSuccessorEnvKey] == "1"
+    }
+
+    /// 交接用继任进程的环境：摘掉 launchd 注入的标记（继任者本就不归 launchd 管），
+    /// 打上交接标记。两个 spawn 点共用，避免其中一个漏标又退化成"两个全灭"。
+    static func successorEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: LaunchAgentPlist.launchedByLaunchdEnvKey)
+        env[handoverSuccessorEnvKey] = "1"
+        return env
+    }
+
     static var osLevelStatusDescription: String {
         guard let plist = LaunchAgentInstaller.readInstalled(),
               LaunchAgentPlist.crashRelaunch(from: plist) else {
@@ -2424,15 +2446,16 @@ enum ContinuityModeController {
         return true
     }
 
-    /// 启动最开头调用：已有实例时，非 launchd 的后来者直接退出；launchd 拉起的新实例
-    /// 等旧实例把进程交出来（连续性刚打开时的交接）。
+    /// 启动最开头调用：已有实例时，非 launchd 的后来者直接退出；launchd 拉起的新实例，
+    /// 或者本进程主动交接出来的继任者（successorEnvironment 打的标记，来自
+    /// disableKeepAlive() 与 restartApplication()），等旧实例把进程交出来再接管。
     static func shouldExitAsDuplicate() -> Bool {
         guard let bundleId = Bundle.main.bundleIdentifier else { return false }
         let own = ProcessInfo.processInfo.processIdentifier
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
             .filter { $0.processIdentifier != own }
         guard !others.isEmpty else { return false }
-        if isLaunchdManaged {
+        if isLaunchdManaged || isHandoverSuccessor {
             let deadline = Date().addingTimeInterval(5)
             while Date() < deadline {
                 let remaining = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
@@ -2537,9 +2560,7 @@ enum ContinuityModeController {
         guard let executablePath = Bundle.main.executablePath else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: LaunchAgentPlist.launchedByLaunchdEnvKey)
-        process.environment = env
+        process.environment = successorEnvironment()
         try? process.run()
         Thread.sleep(forTimeInterval: 0.4)
     }

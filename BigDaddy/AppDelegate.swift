@@ -672,7 +672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(
-            title: Localization.string(zh: "关闭守护程序（需家长验证码）", en: "Close Guard Process (Requires Exit Code)"),
+            title: Localization.string(zh: "关闭守护程序（需临时验证码）", en: "Close Guard Process (Requires Temporary Verification Code)"),
             action: #selector(quitWithPassword), keyEquivalent: "q"
         ))
         statusItem?.menu = menu
@@ -2642,7 +2642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             屏幕最上面那一排里有个小盾牌，一直都在，你随时能点开。盾牌旁边什么都没有，就是没在截图；多出一个小圆点，就是截图开着；圆点变成一个圈，就是这一刻正在截图——扫一眼就知道现在是哪种。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
 
             想暂停或者卸载？
-            跟家长说一声。家长会在他那边生成一个一次性的数字码，你输进去就能退出。家长如果打开了"崩溃后自动恢复"，程序意外退出后会自己再打开；关掉程序仍然需要家长的一次性数字码。这不是偷偷装的第二份软件，把 BigDaddy 从这台电脑上删掉之后它不会自己回来。
+            跟家长说一声。家长会在他那边生成一个临时验证码，你输进去就能退出。家长如果打开了"崩溃后自动恢复"，程序意外退出后会自己再打开；关掉程序仍然需要家长的临时验证码。这不是偷偷装的第二份软件，把 BigDaddy 从这台电脑上删掉之后它不会自己回来。
 
             ——如果你是家长，而这就是你自己的电脑：BigDaddy 应该装在孩子的电脑上，装在这里不会有任何用。
             """,
@@ -2659,7 +2659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             There's a small shield in the strip along the very top of the screen. It's always there, and you can open it any time. Nothing next to the shield means no screenshots are being taken; a small dot means they're on; the dot turning into a ring means a screenshot is being taken right this moment — one glance tells you which. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.
 
             Want to pause it or take it off?
-            Talk to your parent. They can generate a one-time code on their side, and typing it in lets you quit. If your parent turned on "relaunch after crash", the app comes back after an unexpected quit; closing it still needs that one-time code. This is not a hidden second copy — deleting BigDaddy from this Mac will not bring it back.
+            Talk to your parent. They can generate a temporary verification code on their side, and typing it in lets you quit. If your parent turned on "relaunch after crash", the app comes back after an unexpected quit; closing it still needs that temporary verification code. This is not a hidden second copy — deleting BigDaddy from this Mac will not bring it back.
 
             — If you're a parent and this is your own computer: BigDaddy belongs on your child's computer. Installed here, it won't do anything useful.
             """
@@ -2762,8 +2762,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭 BigDaddy 守护程序", en: "Close BigDaddy Guard Process"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时退出码」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭守护程序。",
-                en: "Please enter the 6-digit temporary exit code from Guardian Home → Settings → More Actions → Get Temporary Exit Code (valid for 5 minutes)."
+                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭守护程序。",
+                en: "Please enter the 6-digit temporary verification code from Guardian Home → Settings → More Actions → Get Temporary Verification Code (valid for 5 minutes)."
             ),
             confirmTitle: Localization.string(zh: "关闭守护程序", en: "Close Guard Process")
         ) else { return }
@@ -2779,8 +2779,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
                     errorAlert.informativeText = Localization.string(
-                        zh: "退出验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The exit code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                        zh: "临时验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The temporary verification code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
                     )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
@@ -2842,8 +2842,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭开机自动启动", en: "Turn Off Start at Login"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时退出码」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
-                en: "Please enter the 6-digit temporary exit code from Guardian Home → Settings → More Actions → Get Temporary Exit Code, to turn off Start at Login."
+                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
+                en: "Please enter the 6-digit temporary verification code from Guardian Home → Settings → More Actions → Get Temporary Verification Code, to turn off Start at Login."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
@@ -2857,8 +2857,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
                     errorAlert.informativeText = Localization.string(
-                        zh: "验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                        zh: "临时验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The temporary verification code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
                     )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
@@ -2881,8 +2881,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭崩溃后自动恢复", en: "Turn Off Relaunch After Crash"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时退出码」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
-                en: "Please enter the 6-digit temporary exit code from Guardian Home → Settings → More Actions → Get Temporary Exit Code, to turn off relaunch after crash."
+                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
+                en: "Please enter the 6-digit temporary verification code from Guardian Home → Settings → More Actions → Get Temporary Verification Code, to turn off relaunch after crash."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
@@ -2900,8 +2900,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
                     errorAlert.informativeText = Localization.string(
-                        zh: "验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                        zh: "临时验证码不正确或已过期，请重新在家长端生成后重试。",
+                        en: "The temporary verification code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
                     )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
@@ -2910,9 +2910,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    /// "安全退出"与"关闭开机自动启动"共用的 6 位家长验证码输入弹窗（含倒计时、
+    /// "安全退出"与"关闭开机自动启动"共用的 6 位临时验证码输入弹窗（含倒计时、
     /// 自动跳格），返回用户输入的 6 位数字；用户点取消，或未输满 6 位时返回 nil
-    /// （未输满会先提示"请输入完整的 6 位验证码"）。调用方自行决定拿到码之后怎么
+    /// （未输满会先提示"请输入完整的 6 位临时验证码"）。调用方自行决定拿到码之后怎么
     /// 校验、以及成功/失败分别做什么。
     private func promptParentVerificationCode(title: String, message: String, confirmTitle: String) -> String? {
         let alert = NSAlert()
@@ -2965,7 +2965,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if code.count < 6 {
             let errorAlert = NSAlert()
             errorAlert.messageText = Localization.string(zh: "验证失败", en: "Verification Failed")
-            errorAlert.informativeText = Localization.string(zh: "请输入完整的 6 位验证码。", en: "Please enter the complete 6-digit verification code.")
+            errorAlert.informativeText = Localization.string(zh: "请输入完整的 6 位临时验证码。", en: "Please enter the complete 6-digit temporary verification code.")
             errorAlert.addButton(withTitle: Localization.string(zh: "确认", en: "Confirm"))
             errorAlert.runModal()
             return nil
@@ -3072,8 +3072,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self.countdownTimer?.invalidate()
             self.countdownTimer = nil
             exitCountdownLabel?.stringValue = Localization.string(
-                zh: "验证码已超时失效，请关闭此窗口并重新获取",
-                en: "Verification code expired. Please close this window and try again."
+                zh: "临时验证码已超时失效，请关闭此窗口并重新获取",
+                en: "The temporary verification code expired. Please close this window and try again."
             )
             exitCountdownLabel?.textColor = NSColor.systemRed
         }
@@ -3085,8 +3085,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let seconds = countdownSeconds % 60
         let timeString = String(format: "%02d:%02d", minutes, seconds)
         exitCountdownLabel?.stringValue = Localization.string(
-            zh: "验证码将在 \(timeString) 后失效",
-            en: "Verification code will expire in \(timeString)"
+            zh: "临时验证码将在 \(timeString) 后失效",
+            en: "The temporary verification code will expire in \(timeString)"
         )
     }
 
@@ -3573,9 +3573,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let executablePath = Bundle.main.executablePath else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: LaunchAgentPlist.launchedByLaunchdEnvKey)
-        process.environment = env
+        // 与 disableKeepAlive() 的交接同一套标记：这里也是"先拉起继任者、再让自己退出"，
+        // 新进程起来时旧进程往往还没走完 terminate。不打标记的话，它会在
+        // shouldExitAsDuplicate() 里把自己当成多余的重复实例退掉，而旧进程随后也终止——
+        // 一次本该是"重启"的操作变成整个 App 消失。
+        process.environment = ContinuityModeController.successorEnvironment()
         try? process.run()
         NSApp.terminate(nil)
     }
