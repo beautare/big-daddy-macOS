@@ -19,7 +19,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "BigDaddy",
-            exclude: ["Info.plist"]
+            exclude: ["Info.plist", "AppIcon.icns"]
         ),
         .testTarget(
             name: "BigDaddyTests",

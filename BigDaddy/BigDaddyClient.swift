@@ -174,7 +174,7 @@ final class SwitchCounter: @unchecked Sendable {
     }
 }
 
-final class BigDaddyClient {
+final class BigDaddyClient: @unchecked Sendable {
     static var lastSharedInstance: BigDaddyClient?
     static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
 

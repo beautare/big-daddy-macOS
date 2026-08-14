@@ -1423,13 +1423,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 同样用真实 Apple Event 触发系统询问，理由见 probeAutomation。
             // 这个调用会同步阻塞到用户点选为止，必须离开主线程，否则整个客户端
             // （含菜单栏图标）在用户做决定之前都是僵住的。
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let probe = self?.client.probeAutomation(bundleID: bundleID)
+            let client = self.client
+            DispatchQueue.global(qos: .userInitiated).async { [weak self, client] in
+                let probe = client.probeAutomation(bundleID: bundleID)
                 // 内层闭包显式重新弱捕获 self，而不是沿用外层 [weak self] 解出来的那个
                 // 变量——后者是"跨并发边界引用被捕获的 var"，Swift 6 下是错误。
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    if probe?.permission == .granted {
+                    if probe.permission == .granted {
                         self.automationDeniedBundleIDs.remove(bundleID)
                         // 授权当场生效，下一次心跳就能带上 URL，无需重启（这点和屏幕录制不同）
                         self.rebuildMenu()
@@ -1477,12 +1478,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             .filter { running.contains($0) && !warmed.contains($0) }
         guard !urlTargets.isEmpty || !titleTargets.isEmpty else { return }
 
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        let client = self.client
+        DispatchQueue.global(qos: .utility).async { [weak self, client] in
             // 每次调用都会同步阻塞到用户在系统授权框上点选为止——这正是我们要的效果，
             // 但因此绝不能放在主线程上，否则菜单栏图标在用户做决定之前整个僵住。
             var stillBlocked: [String] = []
             for bundleID in urlTargets {
-                guard let probe = self?.client.probeAutomation(bundleID: bundleID) else { return }
+                let probe = client.probeAutomation(bundleID: bundleID)
                 switch probe.permission {
                 case .granted, .targetNotRunning:
                     continue
@@ -1494,7 +1496,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // automationDeniedBundleIDs 驱动的是「浏览器网址未授权」那条待办，而
             // Firefox 无论授权与否都给不出网址，混进去就是给家长派一件做不完的活。
             for bundleID in titleTargets {
-                self?.client.warmTitleAutomation(bundleID: bundleID)
+                client.warmTitleAutomation(bundleID: bundleID)
             }
             // 记账放在探测之后：中途进程被杀的话，这些浏览器下次启动还会再预热一次，
             // 比"记了账却没真发出去、从此再也不预热"要好。
@@ -1572,12 +1574,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 循环才执行的异步任务，闭包本身立即返回、系统立刻继续休眠流程，等于完全废掉
         // "同步阻塞、确保这条心跳已经发出"这个设计的全部意义。`client` 是一个不涉及
         // AppDelegate 自身状态、专为跨线程调用设计的普通类实例，这里保留警告、不做处理。
+        let client = self.client
         workspaceCenter.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
-        ) { [weak self] _ in
-            guard let self else { return }
+        ) { [client] _ in
             AuditLog.record("SYSTEM_WILL_SLEEP")
-            self.client.sendEventSync(event: .sleep, timeout: 2.0)
+            client.sendEventSync(event: .sleep, timeout: 2.0)
         }
 
         workspaceCenter.addObserver(
@@ -3919,7 +3921,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let targets = Array(automationDeniedBundleIDs)
         guard !targets.isEmpty else { return }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let client = self.client
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, client] in
             // 必须把"有记录、被拒"和"根本没有记录"分开：系统设置的自动化面板只列出
             // **已经产生过 TCC 记录**的 App，没有记录的话那个面板里连 BigDaddy 这一栏
             // 都不存在，把用户送过去只会让他对着一个空列表发懵。
@@ -3935,7 +3938,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // AEDeterminePermissionToAutomateTarget(askUserIfNeeded: true)，在它不弹
                 // 询问的情况下既建不出记录，又被判成"被拒"，用户就被送去一个根本没有
                 // BigDaddy 条目的自动化面板。
-                guard let probe = self?.client.probeAutomation(bundleID: bundleID) else { continue }
+                let probe = client.probeAutomation(bundleID: bundleID)
                 switch probe.permission {
                 case .granted:
                     if let url = probe.url {
