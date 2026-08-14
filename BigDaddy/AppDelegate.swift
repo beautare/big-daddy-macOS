@@ -2872,6 +2872,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     @objc private func disableContinuityWithVerification() {
         guard client.config.bound else {
             ContinuityModePreference.isEnabled = false
+            ContinuityModePreference.overrideBaseline = client.config.continuityModeUpdatedAt
             ContinuityModeController.sync(enabled: false)
             AuditLog.record("CONTINUITY_MODE_TOGGLE state=DISABLED source=local-unbound")
             rebuildMenu()
@@ -2892,6 +2893,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             await MainActor.run {
                 if success {
                     ContinuityModePreference.isEnabled = false
+                    ContinuityModePreference.overrideBaseline = self.client.config.continuityModeUpdatedAt
                     ContinuityModeController.sync(enabled: false)
                     AuditLog.record("CONTINUITY_MODE_TOGGLE state=DISABLED source=local-verified")
                     rebuildMenu()

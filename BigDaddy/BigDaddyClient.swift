@@ -115,6 +115,9 @@ struct ClientConfig: Codable, Equatable {
     /// 家长在 Dashboard 打开的"连续性模式"：崩溃 / 强制退出后由用户级 LaunchAgent
     /// KeepAlive 拉起。缺省 false；旧后端不下发此字段时保持关闭，行为与今天一致。
     var continuityMode: Bool = false
+    /// continuityMode 最近一次被家长实际改变（真的翻转过，不是每次保存表单）的时间。
+    /// 旧后端不下发时为 nil，refreshConfig() 退回纯 false→true 边沿判断，行为与今天一致。
+    var continuityModeUpdatedAt: Date? = nil
 
     init() {
     }
@@ -138,6 +141,7 @@ struct ClientConfig: Codable, Equatable {
         webFilter = try container.decodeIfPresent(WebFilterConfiguration.self, forKey: .webFilter) ?? WebFilterConfiguration()
         timeSession = try container.decodeIfPresent(TimeSession.self, forKey: .timeSession)
         continuityMode = try container.decodeIfPresent(Bool.self, forKey: .continuityMode) ?? false
+        continuityModeUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .continuityModeUpdatedAt)
     }
 }
 
@@ -443,9 +447,17 @@ final class BigDaddyClient {
                 object: self
             )
         }
-        // 家长从关闭→打开连续性，清掉孩子在本机用验证码打下的关闭覆盖，让家长策略重新生效。
-        if config.continuityMode && !previous.continuityMode {
+        // 清掉孩子在本机用验证码打下的关闭覆盖，让家长策略重新生效。只在覆盖确实生效时
+        // 才判断——isEnabled 已经是 true 时这个决定毫无意义，没必要跑。
+        if !ContinuityModePreference.isEnabled,
+           ContinuityModeController.shouldClearOverride(
+               remoteContinuityMode: config.continuityMode,
+               previousContinuityMode: previous.continuityMode,
+               remoteUpdatedAt: config.continuityModeUpdatedAt,
+               overrideBaseline: ContinuityModePreference.overrideBaseline
+           ) {
             ContinuityModePreference.isEnabled = true
+            ContinuityModePreference.overrideBaseline = nil
         }
         ContinuityModeController.sync(enabled: config.continuityMode && ContinuityModePreference.isEnabled)
         return config != previous ? .successChanged : .successUnchanged
@@ -2364,6 +2376,7 @@ enum LaunchAgentInstaller {
 /// 家长在 Dashboard 把 continuityMode 从关拨到开时会清掉这份覆盖。
 enum ContinuityModePreference {
     private static let key = "ContinuityModeLocallyEnabled"
+    private static let overrideBaselineKey = "ContinuityModeOverrideBaselineUpdatedAt"
 
     static var isEnabled: Bool {
         get {
@@ -2371,6 +2384,22 @@ enum ContinuityModePreference {
             return UserDefaults.standard.bool(forKey: key)
         }
         set { UserDefaults.standard.set(newValue, forKey: key) }
+    }
+
+    /// 本地覆盖生效那一刻，服务端 config.continuityModeUpdatedAt 的快照。refreshConfig()
+    /// 靠比较这个快照和服务端最新时间戳来判断"家长是否在本地覆盖之后又重新动过这个
+    /// 开关"，不再要求恰好观察到一次 false→true 边沿（旧办法在轮询节奏不巧漏过中间的
+    /// false 时，覆盖永远清不掉）。isEnabled 变回 true 时必须同步清掉，避免下次覆盖
+    /// 复用一份过期快照。
+    static var overrideBaseline: Date? {
+        get { UserDefaults.standard.object(forKey: overrideBaselineKey) as? Date }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(newValue, forKey: overrideBaselineKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: overrideBaselineKey)
+            }
+        }
     }
 }
 
@@ -2381,6 +2410,31 @@ enum ContinuityModePreference {
 enum ContinuityModeController {
     /// 最近一次 sync 的目标状态。LaunchAtLoginController 用它避免拆掉 KeepAlive agent。
     private(set) static var isActive = false
+
+    /// refreshConfig() 里"要不要清掉孩子用验证码打下的本地覆盖"这个判断，抽成纯函数
+    /// 单独测试——调用方已经用 `!ContinuityModePreference.isEnabled` 保证只在覆盖确实
+    /// 生效时才调用这里，这个前提不在函数内部重复判断。
+    ///
+    /// 两种信号任一命中都清：
+    /// 1) 边沿：这次轮询看到 continuityMode 从 false 变 true。轮询节奏凑巧时才会
+    ///    观察到，但胜在不依赖后端有没有下发时间戳，旧后端也能用。
+    /// 2) 时间戳更新：remoteUpdatedAt 比创建覆盖那一刻记下的 overrideBaseline 更新，
+    ///    说明家长确实在覆盖生效之后又重新动过这个开关——不管中间有没有一次轮询真的
+    ///    落在"已经变回 false"的那一拍。这是给 1) 补的洞：家长把开关关了又立刻打开，
+    ///    两次保存之间如果没轮询到，光看边沿会永远漏判，覆盖清不掉。
+    static func shouldClearOverride(
+        remoteContinuityMode: Bool,
+        previousContinuityMode: Bool,
+        remoteUpdatedAt: Date?,
+        overrideBaseline: Date?
+    ) -> Bool {
+        guard remoteContinuityMode else { return false }
+        let sawEdge = !previousContinuityMode
+        let sawFreshTimestamp = overrideBaseline.map { baseline in
+            (remoteUpdatedAt ?? .distantPast) > baseline
+        } == true
+        return sawEdge || sawFreshTimestamp
+    }
 
     static var isLaunchdManaged: Bool {
         if ProcessInfo.processInfo.environment[LaunchAgentPlist.launchedByLaunchdEnvKey] == "1" {
@@ -2606,7 +2660,7 @@ enum ConfigStore {
     static func save(_ config: ClientConfig) {
         do {
             try FileManager.default.createDirectory(at: configFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let encoder = JSONEncoder()
+            let encoder = JSONEncoder.bigDaddy
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(config)
             try data.write(to: configFileURL, options: .atomic)
@@ -2784,6 +2838,26 @@ extension JSONDecoder {
             throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unrecognized date: \(raw)")
         }
         return decoder
+    }
+}
+
+extension JSONEncoder {
+    /// 与 JSONDecoder.bigDaddy 配对。ConfigStore 用它把 ClientConfig 存到本地磁盘再读回来
+    /// （跟服务器无关的纯本机往返）。普通 JSONEncoder() 默认把 Date 编码成距 2001 参考日的
+    /// 秒数（Double），而 JSONDecoder.bigDaddy 的自定义策略无条件按字符串解析——两者一旦
+    /// 用来编解码同一份数据就对不上，ClientConfig 只要携带一个非 nil 的 Date 字段存盘，
+    /// 下次启动 ConfigStore.load() 就会在这个字段上解码失败，进而让**整份本地配置**
+    /// 静默退回默认值。这里改成输出 BigDaddyDateParser 认得的带小数秒 ISO 8601 字符串，
+    /// 消除这个此前从未被触发过（ClientConfig 里从没出现过 Date 字段）的潜在坑。
+    static var bigDaddy: JSONEncoder {
+        let encoder = JSONEncoder()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(formatter.string(from: date))
+        }
+        return encoder
     }
 }
 
