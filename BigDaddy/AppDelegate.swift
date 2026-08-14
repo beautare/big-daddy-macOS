@@ -2762,8 +2762,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭 BigDaddy 守护程序", en: "Close BigDaddy Guard Process"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭守护程序。",
-                en: "Please enter the 6-digit temporary exit code obtained from Guardian Home (valid for 5 minutes)."
+                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时退出码」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭守护程序。",
+                en: "Please enter the 6-digit temporary exit code from Guardian Home → Settings → More Actions → Get Temporary Exit Code (valid for 5 minutes)."
             ),
             confirmTitle: Localization.string(zh: "关闭守护程序", en: "Close Guard Process")
         ) else { return }
@@ -2842,8 +2842,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭开机自动启动", en: "Turn Off Start at Login"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
-                en: "Please generate a secure exit verification code on the parent dashboard, enter it to turn off Start at Login."
+                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时退出码」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
+                en: "Please enter the 6-digit temporary exit code from Guardian Home → Settings → More Actions → Get Temporary Exit Code, to turn off Start at Login."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
@@ -2881,8 +2881,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭崩溃后自动恢复", en: "Turn Off Relaunch After Crash"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
-                en: "Please generate a secure exit verification code on the parent dashboard, enter it to turn off relaunch after crash."
+                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时退出码」中获取的 6 位临时退出码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
+                en: "Please enter the 6-digit temporary exit code from Guardian Home → Settings → More Actions → Get Temporary Exit Code, to turn off relaunch after crash."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
