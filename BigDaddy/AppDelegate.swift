@@ -2135,15 +2135,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 let alert = NSAlert()
                 alert.messageText = Localization.string(zh: "设备绑定验证", en: "Device Binding Verification")
                 alert.informativeText = Localization.string(
-                    zh: "请家长登录仪表盘，输入下方的 6 位绑定码完成绑定。家长就在旁边时，可点击「在本机打开仪表盘」直接在这台电脑上操作。",
-                    en: "Ask your parent to sign in to the dashboard and enter the 6-digit bind code below. If your parent is nearby, click \"Open Dashboard on This Mac\" to finish binding right here."
+                    zh: "请家长登录家长中心，输入下方的 6 位绑定码完成绑定。家长就在旁边时，可点击「在本机打开家长中心」直接在这台电脑上操作。",
+                    en: "Ask your parent to sign in to the Parent Center and enter the 6-digit bind code below. If your parent is nearby, click \"Open Parent Center on This Mac\" to finish binding right here."
                 )
                 self.applyShieldIcon(to: alert)
 
                 let accessory = self.createBindCodeAccessoryView(fingerprint: fingerprint, initialToken: initialToken)
                 alert.accessoryView = accessory
 
-                alert.addButton(withTitle: Localization.string(zh: "在本机打开仪表盘", en: "Open Dashboard on This Mac"))
+                alert.addButton(withTitle: Localization.string(zh: "在本机打开家长中心", en: "Open Parent Center on This Mac"))
                 alert.addButton(withTitle: Localization.string(zh: "复制绑定信息", en: "Copy Binding Info"))
                 alert.addButton(withTitle: Localization.string(zh: "关闭", en: "Close"))
 
@@ -2378,8 +2378,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             en: "Enter the bind code from parent"
         )
         alert.informativeText = Localization.string(
-            zh: "请在家长仪表盘获取 6 位绑定码",
-            en: "Get the 6-digit bind code from the dashboard"
+            zh: "请在家长中心获取 6 位绑定码",
+            en: "Get the 6-digit bind code from the Parent Center"
         )
         applyShieldIcon(to: alert)
 
@@ -2764,8 +2764,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭 BigDaddy 守护程序", en: "Close BigDaddy Guard Process"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭守护程序。",
-                en: "Please enter the 6-digit temporary verification code from Guardian Home → Settings → More Actions → Get Temporary Verification Code (valid for 5 minutes)."
+                zh: "请输入在网页端「家长中心」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭守护程序。",
+                en: "Please enter the 6-digit temporary verification code from Parent Center → Settings → More Actions → Get Temporary Verification Code (valid for 5 minutes)."
             ),
             confirmTitle: Localization.string(zh: "关闭守护程序", en: "Close Guard Process")
         ) else { return }
@@ -2844,8 +2844,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭开机自动启动", en: "Turn Off Start at Login"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
-                en: "Please enter the 6-digit temporary verification code from Guardian Home → Settings → More Actions → Get Temporary Verification Code, to turn off Start at Login."
+                zh: "请输入在网页端「家长中心」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
+                en: "Please enter the 6-digit temporary verification code from Parent Center → Settings → More Actions → Get Temporary Verification Code, to turn off Start at Login."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
@@ -2884,8 +2884,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭崩溃后自动恢复", en: "Turn Off Relaunch After Crash"),
             message: Localization.string(
-                zh: "请输入在网页端「守护主页」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
-                en: "Please enter the 6-digit temporary verification code from Guardian Home → Settings → More Actions → Get Temporary Verification Code, to turn off relaunch after crash."
+                zh: "请输入在网页端「家长中心」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
+                en: "Please enter the 6-digit temporary verification code from Parent Center → Settings → More Actions → Get Temporary Verification Code, to turn off relaunch after crash."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
