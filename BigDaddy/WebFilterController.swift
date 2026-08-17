@@ -463,10 +463,10 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         // provider 不在线时（还没激活、或系统扩展被人关掉）这次推送单纯失败，无副作用——
         // 下面走 NEFilterManager 的那条路仍然是权威的、扛得住 provider 重启的持久化路径，
         // 推送只是它的加速通道，不是替代品。
-        let policyToPush = currentPolicy
-        Task { [providerConnection] in
-            _ = await providerConnection.pushPolicy(policyToPush)
-        }
+        //
+        // 直接调、不包 Task：pushPolicy 本身不阻塞（XPC 单向发出，不等回复），而"发出顺序
+        // 必须等于调用顺序"是这条通道正确性的前提，见 pushPolicy 的注释。
+        providerConnection.pushPolicy(currentPolicy)
 
         let manager = NEFilterManager.shared()
         manager.loadFromPreferences { [weak self] error in

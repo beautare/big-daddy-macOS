@@ -29,6 +29,13 @@ import NetworkExtension
 /// 见 handleNewFlow 里的说明。
 final class FilterDataProvider: NEFilterDataProvider {
 
+    /// 一份策略是从哪条通道来的。两条通道的可信度不同——系统配置是现读的当前值，推送是
+    /// 发送方在发送时刻抓的快照——所以落地时的处理也不同，见 applyPolicy。
+    private enum PolicySource: String {
+        case systemConfiguration
+        case push
+    }
+
     /// 一条正在跟踪的连接。放行之后仍然留着，好在策略变严时把它掐断。
     private final class TrackedFlow {
         let flow: NEFilterSocketFlow
@@ -77,11 +84,15 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// WebFilterProviderAcknowledgement.providerStartedAt 的注释。
     private let providerStartedAt = Date()
     private let policyLock = NSLock()
-    private var policy = WebFilterPolicySnapshot(
+
+    /// "什么都不拦"的初始/复位策略。revision 0、appliedAt 取纪元，任何真实策略都能盖过它。
+    private static let emptyPolicy = WebFilterPolicySnapshot(
         configuration: WebFilterConfiguration(),
         isDeviceBound: false,
         appliedAt: Date(timeIntervalSince1970: 0)
     )
+
+    private var policy = FilterDataProvider.emptyPolicy
     private var trackedFlows: [ObjectIdentifier: TrackedFlow] = [:]
     private var nextFlowSequence: UInt64 = 0
     private var configurationObservation: NSKeyValueObservation?
@@ -104,7 +115,9 @@ final class FilterDataProvider: NEFilterDataProvider {
         // 收到主 App 的 applyPolicy 调用（尤其是主 App 恰好在这个 provider 刚起来时重推
         // 策略的场景）。闭包捕获 weak self 而不是让 IPC 层直接持有 trackedFlows/policyLock，
         // 见 WebFilterProviderIPCListener.onPolicyPushed 的注释。
-        ipcListener?.onPolicyPushed = { [weak self] policy in self?.applyPolicy(policy) }
+        ipcListener?.onPolicyPushed = { [weak self] policy in
+            self?.applyPolicy(policy, from: .push)
+        }
         ipcListener?.start()
         configurationObservation = observe(\.filterConfiguration, options: [.new]) { [weak self] _, _ in
             self?.reloadPolicy()
@@ -120,6 +133,11 @@ final class FilterDataProvider: NEFilterDataProvider {
         configurationObservation = nil
         policyLock.lock()
         trackedFlows.removeAll()
+        // 策略一并清回默认值。provider 进程未必随过滤停止而退出，而"停掉再开"之间这台
+        // 机器可能已经换了家庭：解绑会让后端删掉设备行、级联重建配置，webFilterRevision
+        // 从 0 重新开始。不清的话，推送通道的 revision 守卫会拿旧家庭的高水位去挡新家庭的
+        // 策略（见 WebFilterPolicyReplacement）。清掉之后水位归零，两条通道都能正常落地。
+        policy = Self.emptyPolicy
         policyLock.unlock()
         completionHandler()
     }
@@ -230,12 +248,8 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// 策略最终一定会经这里落地一次，哪怕更快的推送通道已经先应用过了。
     private func reloadPolicy() {
         let nextPolicy = WebFilterPolicyTransport.policy(from: filterConfiguration.vendorConfiguration)
-            ?? WebFilterPolicySnapshot(
-                configuration: WebFilterConfiguration(),
-                isDeviceBound: false,
-                appliedAt: Date(timeIntervalSince1970: 0)
-            )
-        applyPolicy(nextPolicy)
+            ?? Self.emptyPolicy
+        applyPolicy(nextPolicy, from: .systemConfiguration)
     }
 
     /// 落地一份新策略，不管它是从哪条路来的：reloadPolicy 读到的系统配置，还是主 App
@@ -243,17 +257,26 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// 里"抄近路"那段注释）。两条路最终都收敛到这一个方法，"哪些已跟踪的流该被掐断"这套
     /// 判定只写一遍，也只在一处发回执。
     ///
-    /// 推送通道存在的理由：NEFilterManager.saveToPreferences() 之后，新配置要走系统自己的
-    /// 分发管线才能传到这个已经在跑的 provider 进程、触发 filterConfiguration 的 KVO——
-    /// 实测这一步可能耗时到一两分钟，而"家长打开限制、孩子的浏览器立刻被掐断"等不起这个。
-    /// 主 App 手上已经有同一份策略，没必要陪系统那条路一起等，直接经 mach service 推一份
-    /// 过来，一次 XPC 往返（通常个位数毫秒）就能生效；随后系统那条路终究也会把同一份数据
-    /// 带到，二次应用是幂等的（WebFilterPolicyReplacement 挡掉真正的旧数据，其余情况下
-    /// nextPolicy 与已经生效的 policy 结构相同，下面的判定不会有任何新的掐断动作）。
-    private func applyPolicy(_ nextPolicy: WebFilterPolicySnapshot) {
+    /// 推送通道**假设**存在的理由：NEFilterManager.saveToPreferences() 之后，新配置要走系统
+    /// 自己的分发管线才能传到这个已经在跑的 provider 进程、触发 filterConfiguration 的 KVO，
+    /// 而这一步可能慢到一两分钟——"家长打开限制、孩子的浏览器立刻被掐断"等不起。主 App 手上
+    /// 已经有同一份策略，直接经 mach service 推一份过来，一次 XPC 投递就能生效。
+    ///
+    /// **注意"可能慢到一两分钟"目前只是推断，还没有被实测证实。** 下面那行 NSLog 就是为了
+    /// 证实或推翻它而存在的：真机上比较 source=push 与 source=systemConfiguration 两条记录
+    /// 的时间差，才知道这条加速通道到底是不是对症的药。读数怎么解释见那行注释。
+    ///
+    /// 两条路最终都收敛到这一个方法，"哪些已跟踪的流该被掐断"这套判定只写一遍，也只在一处
+    /// 发回执。重复应用同一份策略是幂等的：nextPolicy 与已经生效的 policy 结构相同时，下面
+    /// 的判定不会产生任何新的掐断动作。
+    private func applyPolicy(_ nextPolicy: WebFilterPolicySnapshot, from source: PolicySource) {
         policyLock.lock()
-        guard WebFilterPolicyReplacement.shouldReplace(current: policy, incoming: nextPolicy) else {
+        // 守卫只套在推送上。系统配置那条路是**现读**当前值，结构上不可能陈旧，挡它只会
+        // 制造故障（换家庭后 revision 回到 0 那种），详见 WebFilterPolicyReplacement。
+        if source == .push,
+           !WebFilterPolicyReplacement.shouldReplace(current: policy, incoming: nextPolicy) {
             policyLock.unlock()
+            NSLog("BigDaddyWebFilter: ignored stale pushed policy revision \(nextPolicy.revision)")
             return
         }
         policy = nextPolicy
@@ -272,11 +295,27 @@ final class FilterDataProvider: NEFilterDataProvider {
                 trackedFlows.removeValue(forKey: key)
             }
         }
+        let trackedCount = trackedFlows.count
         policyLock.unlock()
 
         for flow in flowsToDrop {
             update(flow, using: .drop(), for: .any)
         }
+
+        // 这一行是给"限制打开之后到底卡在哪一步"用的量尺，别当成噪音删掉。三种读数分别
+        // 指向完全不同的病因：
+        //   · source=push 立刻出现、dropped>0，但浏览器照常能上 ⇒ 掐断动作本身没能拆掉
+        //     已建立的 socket，问题在 update(_:using:.drop()) 那一层，加速通道帮不上忙；
+        //   · source=push 立刻出现、dropped=0 ⇒ 那些连接压根没在跟踪表里（多半是它们
+        //     早于本 provider 进程启动——装新版会重启扩展并清空跟踪表），问题在覆盖面；
+        //   · source=push 立刻出现、source=systemConfiguration 隔一两分钟才出现 ⇒ 系统
+        //     配置分发确实慢，加速通道正是对症的那一味药。
+        NSLog("""
+            BigDaddyWebFilter: applied policy source=\(source.rawValue) \
+            revision=\(nextPolicy.revision) enforcing=\(nextPolicy.enabled) \
+            rules=\(nextPolicy.blockedDomains.count) dropped=\(flowsToDrop.count) \
+            tracked=\(trackedCount)
+            """)
 
         // 回执只在"这份策略确实是当前生效的那份"时才发：期间又来了一次更新的话，
         // 由那一轮 applyPolicy 负责发它自己的回执，这一轮闭嘴，免得把已经被顶掉的

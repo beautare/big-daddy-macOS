@@ -140,9 +140,24 @@ final class WebFilterProviderIPCListener: NSObject, NSXPCListenerDelegate, WebFi
     /// 过滤器内部怎么记账，它只负责把字节从 mach service 那头搬过来。
     var onPolicyPushed: ((WebFilterPolicySnapshot) -> Void)?
 
+    /// 本进程有没有能力校验连上来的是谁。两个条件缺一不可：拿得到 code requirement 串
+    /// （ad-hoc 签名的本地构建拿不到，见 WebFilterIPC.teamIdentifier），且系统提供
+    /// `setCodeSigningRequirement`（macOS 13+，而本项目部署目标是 12.4）。
+    ///
+    /// 为 false 时**拒绝一切策略推送**，只保留只读的回执查询。因为 mach service 在系统域里
+    /// 是本机任何进程都连得上的：校验不了调用方还接受 applyPolicy，等于给这台 Mac 上任何
+    /// 一个程序开了一个"把上网限制关掉"的接口——对监护类产品这是不能接受的。丢掉的只是
+    /// 那条加速通道，NEFilterManager 那条权威路径照常工作，代价仅仅是慢一点。
+    private let canAuthenticateCallers: Bool
+
     init(machServiceName: String, codeSigningRequirement: String?) {
         self.listener = NSXPCListener(machServiceName: machServiceName)
         self.codeSigningRequirement = codeSigningRequirement
+        if codeSigningRequirement != nil, #available(macOS 13.0, *) {
+            self.canAuthenticateCallers = true
+        } else {
+            self.canAuthenticateCallers = false
+        }
         super.init()
         listener.delegate = self
     }
@@ -178,6 +193,11 @@ final class WebFilterProviderIPCListener: NSObject, NSXPCListenerDelegate, WebFi
     }
 
     func applyPolicy(_ data: Data, withReply reply: @escaping (Bool) -> Void) {
+        guard canAuthenticateCallers else {
+            NSLog("BigDaddyWebFilter: refusing policy push, caller authentication unavailable")
+            reply(false)
+            return
+        }
         guard let policy = WebFilterPolicyTransport.decode(data) else {
             reply(false)
             return
@@ -222,24 +242,29 @@ final class WebFilterProviderConnection: @unchecked Sendable {
     }
 
     /// 把一份策略直接推给正在跑的 provider。见 WebFilterProviderXPC.applyPolicy 的注释——
-    /// 这是绕开系统配置分发管线延迟的加速通道，不是持久化路径。返回 false 只表示"没能把
-    /// 这次调用送到"（provider 不在线、连接失败），调用方不该把它当错误处理：下面走
-    /// NEFilterManager 的正常流程仍然会把同一份策略送到位，只是慢一点。
-    func pushPolicy(_ policy: WebFilterPolicySnapshot) async -> Bool {
+    /// 这是绕开系统配置分发管线延迟的加速通道，不是持久化路径。
+    ///
+    /// **刻意不是 async，也刻意不等回复。** 这里唯一要保证的是"发出顺序 == 调用顺序"：
+    /// XPC 在单条连接上保序投递，所以只要调用方按顺序调到这里，provider 收到的就是同样的
+    /// 顺序。此前这里是 async 的、由调用方包一层 `Task { await … }` 去发——两个无结构 Task
+    /// 在并发执行器上谁先跑没有任何保证，一份旧策略理论上可以后发先至，把新策略挤掉。
+    /// 那种错乱在"时间到限网"开始/结束这一对策略上尤其危险：它们 revision 相同
+    /// （后端 applyWebLockdownOverride 不改 revision），revision 守卫拦不住。
+    ///
+    /// 回复只用来记一笔日志：推送失败（provider 不在线、还没激活、被人关掉、或对端因为
+    /// 无法校验调用方而拒绝）都不是错误，NEFilterManager 那条权威路径照样会把同一份策略
+    /// 送到位，只是慢一点。
+    func pushPolicy(_ policy: WebFilterPolicySnapshot) {
         guard let connection = ensureConnection(), let data = WebFilterPolicyTransport.encode(policy) else {
-            return false
+            return
         }
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let box = ResumeOnce(continuation)
-            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-                NSLog("BigDaddy: web filter provider unreachable while pushing policy: \(error.localizedDescription)")
-                box.resume(false)
-            } as? WebFilterProviderXPC
-            guard let proxy else {
-                box.resume(false)
-                return
+        let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+            NSLog("BigDaddy: web filter provider unreachable while pushing policy: \(error.localizedDescription)")
+        } as? WebFilterProviderXPC
+        proxy?.applyPolicy(data) { accepted in
+            if !accepted {
+                NSLog("BigDaddy: web filter provider declined pushed policy revision \(policy.revision)")
             }
-            proxy.applyPolicy(data) { success in box.resume(success) }
         }
     }
 

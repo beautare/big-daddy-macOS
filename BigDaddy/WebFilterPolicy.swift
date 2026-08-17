@@ -71,13 +71,21 @@ enum WebFilterFlowDisposition {
     }
 }
 
-/// 一份新收到的策略该不该盖过 provider 当前正在用的那一份。
+/// 一份**推送来的**策略该不该盖过 provider 当前正在用的那一份。
 ///
-/// provider 现在从两条通道收策略：系统的 vendorConfiguration（经 filterConfiguration 的
-/// KVO）和主 App 直接经 XPC 的推送（见 WebFilterController.enableContentFilter 里"抄近路"
-/// 那段注释）。正常情况下两条路送来的迟早是同一份数据，推送只是抄了近路——这里唯一要挡的
-/// 是**两条路的到达顺序被打乱**：比如推送因为一次瞬时的 XPC 失败重试晚到，而系统那条路上
-/// 一份更新的策略已经先落地了，此时绝不能让这份姗姗来迟的旧数据把新数据挤掉。
+/// 只管推送这一条通道，系统 vendorConfiguration 那条不受这里约束——原因是两条通道的性质
+/// 根本不同：
+///
+/// - KVO 那条路上，provider 是在收到通知的当口去**现读** `filterConfiguration` 的当前值。
+///   系统只保存"当前这一份"配置，不是一个历史队列，所以那条路读到的永远是此刻最新的，
+///   结构上不可能陈旧，也就不需要、更不应该被守卫挡住（挡住它反而会制造真正的故障：见下）。
+/// - 推送那条路带的是主 App 在**发送时刻**抓的一份快照，理论上可能后发先至。
+///
+/// 因此这道守卫只能让加速通道少生效一次，永远不会让正确的策略落不了地——这正是"推送只是
+/// 加速通道、不是替代品"该有的样子。反过来把它套在 KVO 上就会出真事故：设备解绑再绑时后端
+/// 会重建配置行、`webFilterRevision` 从 0 重新开始（unbindDevice 直接删设备行、级联清空），
+/// 而 provider 进程未必跟着重启，手里可能还攥着旧家庭的高水位 revision，于是新家庭的策略
+/// 会被永久拒之门外。
 enum WebFilterPolicyReplacement {
     static func shouldReplace(current: WebFilterPolicySnapshot, incoming: WebFilterPolicySnapshot) -> Bool {
         incoming.revision >= current.revision
