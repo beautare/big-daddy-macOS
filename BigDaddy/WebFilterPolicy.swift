@@ -45,6 +45,32 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     }
 }
 
+/// 一条**已经在跟踪**的连接，在策略刚刚变化之后该不该被就地掐断。
+///
+/// 单独抽出来不是为了复用——只有 FilterDataProvider.reloadPolicy 一个调用点——而是因为
+/// 它是"家长把限制打开的那一秒，浏览器里已经开着的 YouTube 还能不能继续看"的全部判据，
+/// 而那个调用点整个建立在 NEFilterSocketFlow 上，在测试里造不出来。判据留在这里才测得到。
+///
+/// 前提是这条流当初真的被跟踪过——也就是限制打开**之前**过滤器就已经在跑。provider 只
+/// 看得到自己启动之后新建的流，系统不会把已存在的 socket 补送给它，也没有任何 API 能事后
+/// 枚举或掐断它们。这就是 WebFilterController.shouldRunContentFilter 必须只看"设备已绑定"
+/// 的原因，两处要一起看才完整。
+enum WebFilterFlowDisposition {
+    static func shouldTerminate(
+        hostname: String?,
+        isLikelyQUIC: Bool,
+        under policy: WebFilterPolicySnapshot
+    ) -> Bool {
+        if let hostname {
+            return policy.blocks(hostname: hostname)
+        }
+        // 判不出主机名的 QUIC。这些流多半是在策略还没启用时放行的（那期间我们不掐 QUIC，
+        // 见 FilterDataProvider.handleOutboundData），限制一旦启用就必须一并掐掉，否则
+        // 浏览器会一直复用它们绕过限制——正是"新标签也照样能看"的那条通道。
+        return policy.enabled && isLikelyQUIC
+    }
+}
+
 enum DomainName {
     static func normalize(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

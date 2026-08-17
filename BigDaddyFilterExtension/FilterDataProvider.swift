@@ -17,6 +17,13 @@ import NetworkExtension
 ///    `dataVerdict(passBytes:peekBytes:)` 保持挂载——代价是每 passThroughChunkBytes
 ///    字节回来打个招呼，换来的是家长改策略时能把已经建立的连接精确掐断。
 ///
+/// 第 2 条只有在"限制打开之前这个 provider 就已经在跑"时才兑现得了：系统只把**启动之后
+/// 新建**的流送进来，已经存在的 socket 对我们完全不可见，也没有 API 能事后枚举或掐断。
+/// 所以主 App 从设备绑定那一刻就让内容过滤一直开着，限制关闭期间本 provider 以透传模式
+/// 运行——照常识别主机名、照常保持挂载，只是 `policy.blocks()` 恒为 false。这期间攒下的
+/// 跟踪表，正是限制打开那一秒能立刻掐断 YouTube 的全部依仗（见
+/// WebFilterController.shouldRunContentFilter）。
+///
 /// 一条贯穿全文件的原则：**认不出来一律放行**。误拦会毫无征兆地掐断孩子电脑上任意一个
 /// 程序的网络，代价远大于漏拦一次。唯一的例外是生效期间判不出主机名的 UDP 443（QUIC），
 /// 见 handleNewFlow 里的说明。
@@ -31,11 +38,14 @@ final class FilterDataProvider: NEFilterDataProvider {
         var awaitingHostname: Bool
         /// 握手字节的暂存。ClientHello 可能被拆成几段送来，攒够了才解析得出。
         var handshake = Data()
+        /// 记账序号，越大越新。只用来在跟踪表满了的时候挑最老的淘汰，别的地方不该看它。
+        let sequence: UInt64
 
-        init(flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool) {
+        init(flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool, sequence: UInt64) {
             self.flow = flow
             self.hostname = hostname
             self.awaitingHostname = awaitingHostname
+            self.sequence = sequence
         }
     }
 
@@ -49,6 +59,17 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// 还能掐断它），不做任何检查。取 4 MiB：一个 4K 视频流大概每秒一次回调，开销
     /// 可以忽略；取太小会把扩展塞进热路径，取太大则没有意义——反正只是保持挂载。
     private static let passThroughChunkBytes = 4 * 1024 * 1024
+    /// 跟踪表的上限，以及触顶后要削到的水位。
+    ///
+    /// 清账本来只靠 `flowClosed` 回执（handle(_:)）。那在"只有限网期间才跑"的时代够用，
+    /// 现在 provider 从绑定起就一直开着，一台机器上所有程序的连接都从这里过——回执万一
+    /// 漏掉一条，就永久占着一个条目和最多 maxHandshakeBytes 的握手缓冲，几天下来会积成
+    /// 一笔看不见的账。所以加一道硬上限。
+    ///
+    /// 被淘汰的流只是失去"日后被掐断"的资格（等同于当初给了终局 allow），不会因此漏过
+    /// **新**连接——所以宁可淘汰最老的：越老的流越可能其实早就关了，只是回执没到。
+    private static let maxTrackedFlows = 2048
+    private static let trackedFlowLowWaterMark = 1536
 
     /// 本 provider 进程的启动时刻，构造时取一次、此后不变。主 App 靠它回答"这个扩展在那段
     /// 空窗期里有没有重启过"（见 WebFilterController.extensionSurvivedGap）——**不能**用
@@ -62,6 +83,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         appliedAt: Date(timeIntervalSince1970: 0)
     )
     private var trackedFlows: [ObjectIdentifier: TrackedFlow] = [:]
+    private var nextFlowSequence: UInt64 = 0
     private var configurationObservation: NSKeyValueObservation?
     /// 回执服务端。主 App 靠它知道"provider 到底应用了哪个 revision"，家长端的
     /// "实际版本 / 已生效"整列信息都来自这里。取不到 mach 服务名（Info.plist 没写
@@ -213,14 +235,11 @@ final class FilterDataProvider: NEFilterDataProvider {
             // 主机名优先用已经认出来的那个；没有就再问一次系统——remoteHostname 可能
             // 在 handleNewFlow 之后才被填上，当场重读能让这类流赶上这次策略变化。
             let hostname = tracked.hostname ?? systemHostname(for: tracked.flow)
-            let shouldDrop: Bool
-            if let hostname {
-                shouldDrop = nextPolicy.blocks(hostname: hostname)
-            } else {
-                // 判不出主机名的 QUIC：策略刚刚启用时，这些是在"还没启用"期间放行的，
-                // 必须一并掐掉，否则浏览器会一直复用它们绕过限制。
-                shouldDrop = nextPolicy.enabled && isLikelyQUIC(tracked.flow)
-            }
+            let shouldDrop = WebFilterFlowDisposition.shouldTerminate(
+                hostname: hostname,
+                isLikelyQUIC: isLikelyQUIC(tracked.flow),
+                under: nextPolicy
+            )
             if shouldDrop {
                 flowsToDrop.append(tracked.flow)
                 trackedFlows.removeValue(forKey: key)
@@ -266,12 +285,25 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private func remember(_ flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool) {
         policyLock.lock()
+        nextFlowSequence += 1
         trackedFlows[ObjectIdentifier(flow)] = TrackedFlow(
             flow: flow,
             hostname: hostname,
-            awaitingHostname: awaitingHostname
+            awaitingHostname: awaitingHostname,
+            sequence: nextFlowSequence
         )
+        evictOldestTrackedFlowsIfNeeded()
         policyLock.unlock()
+    }
+
+    /// 调用方必须已经持有 policyLock。
+    private func evictOldestTrackedFlowsIfNeeded() {
+        guard trackedFlows.count > Self.maxTrackedFlows else { return }
+        let survivors = trackedFlows
+            .sorted { $0.value.sequence > $1.value.sequence }
+            .prefix(Self.trackedFlowLowWaterMark)
+        trackedFlows = Dictionary(uniqueKeysWithValues: survivors.map { ($0.key, $0.value) })
+        NSLog("BigDaddyWebFilter: tracked flow table trimmed to \(trackedFlows.count)")
     }
 
     private func forget(_ key: ObjectIdentifier) {

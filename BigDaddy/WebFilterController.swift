@@ -28,6 +28,10 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         isDeviceBound: false,
         appliedAt: Date(timeIntervalSince1970: 0)
     )
+    /// 设备是否已绑定。currentPolicy 里只留下了 `isDeviceBound && enabled` 的结果，
+    /// 这两者现在必须分开：过滤器**开不开**看绑定，**拦不拦**看策略。见
+    /// shouldRunContentFilter。
+    private var isDeviceBound = false
     /// 系统里那份内容过滤配置当前是否处于开启状态。
     ///
     /// nil = 还没成功回读过（启动早期），**不是** false：这两者在家长端要说完全不同的
@@ -64,21 +68,45 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         }
     }
 
-    /// 只在家长真正打开「网站访问限制」时才为真——不是"设备已绑定"就为真。
+    /// 系统里那份内容过滤配置该不该处于开启状态——**只看设备有没有绑定**，不看家长此刻
+    /// 有没有打开网站限制。"过滤器开着"和"正在拦截"是两件必须分开的事，后者见
+    /// isEnforcementIntended。
     ///
-    /// currentPolicy.enabled 本来就是 isDeviceBound && configuration.enabled（见
-    /// WebFilterPolicySnapshot.init），直接复用它，不用另外维护一份判据。此前这里只看
-    /// isDeviceBound：任何设备一绑定，不管家长有没有打开网站限制，孩子那台 Mac 上立刻
-    /// 弹出系统扩展授权请求——多数家庭其实从未用到这项功能，却要先经历一次系统弹窗。
-    /// 现在把它推迟到 webFilter.enabled 第一次变成 true 的那次 synchronize 才发生。
+    /// 这一条曾经写成 currentPolicy.enabled（限制关着就把过滤器整个关掉），理由是别让
+    /// 从不使用这项功能的家庭平白经历一次系统弹窗。代价直到实测才暴露出来：
+    /// NEFilterDataProvider **只收得到自己启动之后新建的流**，系统不会把已经存在的 socket
+    /// 补送给它，也没有任何 API 能事后枚举或掐断它们。于是"孩子先在 Chrome 里开着
+    /// YouTube，家长再打开限制"这个最常见的场景里，那条已经建立的连接对过滤器完全不存在：
+    /// cmd+R 和新标签都复用它，一直要等浏览器自己因空闲超时拆掉连接（几分钟）才第一次
+    /// 撞上过滤器。FilterDataProvider 里那套"放行也保持挂载、策略变严时补一刀"的设计，
+    /// 在这个场景里根本没有机会执行。
+    ///
+    /// 所以过滤器从绑定那一刻起就一直开着，限制关闭期间以透传模式运行（policy.enabled
+    /// 为 false ⇒ blocks() 恒为 false，全部放行但保持跟踪）。限制打开时，那些连接早就
+    /// 在 trackedFlows 里、主机名也已解析好，reloadPolicy 当场就能把它们掐断。
+    ///
+    /// 代价是首次启用会弹一次系统的"允许过滤网络内容"。这被放在绑定那一刻——与
+    /// requestSystemExtensionApprovalEagerly 索取系统扩展批准同一时机，不额外制造一个
+    /// 新的打扰点。
     private var shouldRunContentFilter: Bool {
+        isDeviceBound
+    }
+
+    /// 家长此刻**要不要**拦。所有面向家长的状态（徽章、"已生效"、"被关掉了"）都以它为准，
+    /// 不能用 shouldRunContentFilter 代替：后者在限制关闭期间同样为真，拿它去驱动展示，
+    /// 会在家长根本没开限制的时候报出"正在阻断"或"限制已被关闭"。
+    private var isEnforcementIntended: Bool {
         currentPolicy.enabled
     }
 
     /// 家长端"扩展被关掉了"这一条的判据。只有在扩展确实激活成功过之后，"系统里过滤
     /// 是关的"才等价于"有人关掉了它"；激活都还没走完时它当然是关的。
+    ///
+    /// 判据是 isEnforcementIntended 而不是 shouldRunContentFilter：限制关闭期间过滤器
+    /// 虽然也该开着（为了预热跟踪），但那时被人关掉并不构成一次"防线失守"，不该向家长
+    /// 报警——自动恢复照常进行（见 repairSystemFilterIfPossible），只是不出现在 UI 上。
     var isSystemFilterDisabledExternally: Bool {
-        shouldRunContentFilter && activationCompleted && systemFilterEnabled == false
+        isEnforcementIntended && activationCompleted && systemFilterEnabled == false
     }
 
     /// 网站访问是否正被限制——菜单栏右上角"受限"徽章用的信号。
@@ -95,7 +123,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     /// 必须优先处理"扩展本身有问题"这一类信号，再决定要不要显示这个徽章——否则会在
     /// 防线实际失守的那一刻，图标却说"正在限制"。
     var isRestrictingWebAccess: Bool {
-        shouldRunContentFilter && !currentPolicy.blockedDomains.isEmpty
+        isEnforcementIntended && !currentPolicy.blockedDomains.isEmpty
     }
 
     func statusReport(requestedRevision: Int64) async -> WebFilterStatusReport {
@@ -137,7 +165,11 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             )
         }
 
-        guard shouldRunContentFilter else {
+        // 家长没开限制时就是透传，不必再往下问系统和扩展。这里刻意用 isEnforcementIntended
+        // 而不是 shouldRunContentFilter：后者在限制关闭期间也为真（过滤器一直开着做预热
+        // 跟踪），拿它当门槛会让"没开限制"的设备也走进下面的 .disabled / .unknown 分支，
+        // 家长端凭空多出一行红字。
+        guard isEnforcementIntended else {
             return report(systemExtensionState, .passThrough)
         }
 
@@ -231,7 +263,10 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             // 确实恢复了，重试预算归零，下次再被关掉还能再自愈三次
             filterRepairAttempts = 0
         } else if hadValue && shouldRunContentFilter && activationCompleted {
-            AuditLog.record("WEB_FILTER_DISABLED_EXTERNALLY")
+            // enforcing=false 表示这次是在"限制关着、过滤器只做预热跟踪"的期间被关掉的：
+            // 家长端不会因此报警（见 isSystemFilterDisabledExternally），但自动恢复照做——
+            // 否则下次家长打开限制时，预热跟踪是空的，又会退回到那几分钟的滞后。
+            AuditLog.record("WEB_FILTER_DISABLED_EXTERNALLY enforcing=\(isEnforcementIntended)")
             repairSystemFilterIfPossible()
         }
         notifyStateChanged()
@@ -274,6 +309,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     }
 
     func synchronize(configuration: WebFilterConfiguration, isDeviceBound: Bool) {
+        self.isDeviceBound = isDeviceBound
         currentPolicy = WebFilterPolicySnapshot(
             configuration: configuration,
             isDeviceBound: isDeviceBound
