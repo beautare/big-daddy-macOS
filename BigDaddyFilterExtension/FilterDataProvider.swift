@@ -100,6 +100,11 @@ final class FilterDataProvider: NEFilterDataProvider {
     }()
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
+        // 必须在 ipcListener?.start() 之前接上：listener 一旦 resume()，理论上就可能立刻
+        // 收到主 App 的 applyPolicy 调用（尤其是主 App 恰好在这个 provider 刚起来时重推
+        // 策略的场景）。闭包捕获 weak self 而不是让 IPC 层直接持有 trackedFlows/policyLock，
+        // 见 WebFilterProviderIPCListener.onPolicyPushed 的注释。
+        ipcListener?.onPolicyPushed = { [weak self] policy in self?.applyPolicy(policy) }
         ipcListener?.start()
         configurationObservation = observe(\.filterConfiguration, options: [.new]) { [weak self] _, _ in
             self?.reloadPolicy()
@@ -220,6 +225,9 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     // MARK: - 策略
 
+    /// 从系统的 vendorConfiguration 里重读策略——filterConfiguration 的 KVO 触发的那条路，
+    /// 也是 startFilter 里的初次加载。这条路径权威、但慢（见 applyPolicy 的注释），一份
+    /// 策略最终一定会经这里落地一次，哪怕更快的推送通道已经先应用过了。
     private func reloadPolicy() {
         let nextPolicy = WebFilterPolicyTransport.policy(from: filterConfiguration.vendorConfiguration)
             ?? WebFilterPolicySnapshot(
@@ -227,8 +235,27 @@ final class FilterDataProvider: NEFilterDataProvider {
                 isDeviceBound: false,
                 appliedAt: Date(timeIntervalSince1970: 0)
             )
+        applyPolicy(nextPolicy)
+    }
 
+    /// 落地一份新策略，不管它是从哪条路来的：reloadPolicy 读到的系统配置，还是主 App
+    /// 经 ipcListener.onPolicyPushed 直接推过来的（见 WebFilterController.enableContentFilter
+    /// 里"抄近路"那段注释）。两条路最终都收敛到这一个方法，"哪些已跟踪的流该被掐断"这套
+    /// 判定只写一遍，也只在一处发回执。
+    ///
+    /// 推送通道存在的理由：NEFilterManager.saveToPreferences() 之后，新配置要走系统自己的
+    /// 分发管线才能传到这个已经在跑的 provider 进程、触发 filterConfiguration 的 KVO——
+    /// 实测这一步可能耗时到一两分钟，而"家长打开限制、孩子的浏览器立刻被掐断"等不起这个。
+    /// 主 App 手上已经有同一份策略，没必要陪系统那条路一起等，直接经 mach service 推一份
+    /// 过来，一次 XPC 往返（通常个位数毫秒）就能生效；随后系统那条路终究也会把同一份数据
+    /// 带到，二次应用是幂等的（WebFilterPolicyReplacement 挡掉真正的旧数据，其余情况下
+    /// nextPolicy 与已经生效的 policy 结构相同，下面的判定不会有任何新的掐断动作）。
+    private func applyPolicy(_ nextPolicy: WebFilterPolicySnapshot) {
         policyLock.lock()
+        guard WebFilterPolicyReplacement.shouldReplace(current: policy, incoming: nextPolicy) else {
+            policyLock.unlock()
+            return
+        }
         policy = nextPolicy
         var flowsToDrop: [NEFilterSocketFlow] = []
         for (key, tracked) in trackedFlows {
@@ -252,7 +279,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
 
         // 回执只在"这份策略确实是当前生效的那份"时才发：期间又来了一次更新的话，
-        // 由那一轮 reloadPolicy 负责发它自己的回执，这一轮闭嘴，免得把已经被顶掉的
+        // 由那一轮 applyPolicy 负责发它自己的回执，这一轮闭嘴，免得把已经被顶掉的
         // 旧 revision 报成"已应用"。
         policyLock.lock()
         let isStillCurrent = policy == nextPolicy

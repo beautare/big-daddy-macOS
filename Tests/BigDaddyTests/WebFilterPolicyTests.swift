@@ -151,6 +151,52 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertFalse(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(currentPolicy))
     }
 
+    /// 主 App → provider 的策略推送用这对裸编解码（不套 vendorConfiguration 那层 key）。
+    /// 必须跟 vendorConfiguration 路径产出逐位相同的字节，两条通道送到的才是可比较、
+    /// 可去重的同一份数据——见 FilterDataProvider.applyPolicy 的注释。
+    func testBarePolicyCodecRoundTripsAndMatchesVendorConfigurationBytes() throws {
+        let policy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "example.com", includeSubdomains: true)
+        ])
+
+        let pushedData = try XCTUnwrap(WebFilterPolicyTransport.encode(policy))
+        XCTAssertEqual(WebFilterPolicyTransport.decode(pushedData), policy)
+
+        let vendorConfiguration = try WebFilterPolicyTransport.vendorConfiguration(for: policy)
+        let vendorData = try XCTUnwrap(vendorConfiguration[WebFilterPolicyTransport.policyDataKey] as? Data)
+        XCTAssertEqual(pushedData, vendorData)
+    }
+
+    func testPolicyReplacementAcceptsNewerOrEqualRevision() {
+        let current = makePolicy(enabled: true, rules: [])
+        let sameRevision = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(enabled: false, revision: current.revision, blockedDomains: []),
+            isDeviceBound: true
+        )
+        let newerRevision = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(enabled: true, revision: current.revision + 1, blockedDomains: []),
+            isDeviceBound: true
+        )
+
+        XCTAssertTrue(WebFilterPolicyReplacement.shouldReplace(current: current, incoming: sameRevision))
+        XCTAssertTrue(WebFilterPolicyReplacement.shouldReplace(current: current, incoming: newerRevision))
+    }
+
+    /// 这是整个推送通道要挡的唯一情形：一份姗姗来迟的旧策略，绝不能把已经生效的新策略
+    /// 挤掉。见 WebFilterPolicyReplacement 类注释里"两条路的到达顺序被打乱"那个场景。
+    func testPolicyReplacementRejectsStaleRevision() {
+        let current = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(enabled: true, revision: 9, blockedDomains: []),
+            isDeviceBound: true
+        )
+        let stale = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(enabled: false, revision: 8, blockedDomains: []),
+            isDeviceBound: true
+        )
+
+        XCTAssertFalse(WebFilterPolicyReplacement.shouldReplace(current: current, incoming: stale))
+    }
+
     private func makePolicy(
         enabled: Bool,
         rules: [WebFilterRule]

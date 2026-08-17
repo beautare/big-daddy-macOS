@@ -22,6 +22,17 @@ import Foundation
     /// 让两端共用同一个 Codable 模型，比再维护一份 @objc 镜像类型便宜得多。
     /// provider 还没应用过任何策略时回 nil——这是真话，不要用零值伪装成"已应用"。
     func currentAcknowledgement(withReply reply: @escaping (Data?) -> Void)
+
+    /// 主 App 把新策略直接推给正在跑的 provider，绕开 NEFilterManager.saveToPreferences()
+    /// 之后系统自己那条配置分发管线——那条路实测把更新送到一个已经在跑的进程可能要一两
+    /// 分钟，见 WebFilterController.enableContentFilter 里"抄近路"那段注释和
+    /// FilterDataProvider.applyPolicy 的注释。
+    ///
+    /// data 是 WebFilterPolicyTransport.encode(_:) 编出来的裸 WebFilterPolicySnapshot 字节。
+    /// reply 只回答"这次调用本身有没有走通"（解码成功、且确实调用了处理闭包），不代表策略
+    /// 一定被采纳——更旧的策略会被 WebFilterPolicyReplacement 挡在门外，那属于正常丢弃，
+    /// 不是失败，调用方不需要也不应该区分这两种情况。
+    func applyPolicy(_ data: Data, withReply reply: @escaping (Bool) -> Void)
 }
 
 enum WebFilterIPC {
@@ -72,9 +83,9 @@ enum WebFilterIPC {
         return prefix.isEmpty || prefix == "group" ? nil : prefix
     }
 
-    /// 只认同一个开发者团队签出来的对端。这条通道是只读的（对面只能问"你现在应用的是
-    /// 哪个 revision"，不接受任何指令），所以校验不到位的后果有限；但既然团队号就摆在
-    /// App Group id 里，顺手关上总比敞着好。
+    /// 只认同一个开发者团队签出来的对端。主 App 现在会经这条通道向 provider 推送策略
+    /// （applyPolicy），校验不到位的后果不再局限于"读到假回执"，而是别的进程能够直接
+    /// 篡改过滤策略——团队号既然就摆在 App Group id 里，这道检查不能省。
     ///
     /// 串必须是合法的 code requirement —— `setCodeSigningRequirement` 遇到非法串会抛
     /// ObjC 异常，Swift 这边接不住，直接就是崩溃。所以这里只做固定模板 + 团队号插值，
@@ -124,6 +135,10 @@ final class WebFilterProviderIPCListener: NSObject, NSXPCListenerDelegate, WebFi
     private let codeSigningRequirement: String?
     private let lock = NSLock()
     private var acknowledgement: WebFilterProviderAcknowledgement?
+    /// FilterDataProvider 落地一份推送来的策略的地方。放闭包而不是让这个类直接持有
+    /// FilterDataProvider 的私有状态（trackedFlows/policyLock）——IPC 这一层不该知道
+    /// 过滤器内部怎么记账，它只负责把字节从 mach service 那头搬过来。
+    var onPolicyPushed: ((WebFilterPolicySnapshot) -> Void)?
 
     init(machServiceName: String, codeSigningRequirement: String?) {
         self.listener = NSXPCListener(machServiceName: machServiceName)
@@ -161,6 +176,18 @@ final class WebFilterProviderIPCListener: NSObject, NSXPCListenerDelegate, WebFi
         lock.unlock()
         reply(current.flatMap(WebFilterAcknowledgementCodec.encode))
     }
+
+    func applyPolicy(_ data: Data, withReply reply: @escaping (Bool) -> Void) {
+        guard let policy = WebFilterPolicyTransport.decode(data) else {
+            reply(false)
+            return
+        }
+        // onPolicyPushed 只在 FilterDataProvider.startFilter 里、provider 真正起来之后
+        // 才会被设上；理论上 XPC 消息不可能在这之前就送到（listener.resume() 也是那时候
+        // 才调用），这里仍然按 nil 处理而不是硬解包，纯粹是防御性写法。
+        onPolicyPushed?(policy)
+        reply(true)
+    }
 }
 
 // MARK: - 主 App 侧：连接
@@ -191,6 +218,28 @@ final class WebFilterProviderConnection: @unchecked Sendable {
             proxy.currentAcknowledgement { data in
                 box.resume(data.flatMap(WebFilterAcknowledgementCodec.decode))
             }
+        }
+    }
+
+    /// 把一份策略直接推给正在跑的 provider。见 WebFilterProviderXPC.applyPolicy 的注释——
+    /// 这是绕开系统配置分发管线延迟的加速通道，不是持久化路径。返回 false 只表示"没能把
+    /// 这次调用送到"（provider 不在线、连接失败），调用方不该把它当错误处理：下面走
+    /// NEFilterManager 的正常流程仍然会把同一份策略送到位，只是慢一点。
+    func pushPolicy(_ policy: WebFilterPolicySnapshot) async -> Bool {
+        guard let connection = ensureConnection(), let data = WebFilterPolicyTransport.encode(policy) else {
+            return false
+        }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let box = ResumeOnce(continuation)
+            let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+                NSLog("BigDaddy: web filter provider unreachable while pushing policy: \(error.localizedDescription)")
+                box.resume(false)
+            } as? WebFilterProviderXPC
+            guard let proxy else {
+                box.resume(false)
+                return
+            }
+            proxy.applyPolicy(data) { success in box.resume(success) }
         }
     }
 

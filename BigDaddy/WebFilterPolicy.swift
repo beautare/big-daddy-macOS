@@ -71,6 +71,19 @@ enum WebFilterFlowDisposition {
     }
 }
 
+/// 一份新收到的策略该不该盖过 provider 当前正在用的那一份。
+///
+/// provider 现在从两条通道收策略：系统的 vendorConfiguration（经 filterConfiguration 的
+/// KVO）和主 App 直接经 XPC 的推送（见 WebFilterController.enableContentFilter 里"抄近路"
+/// 那段注释）。正常情况下两条路送来的迟早是同一份数据，推送只是抄了近路——这里唯一要挡的
+/// 是**两条路的到达顺序被打乱**：比如推送因为一次瞬时的 XPC 失败重试晚到，而系统那条路上
+/// 一份更新的策略已经先落地了，此时绝不能让这份姗姗来迟的旧数据把新数据挤掉。
+enum WebFilterPolicyReplacement {
+    static func shouldReplace(current: WebFilterPolicySnapshot, incoming: WebFilterPolicySnapshot) -> Bool {
+        incoming.revision >= current.revision
+    }
+}
+
 enum DomainName {
     static func normalize(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -89,6 +102,18 @@ enum WebFilterPolicyTransport {
     static func policy(from vendorConfiguration: [String: Any]?) -> WebFilterPolicySnapshot? {
         guard let data = vendorConfiguration?[policyDataKey] as? Data else { return nil }
         return try? decoder.decode(WebFilterPolicySnapshot.self, from: data)
+    }
+
+    /// 供 WebFilterProviderConnection.pushPolicy 用的裸编解码——不套 vendorConfiguration
+    /// 那层 key，直接就是一份 WebFilterPolicySnapshot 的字节。走同一对 encoder/decoder，
+    /// 保证跟 vendorConfiguration 路径编出来的字节逐位相同，两条路径送到的是可比较、
+    /// 可去重的同一份数据。
+    static func encode(_ policy: WebFilterPolicySnapshot) -> Data? {
+        try? encoder.encode(policy)
+    }
+
+    static func decode(_ data: Data) -> WebFilterPolicySnapshot? {
+        try? decoder.decode(WebFilterPolicySnapshot.self, from: data)
     }
 
     private static let encoder: JSONEncoder = {
