@@ -187,10 +187,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var timeFlag: TimeAgreementFlag?
     /// 驱动倒计时/里程碑检查的 1 秒定时器，仅在有进行中的约定时存活。
     private var timeSessionTimer: Timer?
-    /// 本地单调时钟截止点：`ProcessInfo.systemUptime`（收到这份会话快照那一刻） +
-    /// remainingSeconds。用单调时钟而不是墙钟——孩子改系统时间不影响倒计时；服务端仍是
-    /// 唯一权威，每次 syncTimeSessionState 都会用服务端最新值重新定锚这个值。
-    private var timeSessionDeadline: TimeInterval?
     /// 当前正在跟踪的会话 id，用于识别"变了"（新开/被替换/被中断/到点清空）。
     private var trackedTimeSessionId: String?
     /// 本地倒计时已经判过到点、但服务端还没确认的那个会话 id。
@@ -524,15 +520,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 第一眼看到。菜单每次打开都会刷新这一条的文字（见 menuWillOpen），这里只
         // 负责渲染初始文案。
         //
-        // 判据特意用 trackedTimeSessionId/timeSessionDeadline（客户端自己已经权威更新的
-        // 本地状态），而不是直接查 client.config.timeSession：本地倒计时归零那一刻，
-        // handleTimeSessionReachedZero 已经把这两者清空、旗帜也已经在闪烁，但服务端的
-        // 30 秒扫描器还没确认到点，client.config.timeSession 这时仍是"看起来还在进行"的
-        // 陈旧快照——直接用它会让这一项在旗帜已经闪烁提醒时，还显示着一个不会再变的
-        // 陈旧非零读数，与旗帜的状态互相矛盾。
-        if let session = client.config.timeSession, let deadline = timeSessionDeadline,
+        // 判据特意用 trackedTimeSessionId/currentTimeSessionRemaining()（客户端自己已经
+        // 权威更新的本地状态），而不是直接查 client.config.timeSession：本地倒计时归零
+        // 那一刻，handleTimeSessionReachedZero 已经标记了 locallyExpiredSessionId、旗帜
+        // 也已经在闪烁，但服务端的 30 秒扫描器还没确认到点，client.config.timeSession
+        // 这时仍是"看起来还在进行"的陈旧快照——直接用它会让这一项在旗帜已经闪烁提醒时，
+        // 还显示着一个不会再变的陈旧非零读数，与旗帜的状态互相矛盾。
+        if let session = client.config.timeSession, let remaining = currentTimeSessionRemaining(),
            trackedTimeSessionId == session.sessionId {
-            let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
             let item = NSMenuItem(
                 title: Self.timeSessionMenuTitle(remaining: remaining, grantedSeconds: session.grantedSeconds),
                 action: nil, keyEquivalent: ""
@@ -1620,11 +1615,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 2. 把 wasIdle 归位并按活跃节奏重排心跳——否则下一次心跳还排在 15 分钟之后；
     /// 3. 顺手推一次补发——睡眠期间积压的队列正等着一个触发点，而网络路径可能并未翻转
     ///    （唤醒后 Wi-Fi 自动重连通常会翻转，但有线网络/一直可达的情况不会）；
-    /// 4. 重新拉一次配置并重新校准时间约定的本地截止点——`ProcessInfo.systemUptime`
-    ///    的定义是"系统保持唤醒的时长"，不计入睡眠时长。若不在这里重新定锚，孩子合盖
-    ///    10 分钟对本地倒计时零消耗，与"墙钟到点"的设计矛盾（家长设定的是真实时间，
-    ///    不是"孩子清醒使用电脑的时间"）。screenUnlock 场景机器全程醒着，这一步是
-    ///    无害的冗余刷新，不必单独判断 event 类型来跳过。
+    /// 4. 重新拉一次配置，用服务端的权威值校正时间约定——TimeSessionAnchor 的
+    ///    wallDeadline 本身睡眠期间也在走（不像单纯的 systemUptime 锚会把睡眠时长
+    ///    算作零消耗），所以孩子合盖 10 分钟不会让本地倒计时停摆；但约定仍然可能在
+    ///    睡眠期间被家长中断、替换，或本就已经到点，这些只有服务端知道，唤醒后必须
+    ///    刷新一次才能对齐。screenUnlock 场景机器全程醒着，这一步是无害的冗余刷新，
+    ///    不必单独判断 event 类型来跳过。
     private func handleResumeFromSystemEvent(event: EventType, auditLine: String) {
         handleResume(event: event, auditLine: auditLine, resetActivityFloor: true)
     }
@@ -1887,34 +1883,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     // MARK: - 时间约定（家长设定的可用时长）
 
+    /// 时间约定倒计时的统一读数入口，所有渲染/计时代码都必须经过它，不直接碰
+    /// `client.timeSessionAnchor`。
+    ///
+    /// 截止点本身由 `client.timeSessionAnchor` 维护，只在一次成功的 refreshConfig() 里
+    /// 按服务端返回的 remainingSeconds 重新折算（见 TimeSessionAnchor 类注释），这里只
+    /// 做一件事：本地已经判过到点、服务端还没确认的那个会话（`locallyExpiredSessionId`）
+    /// 永远视为"没有可用截止点"——否则确认窗口内每一次成功的配置轮询都会把锚点重新钉在
+    /// "此刻剩余 0 秒"，把已经停掉的 1 秒定时器重新武装起来，再触发一遍
+    /// handleTimeSessionReachedZero（该方法的注释里记录的正是这个坑）。
+    private func currentTimeSessionRemaining() -> Int? {
+        guard let anchor = client.timeSessionAnchor, anchor.sessionId != locallyExpiredSessionId else {
+            return nil
+        }
+        return anchor.remainingSeconds()
+    }
+
     /// 时间约定状态同步的统一入口。三处调用：60 秒配置轮询的兜底对比（changed 为真时）、
     /// SYNC_TIME_SESSION 门铃触发的即时刷新、系统唤醒后的强制重新校准。
     ///
-    /// 无论 sessionId 是否变化，都会用当前 config.timeSession.remainingSeconds 重新计算
-    /// timeSessionDeadline——这是"唤醒后重新定锚"那条路径真正需要的效果（见
-    /// handleResumeFromSystemEvent 的注释）。只有 sessionId 确实变化（新开/被替换/
-    /// 被中断/清空）时，才触发里程碑重置、计时器重启、旗帜展示/隐藏、本机审计记录这些
-    /// "一次性"副作用，避免每次配置轮询都重复播放"会话开始"的下拉动画。
+    /// 截止点的定锚已经下沉到 BigDaddyClient.refreshConfig()（见 TimeSessionAnchor），
+    /// 这里不再自己计算；只负责在 sessionId 确实变化（新开/被替换/被中断/清空）时，
+    /// 触发里程碑重置、计时器重启、旗帜展示/隐藏、本机审计记录这些"一次性"副作用，
+    /// 避免每次配置轮询都重复播放"会话开始"的下拉动画。
     private func syncTimeSessionState() {
         let current = client.config.timeSession
         let sessionChanged = current?.sessionId != trackedTimeSessionId
-        // 本地已判过到点、服务端尚未确认的那个会话：它在配置里仍然存在（remainingSeconds=0），
-        // 但对客户端来说已经处理完毕，不能再被当成"还在进行"去重新定锚或重启计时器。
-        let awaitingExpiryConfirmation = current != nil && current?.sessionId == locallyExpiredSessionId
-
-        if let session = current, !awaitingExpiryConfirmation {
-            timeSessionDeadline = ProcessInfo.processInfo.systemUptime + Double(session.remainingSeconds)
-        } else if current == nil {
-            timeSessionDeadline = nil
-        }
-        // awaitingExpiryConfirmation 时刻意不动 timeSessionDeadline：
-        // handleTimeSessionReachedZero 已经把它清成 nil，重新按 remainingSeconds=0 定锚会
-        // 让它变成"此刻就到点"的非 nil 值，下一次 tick 又触发一遍到点处理。
 
         guard sessionChanged else {
-            // 会话身份没变——多半是唤醒后的重新定锚，或一次无关变化触发的兜底轮询。
-            // 计时器按幂等方式重新确保仍在运行；菜单项文字顺手刷新一次。
-            if timeSessionDeadline != nil {
+            // 会话身份没变——多半是唤醒后的兜底对账，或一次无关变化触发的轮询。
+            // 计时器按幂等方式重新确保仍在运行（确认窗口内 currentTimeSessionRemaining()
+            // 会自行返回 nil，不会误重启）；菜单项文字顺手刷新一次。
+            if currentTimeSessionRemaining() != nil {
                 scheduleTimeSessionTimer()
             }
             refreshTimeSessionMenuItemText()
@@ -1978,7 +1978,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func handleTimeSessionReachedZero() {
         timeSessionTimer?.invalidate()
         timeSessionTimer = nil
-        timeSessionDeadline = nil
+        // 不清 client.timeSessionAnchor：它由 refreshConfig() 独立维护，这里没有必要
+        // 抢着改。接下来 30 秒确认窗口内即便它被刷新成"剩余 0 秒"，currentTimeSessionRemaining()
+        // 也会因为下面这行设的 locallyExpiredSessionId 而返回 nil，效果与清空等价。
         let expiredSessionId = trackedTimeSessionId
         locallyExpiredSessionId = expiredSessionId
         AuditLog.record("TIME_SESSION_EXPIRED")
@@ -2014,15 +2016,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 显示停摆。
     private func scheduleTimeSessionTimer() {
         timeSessionTimer?.invalidate()
-        guard timeSessionDeadline != nil else { return }
+        guard currentTimeSessionRemaining() != nil else { return }
         timeSessionTimer = scheduleCommonModeTimer(interval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.timeSessionTick() }
         }
     }
 
     private func timeSessionTick() {
-        guard let deadline = timeSessionDeadline, let session = client.config.timeSession else { return }
-        let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+        guard let remaining = currentTimeSessionRemaining(), let session = client.config.timeSession else { return }
         refreshTimeSessionMenuItemText()
 
         if remaining <= 0 {
@@ -2070,12 +2071,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     private func refreshTimeSessionMenuItemText() {
         guard let item = timeSessionMenuItem, let session = client.config.timeSession else { return }
-        // deadline 为 nil = 本地已判过到点（handleTimeSessionReachedZero 清掉了它）。
-        // 这条菜单项本该随之消失，但如果菜单此刻正开着，重建被推迟到关闭之后——
+        // currentTimeSessionRemaining() 为 nil = 本地已判过到点（正处在等服务端确认的
+        // 窗口内）。这条菜单项本该随之消失，但如果菜单此刻正开着，重建被推迟到关闭之后——
         // 那段时间里显示 0:00 才诚实，继续挂着最后那个非零读数会和已经弹出的到点
         // 提醒自相矛盾。
-        let remaining = timeSessionDeadline
-            .map { max(0, Int(($0 - ProcessInfo.processInfo.systemUptime).rounded(.up))) } ?? 0
+        let remaining = currentTimeSessionRemaining() ?? 0
         item.title = Self.timeSessionMenuTitle(remaining: remaining, grantedSeconds: session.grantedSeconds)
     }
 
@@ -2090,8 +2090,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// "关于"窗口"时间约定"行的当前文案，nil 表示当下没有进行中的约定（该行不渲染）。
     private func currentTimeSessionRemainingText() -> String? {
-        guard let session = client.config.timeSession, let deadline = timeSessionDeadline else { return nil }
-        let remaining = max(0, Int((deadline - ProcessInfo.processInfo.systemUptime).rounded(.up)))
+        guard let session = client.config.timeSession, let remaining = currentTimeSessionRemaining() else { return nil }
         let clock = String(format: "%d:%02d", remaining / 60, remaining % 60)
         return Localization.string(
             zh: "\(clock)（共 \(session.grantedSeconds / 60) 分钟）",

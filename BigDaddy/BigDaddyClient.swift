@@ -174,6 +174,31 @@ final class SwitchCounter: @unchecked Sendable {
     }
 }
 
+/// 时间约定倒计时的本地定锚点，在一次成功的 refreshConfig() 里由 remainingSeconds 折算而来。
+///
+/// 双锚而不是单锚：`uptimeDeadline` 用 `ProcessInfo.systemUptime`（不计睡眠时长，但不受
+/// 孩子改系统时钟影响），`wallDeadline` 用墙钟 `Date()`（睡眠时间照走，但能被改钟绕过）。
+/// 到点判定取两者中**更早**的那个——合盖睡眠时靠 wallDeadline 兜底（uptime 不动，wall
+/// 已经过去了），孩子把系统时间往后拨时靠 uptimeDeadline 兜底（wall 被拨远了，uptime
+/// 不受影响）。正常在线运行时两者同时到期，行为与只用单锚时完全一致。
+///
+/// 只在 refreshConfig() 成功（拿到新的 remainingSeconds）时重新计算；失败时这个值保持
+/// 不动——这正是"断网不该让倒计时暂停，也不该被离线期间的旧读数吓得从头开始"的落地位置。
+/// 详见 AppDelegate.currentTimeSessionRemaining() 的调用处。
+struct TimeSessionAnchor: Equatable {
+    let sessionId: String
+    let uptimeDeadline: TimeInterval
+    let wallDeadline: Date
+
+    /// 两个锚点里更早到期的那个折算出的剩余秒数，不足一秒的余量进位成 1（与原先
+    /// `.rounded(.up)` 的读数习惯一致），归零后钳制在 0，不返回负数。
+    func remainingSeconds(now: Date = Date(), systemUptime: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Int {
+        let byUptime = uptimeDeadline - systemUptime
+        let byWall = wallDeadline.timeIntervalSince(now)
+        return max(0, Int(min(byUptime, byWall).rounded(.up)))
+    }
+}
+
 final class BigDaddyClient: @unchecked Sendable {
     static var lastSharedInstance: BigDaddyClient?
     static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
@@ -189,6 +214,10 @@ final class BigDaddyClient: @unchecked Sendable {
     /// register 响应报告本机 secret 与后端存档不一致（设备已绑定、后端拒绝换钥）。
     /// 此状态下所有签名接口都会验签失败，必须在 UI 上明确警示，引导解绑后重新绑定。
     var credentialsInvalid = false
+    /// 当前时间约定的本地定锚点（nil = 没有进行中的约定）。只在 refreshConfig() 成功时
+    /// 更新，刻意不进 ClientConfig/ConfigStore——它是这次响应的派生量，不是服务端策略
+    /// 本身，混进会被持久化结构（Codable、整份覆盖式赋值）污染。见 TimeSessionAnchor 注释。
+    var timeSessionAnchor: TimeSessionAnchor?
     /// 当前是否有浏览器处于"自动化权限被拒"状态，随心跳上报（见 sendHeartbeat 的 metadata）。
     /// 那份被拒 bundle id 的集合归 AppDelegate 管（探测、重置、菜单入口都在那边），
     /// 这里只留一个被同步过来的布尔值——心跳在这个类里组装，总得有个地方读到它。
@@ -453,6 +482,20 @@ final class BigDaddyClient: @unchecked Sendable {
                 name: Self.webFilterConfigChangedNotification,
                 object: self
             )
+        }
+        // 定锚：只在这次成功刷新真的带回了一份 timeSession 时才重新计算，且只信
+        // remote.timeSession——未绑定分支里 config.timeSession 保留的是绑定时期的
+        // 陈旧快照（见上面的分支注释），不能拿它定锚。刷新失败（早于此处已 return）
+        // 时 timeSessionAnchor 保持不动，这正是"断网时倒计时按墙钟继续走、不暂停也
+        // 不被旧读数拽回起点"的落地位置，见 TimeSessionAnchor 类注释。
+        if remote.bound, let session = remote.timeSession {
+            timeSessionAnchor = TimeSessionAnchor(
+                sessionId: session.sessionId,
+                uptimeDeadline: ProcessInfo.processInfo.systemUptime + Double(session.remainingSeconds),
+                wallDeadline: Date().addingTimeInterval(Double(session.remainingSeconds))
+            )
+        } else {
+            timeSessionAnchor = nil
         }
         // 清掉孩子在本机用验证码打下的关闭覆盖，让家长策略重新生效。只在覆盖确实生效时
         // 才判断——isEnabled 已经是 true 时这个决定毫无意义，没必要跑。
