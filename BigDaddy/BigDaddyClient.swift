@@ -224,13 +224,26 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 倒计时却毫无提示。任何一次成功的 refreshConfig() 都会把它翻回 false——不论那次
     /// 响应里到底还有没有 timeSession，都算是一次权威确认。
     var timeSessionAnchorIsFromDisk = false
-    /// 连续失败的 refreshConfig() 轮询次数，成功一次就清零。存在的理由只有一个：限网
+    /// 连续拿不到配置的轮询次数，成功一次就清零。存在的理由只有一个：限网
     /// 生效期间，如果这台 Mac 长时间连不上后端，孩子没法知道"限制会不会自动解除"——
     /// 答案是不会（也不该会，见 AppDelegate 里那条提示的注释），但沉默本身会诱使孩子
     /// 以为是网络故障反复重启/重装排查，制造更多真正需要家长处理的麻烦。不区分认证
     /// 失败/网络错误/解析失败，统一算一次失败：三者对孩子来说是同一种体验（连不上），
     /// 没必要在这个计数器里分开处理。
     var consecutiveConfigRefreshFailures = 0
+
+    /// 这一轮**根本没能发起** refreshConfig()，同样计入失败。
+    ///
+    /// 专为凭据失效准备：那种状态下 60 秒主轮询会整个跳过 refreshConfig()（签名通道全断，
+    /// 调了必然 401，见 AppDelegate.pollConfigForChildVisibility），于是计数器会永远停在
+    /// 进入该状态时的那一次上，"连不上服务器"的提示再也到不了阈值——而凭据失效恰恰是
+    /// 最需要这条提示的一种：设备看着在线、限网继续拦、任何策略都收不到。
+    ///
+    /// 只该由那条 60 秒轮询调用。绑定探测那个 3 秒一轮的 burst 用着同样的跳过写法，但
+    /// 它两分钟能跑 40 轮，计进来会让阈值失去"大约十分钟"的含义。
+    func noteConfigRefreshSkipped() {
+        consecutiveConfigRefreshFailures += 1
+    }
     /// 当前是否有浏览器处于"自动化权限被拒"状态，随心跳上报（见 sendHeartbeat 的 metadata）。
     /// 那份被拒 bundle id 的集合归 AppDelegate 管（探测、重置、菜单入口都在那边），
     /// 这里只留一个被同步过来的布尔值——心跳在这个类里组装，总得有个地方读到它。

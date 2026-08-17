@@ -1829,6 +1829,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         var changed = false
         if !client.credentialsInvalid {
             changed = await client.refreshConfig().changed
+        } else {
+            // 跳过也是一次"这一轮没拿到配置"，必须照常计数——否则凭据失效期间计数器会
+            // 永远停在进入该状态的那一次上，"限制仍在生效、连不上服务器"的提示反而在
+            // 最该出现的场景里永远到不了阈值。见 noteConfigRefreshSkipped 的注释。
+            client.noteConfigRefreshSkipped()
         }
         await reportWebFilterStatus()
         let boundChanged = client.config.bound != boundBefore
