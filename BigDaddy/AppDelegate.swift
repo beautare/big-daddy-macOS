@@ -548,6 +548,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             menu.addItem(.separator())
         }
 
+        // 限网仍在生效、但连不上家长服务器太久了：纯提示，没有可点的动作（不该有——
+        // 解除只能由家长在仪表盘操作，这台 Mac 上没有任何按钮该让孩子拿到"自己解除"
+        // 的能力），所以是禁用项，和上面的时间约定剩余读数同一个写法。
+        if isWebFilterUnreachableWhileRestricting {
+            let item = NSMenuItem(
+                title: Localization.string(
+                    zh: "🌐 上网限制仍在生效 · 暂时连不上家长服务器",
+                    en: "🌐 Restriction still active — can't reach parent server"
+                ),
+                action: nil, keyEquivalent: ""
+            )
+            item.isEnabled = false
+            menu.addItem(item)
+            menu.addItem(.separator())
+        }
+
         // 屏幕录制"就差最后一步"的兜底提醒。
         //
         // 家长点过"前往系统设置授权"、在设置里开完开关之后，还剩一步重启才生效。那一步
@@ -1800,6 +1816,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let before = client.config.screenshotEnabled
         // 记录旧的截图间隔，用于判断是否需要在配置变化后重排定时截图计时器
         let intervalBefore = client.config.screenshotIntervalMins
+        // "限网仍在生效、但连不上服务器"这条菜单提示只在跨过阈值那一刻才需要重建菜单——
+        // 之后每一次同样失败的轮询都不该白白触发一次 rebuildMenu()，那道门槛本身
+        // 已经在 isWebFilterUnreachableWhileRestricting 里做了消抖。
+        let unreachableBefore = isWebFilterUnreachableWhileRestricting
         // 凭据失效时签名通道全断，config 轮询收不到任何信号（包括解绑）。register 不签名：
         // 家长解绑后，后端会重新接受本机 secret（未绑定设备允许换钥），凭据在这里自动恢复，
         // 随后回到常规配置轮询——不需要重启客户端。
@@ -1813,7 +1833,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         await reportWebFilterStatus()
         let boundChanged = client.config.bound != boundBefore
         let credentialsChanged = client.credentialsInvalid != invalidBefore
-        guard changed || boundChanged || credentialsChanged else { return }
+        let unreachableChanged = isWebFilterUnreachableWhileRestricting != unreachableBefore
+        guard changed || boundChanged || credentialsChanged || unreachableChanged else { return }
         let after = client.config.screenshotEnabled
         await MainActor.run {
             // 60 秒配置轮询是时间约定的兜底同步路径——门铃丢失、或家长在设备离线期间
@@ -2064,7 +2085,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let flag = timeFlag ?? TimeAgreementFlag()
         timeFlag = flag
         bindAcknowledgeHandler(to: flag, sessionId: session.sessionId)
-        flag.present(anchor: statusItem, remainingSeconds: remaining, note: session.note, autoDismissAfter: autoDismissAfter)
+        // client.timeSessionAnchorIsFromDisk 只在离线冷启动、还没有任何一次成功的
+        // refreshConfig() 确认过这份约定时为真（见 BigDaddyClient.refreshConfig 的注释）。
+        // 这里每次都现读，不缓存：一旦网络恢复、下一次成功的配置轮询把它翻回 false，
+        // 后续的里程碑调用会自然摘掉这个提示，不需要额外的状态同步。
+        flag.present(
+            anchor: statusItem, remainingSeconds: remaining, note: session.note,
+            autoDismissAfter: autoDismissAfter, unsynced: client.timeSessionAnchorIsFromDisk
+        )
         let sessionId = session.sessionId
         Task { await client.reportTimeSessionShown(sessionId) }
     }
@@ -3749,6 +3777,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         case .activationRequested, .approved, .configurationEnabled, .restartRequired:
             return webFilterController.isSystemFilterDisabledExternally ? .disabledExternally : .none
         }
+    }
+
+    /// 连续多少次配置轮询失败（每次间隔 60 秒，见 configTimer）才提示"限制仍在生效中，
+    /// 但连不上家长服务器"。10 次 ≈ 10 分钟：短暂断网/服务器重启不该触发，只在真的
+    /// 持续失联时才说。
+    private static let webFilterUnreachableNoticeThreshold = 10
+
+    /// 限网正在拦截、且已经连续失联了一段时间——这不是"哪里坏了"（拦截本身工作正常），
+    /// 只是解除信号送不到这台 Mac。与 webFilterAttention 互斥（`webFilterAttention == .none`
+    /// 那道守卫）：扩展本身有问题时那边的提示更具体、更该优先看到，这条不该跟它抢位置。
+    ///
+    /// 刻意不区分这次拦截是"时间到限网"还是家长长期开着的黑名单——客户端在设计上就
+    /// 不知道来源（见 WebFilterController.isRestrictingWebAccess 的注释），文案必须
+    /// 写成来源无关的表述。
+    private var isWebFilterUnreachableWhileRestricting: Bool {
+        webFilterAttention == .none
+            && webFilterController.isRestrictingWebAccess
+            && client.consecutiveConfigRefreshFailures >= Self.webFilterUnreachableNoticeThreshold
     }
 
     private func webFilterMenuTitle(for attention: WebFilterAttention) -> String? {

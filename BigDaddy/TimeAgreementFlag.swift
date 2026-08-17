@@ -41,6 +41,10 @@ final class TimeAgreementFlag {
     private var dismissTimer: Timer?
     /// 当前是否处于"时间到"形态，决定配色、按钮可见性与鼠标事件开关
     private var isExpiredState = false
+    /// 当前这份倒计时是不是离线冷启动从磁盘恢复的、还没有被任何一次成功的配置刷新
+    /// 确认过（见 BigDaddyClient.timeSessionAnchorIsFromDisk）。只影响倒计时形态下的
+    /// 标题文案，不影响"时间到"形态——到点提醒是本地实时判定的，与是否同步无关。
+    private var isUnsyncedState = false
 
     /// 孩子点了「我知道了」。由 AppDelegate 注入：收起面板 + 上报回执。
     var onAcknowledge: (() -> Void)?
@@ -64,8 +68,17 @@ final class TimeAgreementFlag {
     /// 下拉展示（倒计时形态）。`autoDismissAfter` 为 nil 表示常驻不收回（剩余 30 秒内的 sticky 态）。
     /// 若面板已经可见（同一次里程碑内被连续调用，或 sticky 态每秒被刷新文案），只更新
     /// 文案与自动收回定时器，不重复播放滑入动画。
-    func present(anchor: NSStatusItem, remainingSeconds: Int, note: String?, autoDismissAfter: TimeInterval?) {
+    ///
+    /// `unsynced` 为真时标题会换成"尚未同步"的措辞——这份倒计时是离线冷启动时从磁盘
+    /// 恢复出来的，还没有被任何一次成功的配置刷新确认过，家长可能已经在别处改过甚至
+    /// 取消了这次约定，只是消息还没送到这台 Mac。孩子应该知道这一点，而不是看着一个
+    /// 权威性和联网时完全一样、实际却可能早已过期的倒计时。
+    func present(
+        anchor: NSStatusItem, remainingSeconds: Int, note: String?,
+        autoDismissAfter: TimeInterval?, unsynced: Bool = false
+    ) {
         synchronizeScreenPanels()
+        isUnsyncedState = unsynced
         applyExpiredState(false)
         showPanels(anchor: anchor, remainingSeconds: remainingSeconds, note: note)
         scheduleAutoDismiss(after: autoDismissAfter)
@@ -172,7 +185,9 @@ final class TimeAgreementFlag {
             content.iconView.contentTintColor = expired ? Self.accentColor : .labelColor
             content.captionLabel.stringValue = expired
                 ? Localization.string(zh: "约定时间到了", en: "Time's up")
-                : Localization.string(zh: "时间约定剩余", en: "Time left")
+                : (isUnsyncedState
+                    ? Localization.string(zh: "时间约定剩余（尚未同步）", en: "Time left (not synced)")
+                    : Localization.string(zh: "时间约定剩余", en: "Time left"))
             content.captionLabel.textColor = expired ? Self.accentColor : .secondaryLabelColor
             content.remainingLabel.textColor = expired ? Self.accentColor : .labelColor
             content.accentBar.isHidden = !expired

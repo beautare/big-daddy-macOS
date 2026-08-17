@@ -218,6 +218,19 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 更新，刻意不进 ClientConfig/ConfigStore——它是这次响应的派生量，不是服务端策略
     /// 本身，混进会被持久化结构（Codable、整份覆盖式赋值）污染。见 TimeSessionAnchor 注释。
     var timeSessionAnchor: TimeSessionAnchor?
+    /// timeSessionAnchor 当前这份是不是冷启动从磁盘恢复的、还没被任何一次成功的
+    /// refreshConfig() 确认过。UI（TimeAgreementFlag）据此提示孩子"这份倒计时还没有
+    /// 联系上家长的服务器"，避免看着一个来路不明、家长可能早已经改过甚至取消掉的
+    /// 倒计时却毫无提示。任何一次成功的 refreshConfig() 都会把它翻回 false——不论那次
+    /// 响应里到底还有没有 timeSession，都算是一次权威确认。
+    var timeSessionAnchorIsFromDisk = false
+    /// 连续失败的 refreshConfig() 轮询次数，成功一次就清零。存在的理由只有一个：限网
+    /// 生效期间，如果这台 Mac 长时间连不上后端，孩子没法知道"限制会不会自动解除"——
+    /// 答案是不会（也不该会，见 AppDelegate 里那条提示的注释），但沉默本身会诱使孩子
+    /// 以为是网络故障反复重启/重装排查，制造更多真正需要家长处理的麻烦。不区分认证
+    /// 失败/网络错误/解析失败，统一算一次失败：三者对孩子来说是同一种体验（连不上），
+    /// 没必要在这个计数器里分开处理。
+    var consecutiveConfigRefreshFailures = 0
     /// 当前是否有浏览器处于"自动化权限被拒"状态，随心跳上报（见 sendHeartbeat 的 metadata）。
     /// 那份被拒 bundle id 的集合归 AppDelegate 管（探测、重置、菜单入口都在那边），
     /// 这里只留一个被同步过来的布尔值——心跳在这个类里组装，总得有个地方读到它。
@@ -235,7 +248,7 @@ final class BigDaddyClient: @unchecked Sendable {
     init() {
         self.identity = IdentityStore.load()
         var restored = ConfigStore.load() ?? ClientConfig()
-        // 磁盘上存下来的 timeSession 一律作废。
+        // 磁盘上存下来的（完整 ClientConfig 里那份）timeSession 一律作废。
         //
         // ConfigStore 持久化的是整个 ClientConfig，timeSession 会连着它那个"服务端在响应
         // 那一刻算出的" remainingSeconds 一起落盘，而这个数字**只在落盘那一瞬间成立**。
@@ -245,10 +258,39 @@ final class BigDaddyClient: @unchecked Sendable {
         // refreshConfig() 失败——若不清掉，客户端会拿着这份隔夜快照下拉旗帜、显示"剩余
         // 20:00"并开始倒数，而服务端早在昨晚就把它判成 EXPIRED 了。
         //
-        // 只清磁盘这一条路径，不动内存：进程运行期间 refreshConfig() 失败时保留内存里的
-        // 上一份 timeSession 是**正确**的（墙钟语义下时间照流，断网不该让倒计时暂停），
-        // 有问题的只是磁盘往返跨越的那段不可知时长。
+        // 只清这一份，不动内存：进程运行期间 refreshConfig() 失败时保留内存里的上一份
+        // timeSession 是**正确**的（墙钟语义下时间照流，断网不该让倒计时暂停），有问题的
+        // 只是磁盘往返跨越的那段不可知时长。
         restored.timeSession = nil
+
+        // 单独存的 TimeSessionAnchorStore 记的是绝对墙钟时刻（wallDeadline），不是
+        // remainingSeconds，跨关机一整晚依然成立——这正是它能安全恢复、而上面那份不能
+        // 的原因。已经过期的直接丢弃（清盘），不在这里悄悄推进任何状态；还没过期的
+        // 用它重建一份最小的 TimeSession 塞回 config，让 AppDelegate 现有的
+        // syncTimeSessionState() 按老路径自然识别出"有一个进行中的约定"并弹出旗帜——
+        // 旗帜会标注"尚未同步"，直到下一次成功的 refreshConfig() 用服务端权威值覆盖它
+        // （见 timeSessionAnchorIsFromDisk）。
+        if let persisted = TimeSessionAnchorStore.load() {
+            let remaining = persisted.wallDeadline.timeIntervalSinceNow
+            if remaining > 0 {
+                let roundedRemaining = Int(remaining.rounded(.up))
+                timeSessionAnchor = TimeSessionAnchor(
+                    sessionId: persisted.sessionId,
+                    uptimeDeadline: ProcessInfo.processInfo.systemUptime + Double(roundedRemaining),
+                    wallDeadline: persisted.wallDeadline
+                )
+                restored.timeSession = TimeSession(
+                    sessionId: persisted.sessionId,
+                    grantedSeconds: persisted.grantedSeconds,
+                    remainingSeconds: roundedRemaining,
+                    note: persisted.note
+                )
+                timeSessionAnchorIsFromDisk = true
+            } else {
+                TimeSessionAnchorStore.clear()
+            }
+        }
+
         self.config = restored
         BigDaddyClient.lastSharedInstance = self
     }
@@ -455,13 +497,21 @@ final class BigDaddyClient: @unchecked Sendable {
             data = try await request(path: "/bigdaddy/client/config", method: "GET", body: nil, signed: true)
         } catch let error as BigDaddyAPIError where error.isAuthFailure {
             markCredentialsInvalid()
+            consecutiveConfigRefreshFailures += 1
             return .failed
         } catch {
+            consecutiveConfigRefreshFailures += 1
             return .failed
         }
         guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else {
+            consecutiveConfigRefreshFailures += 1
             return .failed
         }
+        // 从这里开始就是一次成功的刷新：不论后面走绑定还是未绑定分支，服务器都确实
+        // 回应了。清零失败计数——AppDelegate 拿它判断"限网期间是不是已经连不上服务器
+        // 太久了"（见 consecutiveConfigRefreshFailures 的注释），一次成功就该让计数
+        // 归零，不必等到下一轮才反映过来。
+        consecutiveConfigRefreshFailures = 0
         let previous = config
         let remote = response.data
         if remote.bound {
@@ -488,14 +538,28 @@ final class BigDaddyClient: @unchecked Sendable {
         // 陈旧快照（见上面的分支注释），不能拿它定锚。刷新失败（早于此处已 return）
         // 时 timeSessionAnchor 保持不动，这正是"断网时倒计时按墙钟继续走、不暂停也
         // 不被旧读数拽回起点"的落地位置，见 TimeSessionAnchor 类注释。
+        //
+        // 这次刷新一旦成功，不论有没有 timeSession，都是一次对当前状态的权威确认——
+        // timeSessionAnchorIsFromDisk 必须翻回 false，让 UI 摘掉"尚未同步"的提示；
+        // 磁盘上的持久化锚点也要跟着同步：有会话就覆盖成最新的 wallDeadline，没有
+        // 就清掉，不留一份将来某次离线冷启动会被错误复活的旧记录。
+        timeSessionAnchorIsFromDisk = false
         if remote.bound, let session = remote.timeSession {
+            let wallDeadline = Date().addingTimeInterval(Double(session.remainingSeconds))
             timeSessionAnchor = TimeSessionAnchor(
                 sessionId: session.sessionId,
                 uptimeDeadline: ProcessInfo.processInfo.systemUptime + Double(session.remainingSeconds),
-                wallDeadline: Date().addingTimeInterval(Double(session.remainingSeconds))
+                wallDeadline: wallDeadline
             )
+            TimeSessionAnchorStore.save(PersistedTimeSessionAnchor(
+                sessionId: session.sessionId,
+                wallDeadline: wallDeadline,
+                grantedSeconds: session.grantedSeconds,
+                note: session.note
+            ))
         } else {
             timeSessionAnchor = nil
+            TimeSessionAnchorStore.clear()
         }
         // 清掉孩子在本机用验证码打下的关闭覆盖，让家长策略重新生效。只在覆盖确实生效时
         // 才判断——isEnabled 已经是 true 时这个决定毫无意义，没必要跑。
