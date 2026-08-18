@@ -572,7 +572,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 想搞清楚是怎么回事——这条就得在这儿等着，而且是一点就完事的。
         //
         // 少了这条，最坏情况就是家长的原始抱怨："我明明授权了，怎么还是警示图标？"
-        if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
+        //
+        // 出现条件里**刻意不带 screenshotEnabled**，这一条是"绑定时索取、被拒后退回菜单"
+        // 这条链路上最大的一个断点：家长在绑定自检里对屏幕录制点了拒绝时，截图功能通常
+        // 还没打开（它默认关着、要家长日后在仪表盘上开），于是这条菜单项不出现；而 macOS
+        // 的 TCC 一旦记下"拒绝"就**不会再弹第二次系统框**，补授权只剩"自己去系统设置里翻"
+        // 这一条路。也就是说，在最需要这个入口的那段时间里它恰好不存在；等家长日后打开
+        // 截图、入口终于冒出来时，人往往已经不在孩子那台机器跟前了。
+        //
+        // 改成只要绑定了就常驻。代价是"权限缺着、功能没开"这段时间菜单里多一行——但那一行
+        // 是可点即修的，不是报警（措辞跟着分开，见下），比一个找不到的入口划算得多。
+        if client.config.bound && !checkScreenRecordingPermission() {
+            // 截图没开时不用"⚠️ 未授权"的口吻：此刻确实什么都没坏、也没有任何东西不生效，
+            // 报警等于骗人。同一颗按钮，两种措辞。
+            let screenshotOn = client.config.screenshotEnabled
             if awaitingScreenRecordingGrant {
                 menu.addItem(NSMenuItem(
                     title: Localization.string(
@@ -588,10 +601,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 菜单里却一条相关的都没有——图标上的警示徽章没有任何可点的落点，
                 // 和辅助功能/浏览器网址那两条待办的待遇不一致。
                 menu.addItem(NSMenuItem(
-                    title: Localization.string(
-                        zh: "⚠️ 屏幕录制未授权 · 点此修复",
-                        en: "⚠️ Screen recording off · Fix it"
-                    ),
+                    title: screenshotOn
+                        ? Localization.string(
+                            zh: "⚠️ 屏幕录制未授权 · 点此修复",
+                            en: "⚠️ Screen recording off · Fix it"
+                          )
+                        : Localization.string(
+                            zh: "屏幕录制未授权 · 点此补上（截图当前未开启）",
+                            en: "Screen recording not granted · Grant it (screenshots are off)"
+                          ),
                     action: #selector(openScreenRecordingSettings), keyEquivalent: ""
                 ))
             }
@@ -624,12 +642,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 之前它只存在于两个地方：一次性的本机通知（错过就没了）和「关于 BigDaddy…」
         // 里的一颗按钮（要先知道去那儿翻）。结果是家长端一直显示"网址未授权"，而机器
         // 跟前的人根本不知道有个开关等着点。放在这里，图标上的 ⚠️ 也就有了落点。
-        if client.config.bound && !automationDeniedBundleIDs.isEmpty {
+        //
+        // 两支条件对应两种完全不同的处境，都得有入口（见 neverAskedBrowsers 的注释）：
+        // - automationDeniedBundleIDs 非空 = 问过了、被拒了 → 真待办，用警示口吻；
+        // - neverAskedBrowsers 非空 = 绑定那一刻这些浏览器没开着、压根没问过 → 不是
+        //   故障，但如果不给入口，这件事就只能等孩子哪天自己打开浏览器时被系统弹一次框，
+        //   而那一刻家长不在场。这一支正是"绑定时没能一并索取"所必须留的后路。
+        let unaskedBrowsers = client.config.bound ? neverAskedBrowsers() : []
+        if client.config.bound && (!automationDeniedBundleIDs.isEmpty || !unaskedBrowsers.isEmpty) {
             menu.addItem(NSMenuItem(
-                title: Localization.string(
-                    zh: "⚠️ 浏览器网址未授权 · 点此修复",
-                    en: "⚠️ Browser URL access off · Fix it"
-                ),
+                title: automationDeniedBundleIDs.isEmpty
+                    ? Localization.string(
+                        zh: "浏览器网址读取未授权 · 点此补上",
+                        en: "Browser URL access not granted · Grant it"
+                      )
+                    : Localization.string(
+                        zh: "⚠️ 浏览器网址未授权 · 点此修复",
+                        en: "⚠️ Browser URL access off · Fix it"
+                      ),
                 action: #selector(promptAutomationPermission), keyEquivalent: ""
             ))
             menu.addItem(.separator())
@@ -760,7 +790,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 现在改成：我们确实查不到权限，但我们**查得到家长有没有点过第一颗按钮**，用这个
         // 已知信息把流程切成两个互斥的状态，每个状态只呈现那一步该做的唯一动作。猜错的
         // 代价也被兜住了——第二步的说明里写清了"如果还没开，就走下面那条回去设置"。
-        if client.config.bound && client.config.screenshotEnabled && !checkScreenRecordingPermission() {
+        //
+        // 出现条件同 rebuildMenu：不带 screenshotEnabled。否则家长在绑定时拒掉屏幕录制
+        // 之后，这个窗口——本 App 事实上的权限中心——里反而没有补授权的按钮，而系统那边
+        // 又不会再弹第二次框（完整理由见 rebuildMenu 里那段注释）。
+        if client.config.bound && !checkScreenRecordingPermission() {
+            let screenshotOn = client.config.screenshotEnabled
             if awaitingScreenRecordingGrant {
                 // 第 2 步：家长刚从系统设置回来。重启是此刻唯一该做的事，给蓝底主按钮。
                 actions.append((
@@ -777,10 +812,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 ))
             } else {
                 // 第 1 步：还没去过设置。此刻唯一该做的事就是去开开关。
+                // 截图没开时降级成非主按钮、措辞也不报警——那时确实什么都没坏。
                 actions.append((
-                    Localization.string(zh: "⚠️ 前往系统设置授权", en: "⚠️ Open System Settings"),
+                    screenshotOn
+                        ? Localization.string(zh: "⚠️ 前往系统设置授权", en: "⚠️ Open System Settings")
+                        : Localization.string(zh: "补上屏幕录制权限（截图当前未开启）",
+                                              en: "Grant Screen Recording (screenshots are off)"),
                     openScreenRecordingSettings,
-                    true
+                    screenshotOn
                 ))
             }
         }
@@ -800,12 +839,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 false
             ))
         }
-        // 浏览器自动化权限缺失：家长端会看到"有标题、没链接"的日志。这条和屏幕录制那条
-        // 的可见性条件不同——它跟 screenshotEnabled 无关，只要设备已绑定、且实际撞到过
-        // 被拒的浏览器就该出现（未绑定时没有任何上报，提示也就没有意义）。
-        if client.config.bound && !automationDeniedBundleIDs.isEmpty {
+        // 浏览器自动化权限缺失：家长端会看到"有标题、没链接"的日志。只要设备已绑定、
+        // 且实际撞到过被拒的浏览器就该出现（未绑定时没有任何上报，提示也就没有意义）。
+        // 第二支 neverAskedBrowsers 是"绑定那一刻这些浏览器没开着、从没问过"的情况，
+        // 判据与 rebuildMenu 里那条完全一致（原因见 neverAskedBrowsers 的注释）。
+        if client.config.bound && (!automationDeniedBundleIDs.isEmpty || !neverAskedBrowsers().isEmpty) {
             actions.append((
-                Localization.string(zh: "⚠️ 允许记录访问网址（网页管理权限）", en: "⚠️ Allow Recording Web Addresses (Web Management Permission)"),
+                automationDeniedBundleIDs.isEmpty
+                    ? Localization.string(zh: "补上网址记录权限（网页管理权限）",
+                                          en: "Grant Web Address Recording (Web Management Permission)")
+                    : Localization.string(zh: "⚠️ 允许记录访问网址（网页管理权限）",
+                                          en: "⚠️ Allow Recording Web Addresses (Web Management Permission)"),
                 promptAutomationPermission,
                 false
             ))
@@ -1423,6 +1467,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
         if reason == BigDaddyClient.UrlUnavailableReason.notPermitted.rawValue {
             automationDeniedBundleIDs.insert(bundleID)
+            // -1743 只会在系统**已经记过一次明确拒绝**之后才出现，说明这个浏览器早就被
+            // 问过了（不管是哪条路问的）——同 markAutomationWarmed 的记账，理由见下方。
+            markAutomationWarmed(bundleID)
             // 菜单栏那条一级警示项和图标状态都由这个集合驱动，插入后要立刻重绘——
             // 常驻入口不受下面的通知节流管辖，本来就该在第一时间出现。
             rebuildMenu()
@@ -1441,6 +1488,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 变量——后者是"跨并发边界引用被捕获的 var"，Swift 6 下是错误。
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    // 不管结果是准是拒，这一刻都问出了一个明确答案——记账，理由见
+                    // markAutomationWarmed。少了这一步，孩子自己打开一个从没问过的浏览器、
+                    // 当场获准，neverAskedBrowsers() 却因为 warmedAutomationTargetsKey
+                    // 没更新而永远把它算成"没问过"，菜单里那条补授权入口会挂着一个已经
+                    // 授权好的浏览器，点进去发现根本没有待办——这正是新加的两处菜单入口
+                    // （rebuildMenu / showAboutWindow 里 neverAskedBrowsers 非空那支）
+                    // 唯一依赖的记账来源，这里不补上就是留了个假警报。
+                    self.markAutomationWarmed(bundleID)
                     if probe.permission == .granted {
                         self.automationDeniedBundleIDs.remove(bundleID)
                         // 授权当场生效，下一次心跳就能带上 URL，无需重启（这点和屏幕录制不同）
@@ -1458,6 +1513,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 已经主动预热过自动化授权的浏览器 bundle id，跨启动持久化
     private static let warmedAutomationTargetsKey = "BigDaddyWarmedAutomationTargets"
+
+    /// 记一笔"这个浏览器已经有过明确结果"，无论结果是准是拒。
+    ///
+    /// neverAskedBrowsers() 单靠这份记账分辨"问没问过"，而写入点原本只有两处：绑定后的
+    /// 批量预热（warmAutomationConsentIfNeeded）和菜单里的补授权按钮
+    /// （promptAutomationPermission）。运行期这条路——孩子自己打开一个从没问过的浏览器，
+    /// 被 activeWindowInfo 探测到、由 onBrowserAutomationBlocked 接手——此前完全没有写入，
+    /// 于是一个当场获准的浏览器会被 neverAskedBrowsers() 永远当成"没问过"：菜单里那条
+    /// "浏览器网址未授权 · 点此补上"会挂着一个其实已经授权好的浏览器，点进去发现根本
+    /// 没有待办。这正是本轮新加的两处菜单/关于窗口入口唯一依赖的数据源，不补齐这里，
+    /// 那两处入口会长期显示假警报。
+    private func markAutomationWarmed(_ bundleID: String) {
+        let key = Self.warmedAutomationTargetsKey
+        var warmed = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        guard warmed.insert(bundleID).inserted else { return }
+        UserDefaults.standard.set(Array(warmed), forKey: key)
+    }
 
     /// 绑定完成后，主动给每个"已安装且正在运行"的受支持浏览器各发一次真实 Apple Event，
     /// 让 macOS 当场弹出授权询问、并在 TCC 里建出记录。
@@ -1521,6 +1593,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 self.rebuildMenu()
             }
         }
+    }
+
+    /// 本机装了、但一次都没被问过自动化授权的浏览器。
+    ///
+    /// 这是"被拒之后还能从菜单补授权"这条设计里唯一没被覆盖到的一格。现有的两个集合
+    /// 都装不下它们：
+    /// - automationDeniedBundleIDs 装的是"探测过、结果不行"的；
+    /// - warmedAutomationTargetsKey 装的是"已经问过"的。
+    ///
+    /// 而绑定那一刻没开着的浏览器，warmAutomationConsentIfNeeded 会**整个跳过**（它只
+    /// 对运行中的浏览器发事件，原因见那个方法的注释——`tell application id` 会把没运行的
+    /// 目标启动起来，绑定时凭空弹出四个浏览器窗口是不可接受的）。于是它们既没被问过、
+    /// 也不在被拒名单里，菜单栏里因此**一条相关的都不会出现**——恰恰是它们最需要那个
+    /// 入口：孩子日后第一次打开这些浏览器时会被系统弹一次框，而那一刻家长不在场。
+    ///
+    /// 判据只用"问没问过"，不查 TCC 状态：没在运行的目标查不出真相
+    /// （AEDeterminePermissionToAutomateTarget 一律回 procNotFound，"早就授权好、只是这会儿
+    /// 关着"和"从没问过"返回的是同一个码）。而"问没问过"是我们自己记的账，永远准。
+    /// 顺带的好处是这个函数不发任何 Apple Event、只读一次 UserDefaults 加几次
+    /// LaunchServices 查询，放在 rebuildMenu 里逐次调用也不心疼。
+    private func neverAskedBrowsers() -> [String] {
+        let warmed = Set(UserDefaults.standard.stringArray(forKey: Self.warmedAutomationTargetsKey) ?? [])
+        let installed = BigDaddyClient.installedSupportedBrowsers()
+            + BigDaddyClient.installedTitleOnlyBrowsers()
+        return installed.filter { !warmed.contains($0) }
     }
 
     /// 距离上次就这个浏览器提醒是否已经超过 automationNoticeInterval。
@@ -3424,7 +3521,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let pending = browserAutomationNeedingAttention()
         guard !pending.isEmpty else { return }
         automationDeniedBundleIDs.formUnion(pending)
-        promptAutomationPermission()
+        // 不再调 promptAutomationPermission()：那个方法的目标是
+        // automationDeniedBundleIDs ∪ neverAskedBrowsers() 的**全量**，而 pending 只是
+        // 家长在这张清单上正在处理的那几个（且早已排除了没在运行的，见
+        // browserAutomationNeedingAttention 的注释）。全量口径会把绑定清单以外、家长
+        // 根本没打算现在处理的"从没问过"的浏览器也一并卷进来——点这一行的「去授权」，
+        // 却弹出"要不要顺便打开 Firefox"这种和当下动作无关的确认框。走同一套探测逻辑，
+        // 但把范围锁定在 pending。
+        performAutomationProbe(for: Set(pending))
     }
 
     /// 权限行的三态。indeterminate 是"查不出来"（浏览器没运行），必须和"没授权"分开——
@@ -3968,16 +4072,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 仍是 notDetermined 的，直接弹系统原生授权框（一次点击就能解决）；确实是 denied
     /// 的，才打开系统设置的自动化面板并说明要勾哪一项。
     @objc private func promptAutomationPermission() {
-        let targets = Array(automationDeniedBundleIDs)
-        guard !targets.isEmpty else { return }
+        // 目标不再只取 automationDeniedBundleIDs。那个集合只装"探测过、结果不行"的，
+        // 而这颗按钮现在还要负责另一种处境：绑定那一刻没开着、因而**一次都没被问过**的
+        // 浏览器（见 neverAskedBrowsers 的注释）。只取被拒集合的话，那些浏览器点进来
+        // 会直接 return，按钮看起来是坏的。这是菜单/「关于」窗口那颗按钮的入口——
+        // 全量范围，家长手上能补的都摆出来；绑定清单里"只处理这一行"的入口在
+        // authorizeAllBrowserAutomation，走的是范围更窄的 performAutomationProbe(for:)。
+        performAutomationProbe(for: automationDeniedBundleIDs.union(neverAskedBrowsers()))
+    }
+
+    /// 探测一批浏览器的自动化授权，被 promptAutomationPermission（全量范围）和
+    /// authorizeAllBrowserAutomation（绑定清单里单独一行的范围）共用。
+    ///
+    /// 范围必须是参数而不是内部现算的全量，理由是绑定清单那条路：它只该处理家长在那张
+    /// 清单上点的那一行，不该像菜单里的按钮一样顺手把全机器"从没问过"的浏览器都卷进来——
+    /// 否则家长在绑定流程里点一下"去授权 Chrome"，会意外弹出"要不要顺便打开 Firefox"这种
+    /// 和当下动作无关的确认框。
+    private func performAutomationProbe(for wanted: Set<String>) {
+        guard !wanted.isEmpty else { return }
+        // 结果回写时要用这份**完整原始范围**来确定"这次动没动过"，不能用后面被
+        // dormant/skip 筛过的 wanted——否则家长选「只处理已打开的」之后，回写会
+        // 把没被处理到的那部分也当成"这轮没涉及"而保留，看似正确，实则依赖的是
+        // 下面 carriedOver 补回的巧合，一旦逻辑挪位置就容易悄悄错开。
+        let originalWanted = wanted
+        var wanted = wanted
+
+        // 没在运行的目标要先说清楚再动。`tell application id` 发出去时，macOS 会把没运行的
+        // 目标 App **启动起来**——这是 AppleScript 的既定行为，不是我们额外做了什么，但
+        // 站在孩子电脑前的人看到的就是"浏览器自己开了"。不打招呼就让它发生，在一台以信任
+        // 为前提的机器上是最糟的观感；所以这里如实交代，并且把选择权交回去。
+        //
+        // 刻意不做的两件事：不调 NSWorkspace.openApplication 替家长开（那是我们主动开别人的
+        // App，比顺带被 AppleScript 拉起来更越界），也不在问完之后替家长关掉（terminate 可能
+        // 被浏览器拒绝、也可能让它下次启动时报"未正确关闭"，收拾不干净反而更乱）。
+        let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+        let dormant = wanted.filter { !running.contains($0) }
+        if !dormant.isEmpty, !confirmProbingDormantBrowsers(Array(dormant).sorted()) {
+            wanted.subtract(dormant)
+            guard !wanted.isEmpty else { return }
+        }
+        // 这一轮被撇下（要么家长选了「只处理已打开的」，要么原本就没打算处理）的部分。
+        // 结果回写时要在 automationDeniedBundleIDs 里原样保留它们此刻的状态——不属于
+        // originalWanted 范围的本来就不该碰，属于但被撇下的也不该被这轮"没问出结果"
+        // 抹成"已解决"。
+        let carriedOver = automationDeniedBundleIDs.intersection(originalWanted.subtracting(wanted))
+
+        // Firefox 系必须走另一条路：probeAutomation 第一步就要在 supportedBrowsers 里查
+        // 方言，查不到会直接返回 .unknown，被下面记成 noRecord——于是家长收到一句"系统没有
+        // 弹出授权询问"，而实际上询问弹过了、也授权成功了，只是 Firefox 本来就给不出网址。
+        // 这个坑 warmAutomationConsentIfNeeded 里已经踩过并注释过一次，这里沿用同一套分流。
+        let titleOnly = Set(BigDaddyClient.installedTitleOnlyBrowsers())
+        let titleTargets = Array(wanted.intersection(titleOnly)).sorted()
+        let targets = Array(wanted.subtracting(titleOnly)).sorted()
 
         let client = self.client
+        let warmedKey = Self.warmedAutomationTargetsKey
         DispatchQueue.global(qos: .userInitiated).async { [weak self, client] in
             // 必须把"有记录、被拒"和"根本没有记录"分开：系统设置的自动化面板只列出
             // **已经产生过 TCC 记录**的 App，没有记录的话那个面板里连 BigDaddy 这一栏
             // 都不存在，把用户送过去只会让他对着一个空列表发懵。
             var denied: [String] = []      // -1743：有记录、用户拒过 → 去设置里勾
             var noRecord: [String] = []    // -1744/其他：没有记录 → 去设置没用
+            // 真的问出了结果的那些。没能问成的（浏览器最终也没起来）不记账——把一次临时
+            // 失败记成"这个浏览器不用再问了"，等于把它永久排除在补授权入口之外。
+            var asked: [String] = []
             // 探测顺手读到的真实网址，用来把"已生效"从一句断言变成一个可核对的事实。
             // 这里只留 bundle id，浏览器显示名回到主线程再解析（NSWorkspace 查询是
             // 主线程隔离的）。
@@ -4002,14 +4160,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 case .notDetermined, .unknown:
                     noRecord.append(bundleID)
                 }
+                asked.append(bundleID)
             }
+            // 标题型浏览器只负责把授权框问出来，**不参与** denied/noRecord 的判定：
+            // 那两个集合驱动的是「浏览器网址未授权」这条待办，而 Firefox 无论授权与否
+            // 都给不出网址，混进去就是给家长派一件做不完的活。
+            for bundleID in titleTargets {
+                client.warmTitleAutomation(bundleID: bundleID)
+                asked.append(bundleID)
+            }
+            // 记一笔"问过了"，这条按钮才有终点：neverAskedBrowsers 靠这份名单收敛，
+            // 不记账的话菜单里那条补授权入口会永远挂着，点进去还是同一批浏览器。
+            let alreadyWarmed = Set(UserDefaults.standard.stringArray(forKey: warmedKey) ?? [])
+            UserDefaults.standard.set(Array(alreadyWarmed.union(asked)), forKey: warmedKey)
             // 跨线程边界前定格成不可变副本：直接捕获上面那三个 var，编译器无法证明
             // "派发之后不会再被改"，Swift 6 下会直接判成错误（旧版编译器只给警告）。
             let (finalDenied, finalNoRecord, finalEvidence) = (denied, noRecord, evidence)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                self.automationDeniedBundleIDs = Set(finalDenied + finalNoRecord)
+                // 只替换 originalWanted 这个范围内的条目，范围外的（比如另一个完全无关、
+                // 早就记在案的被拒浏览器）原样保留。这不是可选的严谨——performAutomationProbe
+                // 现在有两个调用方，其中 authorizeAllBrowserAutomation 传入的 originalWanted
+                // 只是绑定清单那一行涉及的一两个浏览器，如果这里改回"整体赋值"，
+                // 会把 automationDeniedBundleIDs 里跟这次无关的其它待办一并冲掉——家长刚
+                // 点了「去授权 Chrome」，某个早就被拒、这次根本没涉及的 Edge 却从菜单上
+                // 的待办列表里凭空消失了，权限其实还缺着。
+                self.automationDeniedBundleIDs = self.automationDeniedBundleIDs
+                    .subtracting(originalWanted)
+                    .union(finalDenied)
+                    .union(finalNoRecord)
+                    .union(carriedOver)
                 self.rebuildMenu()
+                // 判据只看**这一轮真的问过的**结果：carriedOver 是家长自己选择撇下的，
+                // 拿它去否定"刚问的这几个都通了"这个事实，只会让弹窗说一句和家长刚看到的
+                // 系统框对不上的话。它该起作用的地方是上面那笔集合赋值（菜单里的待办
+                // 因此继续挂着），不是这里的措辞。
                 if finalDenied.isEmpty && finalNoRecord.isEmpty {
                     self.automationNoticeShownAt.removeAll()
                     self.showAutomationGranted(evidence: finalEvidence)
@@ -4022,6 +4207,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 }
             }
         }
+    }
+
+    /// 探测没在运行的浏览器之前，先把"它们会被打开"这件事说在前面。
+    ///
+    /// 这不是可选的礼貌。macOS 只在目标 App 运行时才会弹自动化授权框，而让它运行起来的
+    /// 唯一办法就是给它发事件——`tell application id` 发出去，LaunchServices 就会把它启动。
+    /// 也就是说"给没开着的浏览器补授权"和"这个浏览器会被打开"是同一件事的两面，做不到
+    /// 只要前者。既然躲不掉，就不能让它悄悄发生：一台以信任为前提的机器上，程序自己开起来
+    /// 而没有任何解释，是最容易被理解成"中毒了"的一幕。
+    ///
+    /// 「只处理已打开的」这条路必须留着：家长完全可能只想把眼前开着的 Chrome 弄好，
+    /// 剩下的等孩子日后自己打开时再说。菜单里那条入口不会因此消失（neverAskedBrowsers
+    /// 只有真的问过才收敛），所以这条路不是死胡同。
+    private func confirmProbingDormantBrowsers(_ bundleIDs: [String]) -> Bool {
+        let names = bundleIDs.map { Self.browserDisplayName(forBundleID: $0) }.joined(separator: "、")
+        let alert = NSAlert()
+        applyShieldIcon(to: alert)
+        alert.messageText = Localization.string(
+            zh: "\(names) 现在没有运行",
+            en: "\(names) isn't running right now"
+        )
+        alert.informativeText = Localization.string(
+            zh: "网址读取权限是按「BigDaddy × 每个浏览器」逐对授权的，而系统只在那个浏览器**正在运行**时才会弹出询问框。\n\n继续的话，macOS 会在询问前把 \(names) 打开（这是发送授权请求本身的固有行为）。它们打开后不会被自动关闭，您可以随时自己关掉。\n\n也可以选择「只处理已打开的」：\(names) 会等孩子下次真正使用它们时再询问一次，菜单栏的盾牌里也一直留着这个补授权入口。",
+            en: "URL access is granted per pair (BigDaddy × each browser), and macOS only shows the prompt while that browser is actually running.\n\nIf you continue, macOS will open \(names) before asking — that's inherent to sending the authorization request. They won't be closed automatically afterwards; you can quit them whenever you like.\n\nYou can also choose “Only what's open”: \(names) will be asked about the next time your child actually uses them, and the shield menu keeps this button available in the meantime."
+        )
+        alert.addButton(withTitle: Localization.string(zh: "继续并打开", en: "Continue and Open"))
+        alert.addButton(withTitle: Localization.string(zh: "只处理已打开的", en: "Only What's Open"))
+        // LSUIElement 的进程不会自动成为前台应用，不抢一次焦点的话这个弹窗会开在所有
+        // 窗口后面——家长点了菜单却什么都没看到（同 promptWebFilterApprovalIfNeeded）。
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// 授权走通后的确认框。
