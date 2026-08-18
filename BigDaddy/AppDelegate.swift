@@ -377,7 +377,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.alertStyle = .warning
         alert.messageText = Localization.string(zh: "设备凭据失效", en: "Device Credentials Invalid")
         alert.informativeText = Localization.string(
-            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长端会显示设备离线。\n\n恢复方法：请家长在仪表盘中点击「重新授权」按钮，设备将在 1 分钟内自动恢复。",
+            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长端会显示设备离线。\n\n恢复方法：请家长在家长中心中点击「重新授权」按钮，设备将在 1 分钟内自动恢复。",
             en: "This Mac's device key no longer matches the server record (usually after reinstalling or switching client builds). Guardian data cannot be reported and the dashboard will show this device as offline.\n\nTo recover: tap the \"Re-authorize\" button on the parent dashboard. The device will automatically recover within 1 minute."
         )
         alert.runModal()
@@ -460,7 +460,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if client.credentialsInvalid {
             let credentialItem = NSMenuItem(
                 title: Localization.string(
-                    zh: "⚠️ 设备凭据需要重新授权：请家长在仪表盘点击「重新授权」",
+                    zh: "⚠️ 设备凭据需要重新授权：请家长在家长中心点击「重新授权」",
                     en: "⚠️ Credentials need re-authorization: tap \"Re-authorize\" on the dashboard"
                 ),
                 action: nil, keyEquivalent: ""
@@ -549,7 +549,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
 
         // 限网仍在生效、但连不上家长服务器太久了：纯提示，没有可点的动作（不该有——
-        // 解除只能由家长在仪表盘操作，这台 Mac 上没有任何按钮该让孩子拿到"自己解除"
+        // 解除只能由家长在家长中心操作，这台 Mac 上没有任何按钮该让孩子拿到"自己解除"
         // 的能力），所以是禁用项，和上面的时间约定剩余读数同一个写法。
         if isWebFilterUnreachableWhileRestricting {
             let item = NSMenuItem(
@@ -575,7 +575,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         //
         // 出现条件里**刻意不带 screenshotEnabled**，这一条是"绑定时索取、被拒后退回菜单"
         // 这条链路上最大的一个断点：家长在绑定自检里对屏幕录制点了拒绝时，截图功能通常
-        // 还没打开（它默认关着、要家长日后在仪表盘上开），于是这条菜单项不出现；而 macOS
+        // 还没打开（它默认关着、要家长日后在家长中心上开），于是这条菜单项不出现；而 macOS
         // 的 TCC 一旦记下"拒绝"就**不会再弹第二次系统框**，补授权只剩"自己去系统设置里翻"
         // 这一条路。也就是说，在最需要这个入口的那段时间里它恰好不存在；等家长日后打开
         // 截图、入口终于冒出来时，人往往已经不在孩子那台机器跟前了。
@@ -698,7 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let continuityOn = client.config.continuityMode && ContinuityModePreference.isEnabled
         let continuityItem = NSMenuItem(
             title: Localization.string(
-                zh: continuityOn ? "崩溃后自动恢复（家长已开启）" : "崩溃后自动恢复（由家长在仪表盘开启）",
+                zh: continuityOn ? "崩溃后自动恢复（家长已开启）" : "崩溃后自动恢复（由家长在家长中心开启）",
                 en: continuityOn ? "Relaunch After Crash (Parent Enabled)" : "Relaunch After Crash (Enable on Parent Dashboard)"
             ),
             action: continuityOn ? #selector(disableContinuityWithVerification) : nil,
@@ -1239,7 +1239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         Task { [weak self] in await self?.pollConfigForChildVisibility() }
     }
 
-    /// 展示绑定码/二维码后启动的一段高频探测：绑定在服务端完成（家长在仪表盘或本机输码），
+    /// 展示绑定码/二维码后启动的一段高频探测：绑定在服务端完成（家长在家长中心或本机输码），
     /// 用它把"绑定成功"的反馈从最长 60s 压到约 3s。轮询用普通 async（弹窗已关闭，运行循环
     /// 正常），检测到 bound=true 立即刷新配置、重建菜单并弹成功提示；最多探测 2 分钟。
     private func startBindDetectionBurst() {
@@ -1773,7 +1773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         return timer
     }
 
-    /// 只重排"定时截图"这一个计时器：家长在仪表盘改了截图间隔后，运行期配置轮询
+    /// 只重排"定时截图"这一个计时器：家长在家长中心改了截图间隔后，运行期配置轮询
     /// （pollConfigForChildVisibility）需要单独把它按新间隔重排，而不必连带把心跳/命令
     /// 轮询的自重排一次性打断——那些跟截图间隔无关。
     private func scheduleScreenshotTimer() {
@@ -1914,26 +1914,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if boundChanged {
                 // 心跳/命令轮询的节奏依赖 bound，翻转后立即切换调度
                 scheduleTimers()
-                // 家长在仪表盘侧完成绑定（未经过本机 startBindDetectionBurst 那条路径时）
+                // 家长在家长中心侧完成绑定（未经过本机 startBindDetectionBurst 那条路径时）
                 // 也要强制恢复开机自启，抵消未绑定期间可能的关闭
                 if client.config.bound {
                     enforceLaunchAtLoginOnBind()
                     warmAutomationConsentIfNeeded()
                 }
             } else if client.config.screenshotIntervalMins != intervalBefore {
-                // 关键修复：家长在仪表盘改了截图间隔后，之前这里只更新了 config 值、
+                // 关键修复：家长在家长中心改了截图间隔后，之前这里只更新了 config 值、
                 // 却没有重排 screenshotTimer，导致定时截图仍按旧间隔触发——"关于"窗口
-                // 显示的新间隔与实际截图节奏对不上，家长以为客户端没遵循仪表盘设置。
+                // 显示的新间隔与实际截图节奏对不上，家长以为客户端没遵循家长中心设置。
                 // 现在检测到间隔变化就按新值重排这一个计时器。
                 scheduleScreenshotTimer()
                 AuditLog.record("SCREENSHOT_INTERVAL_UPDATED mins=\(client.config.screenshotIntervalMins) source=remote")
             }
             if boundChanged && !client.config.bound {
-                AuditLog.record("DEVICE_UNBOUND 家长已在仪表盘解除本设备的守护关系")
+                AuditLog.record("DEVICE_UNBOUND 家长已在家长中心解除本设备的守护关系")
                 postLocalNotice(
                     title: Localization.string(zh: "守护关系已解除", en: "Guardian binding removed"),
                     body: Localization.string(
-                        zh: "家长已在仪表盘解绑本设备，守护采集已停止。可随时重新绑定。",
+                        zh: "家长已在家长中心解绑本设备，守护采集已停止。可随时重新绑定。",
                         en: "Your parent unbound this Mac on the dashboard; guardian reporting has stopped. You can re-bind at any time."
                     )
                 )
@@ -2040,11 +2040,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 只记"服务端已不再报告这个约定"这个客户端真正观测到的事实，不写原因。
                 //
                 // 客户端在这里**无法区分**两种成因，它们在本地看来完全同形（会话凭空消失、
-                // 且没有本地归零事件）：① 家长在仪表盘主动中断；② 约定在 Mac 睡眠期间
+                // 且没有本地归零事件）：① 家长在家长中心主动中断；② 约定在 Mac 睡眠期间
                 // 自然到点——睡眠时 1 秒 tick 不运行，本地永远没机会判归零，醒来时服务端
                 // 早已清掉了它。此前这里写死 CANCELLED，等于把情况 ② 在孩子可见的守护记录
                 // 里谎报成"家长中断了约定"。准确的成因（TIMER_EXPIRED / TIMER_CANCELLED）
-                // 由服务端审计流水记录、在家长仪表盘里可查，本机记录只需诚实描述所见。
+                // 由服务端审计流水记录、在家长家长中心里可查，本机记录只需诚实描述所见。
                 AuditLog.record("TIME_SESSION_ENDED source=remote 服务端已不再报告进行中的约定")
             }
         }
@@ -2284,7 +2284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     self.postLocalNotice(
                         title: Localization.string(zh: "绑定信息已复制", en: "Binding info copied"),
                         body: Localization.string(
-                            zh: "发送给家长，家长在仪表盘输入绑定码即可完成绑定。",
+                            zh: "发送给家长，家长在家长中心输入绑定码即可完成绑定。",
                             en: "Send it to your parent — they can finish binding by entering the code on the dashboard."
                         )
                     )
@@ -2552,7 +2552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     @objc private func sendScreenshotNow() {
         // 同 pollCommands 里对"测试截图命令"的处理：本机菜单栏/"关于"窗口的"测试截图"
         // 是另一条完全独立、不经过后端命令通道的路径，之前没有同步刷新配置。如果刚在
-        // 仪表盘保存了新的压缩质量/截图宽度就立刻在孩子的 Mac 上点这个按钮测试，客户端
+        // 家长中心保存了新的压缩质量/截图宽度就立刻在孩子的 Mac 上点这个按钮测试，客户端
         // 手上可能还是保存前的旧配置（最长要等 60 秒的配置轮询才会同步），效果对不上。
         Task {
             _ = await client.refreshConfig()
@@ -2768,7 +2768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// 家长把客户端装到了自己的电脑上时的自助纠错。只在未绑定态提供——一旦绑定过，
-    /// 纠错就得走仪表盘解绑（会永久删除该设备历史），那条路必须由家长在仪表盘上走，
+    /// 纠错就得走家长中心解绑（会永久删除该设备历史），那条路必须由家长在家长中心上走，
     /// 这里给不了捷径。
     @objc private func showWrongMacHelp() {
         // dashboardBaseURL 指向的是 dashboard 子域名（默认 dashboard.bigdaddy.mom），
@@ -2802,9 +2802,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             1. 在这台（你自己的）电脑上，把 BigDaddy 从「应用程序」里删掉就行。
             2. 到孩子的那台 Mac 上打开 \(marketingHost)，在那台电脑上下载安装。
             3. 装好后点它的菜单栏图标，拿到 6 位数字。
-            4. 回到你自己的设备上，登录仪表盘，把那 6 位数字输进去。
+            4. 回到你自己的设备上，登录家长中心，把那 6 位数字输进去。
 
-            简单说：软件装在被守护的那台电脑上，你自己只要能打开仪表盘就够了。
+            简单说：软件装在被守护的那台电脑上，你自己只要能打开家长中心就够了。
             """,
             en: """
             BigDaddy on this Mac isn't linked to anyone yet, so it hasn't recorded a thing. Quit it and delete it now and nothing is left behind.
@@ -2964,7 +2964,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// 关闭连续性模式：菜单不能打开它（只由家长配置下发），关闭与开机自启一样走验证码。
-    /// 本机覆盖会挡住家长配置，直到家长在仪表盘把连续性关掉再打开。
+    /// 本机覆盖会挡住家长配置，直到家长在家长中心把连续性关掉再打开。
     @objc private func disableContinuityWithVerification() {
         guard client.config.bound else {
             ContinuityModePreference.isEnabled = false
@@ -3822,7 +3822,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 三种情况收进一个枚举，是因为同一个判断要出现在四个地方（菜单栏图标、菜单项、
     /// "关于"窗口、引导弹窗）。此前只有"待批准"一种被处理，另外两种——激活失败、
     /// 以及扩展被人从系统设置里关掉——在客户端这边完全静默：图标不变、菜单里没有入口、
-    /// "关于"窗口里也没有，家长唯一可能察觉的途径是自己打开仪表盘看到一行红字。
+    /// "关于"窗口里也没有，家长唯一可能察觉的途径是自己打开家长中心看到一行红字。
     /// 而这两种恰恰是"配置了但实际不生效"，跟屏幕录制缺权限属于同一类问题，理应用
     /// 同一套视觉语言提醒。
     enum WebFilterAttention: Equatable {
@@ -3844,7 +3844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             return .failed(message)
         case .unavailable:
             // 这台机器上压根没装出扩展（打包/安装问题），家长去系统设置里也找不到
-            // 任何可开的东西，指过去只会让他白跑一趟。仪表盘上仍会显示"系统扩展不可用"。
+            // 任何可开的东西，指过去只会让他白跑一趟。家长中心上仍会显示"系统扩展不可用"。
             return .none
         case .activationRequested, .approved, .configurationEnabled, .restartRequired:
             return webFilterController.isSystemFilterDisabledExternally ? .disabledExternally : .none

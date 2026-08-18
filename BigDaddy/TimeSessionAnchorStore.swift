@@ -6,7 +6,7 @@ import Foundation
 /// timeSession 的那段注释；这里存的 wallDeadline 是绝对墙钟时刻，跨越关机一整晚这类
 /// 不可知时长依然成立，才是能安全恢复的原因。
 ///
-/// 与 ConfigStore 分开落盘：ConfigStore 落的是服务端策略本身（家长在仪表盘配的一切），
+/// 与 ConfigStore 分开落盘：ConfigStore 落的是服务端策略本身（家长在家长中心配的一切），
 /// 这里落的是本地派生量，混在一起会让"这个值到底谁写的、谁读的、多久失效"变得含糊。
 struct PersistedTimeSessionAnchor: Codable {
     let sessionId: String

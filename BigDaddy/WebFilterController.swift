@@ -116,7 +116,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     /// BigDaddyService#applyWebLockdownOverride），调用方不需要、也不应该知道是谁触发的。
     ///
     /// 黑名单为空时即使 enabled=true 也不算"正在限制"——那种情况下什么都拦不住，
-    /// 显示"受限"会是一句谎言（与仪表盘 currentlyWebFilterOnEmpty 同一条纪律）。
+    /// 显示"受限"会是一句谎言（与家长中心 currentlyWebFilterOnEmpty 同一条纪律）。
     ///
     /// 注意这里只反映"策略意图"，不等于"扩展真的在拦"：扩展被人从系统设置里关掉时
     /// （isSystemFilterDisabledExternally），这个属性依然会是 true。调用方（AppDelegate）

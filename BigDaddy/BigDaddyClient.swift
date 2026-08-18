@@ -48,7 +48,7 @@ enum ConfigRefreshResult: Equatable {
     }
 }
 
-/// 时间约定：家长在仪表盘给孩子设定的一段可用时长，权威状态随 ConfigResponse.timeSession
+/// 时间约定：家长在家长中心给孩子设定的一段可用时长，权威状态随 ConfigResponse.timeSession
 /// 下发（nil = 当前没有进行中的约定）。只做墙钟模式——remainingSeconds 是**服务端在响应
 /// 那一刻**算出的剩余秒数，客户端把它加到本机单调时钟（ProcessInfo.systemUptime）上得出
 /// 本地截止点，孩子改系统时间不影响倒计时。客户端不上报任何计时事件，"到点"完全由服务端
@@ -204,7 +204,7 @@ final class BigDaddyClient: @unchecked Sendable {
     static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
 
     let baseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")!
-    /// 家长仪表盘地址：正式 .app 由打包脚本写入 Info.plist（BigDaddyDashboardBaseURL），
+    /// 家长家长中心地址：正式 .app 由打包脚本写入 Info.plist（BigDaddyDashboardBaseURL），
     /// 裸二进制（swift run / Xcode 直接运行）退回本地 dashboard 开发端口。
     let dashboardBaseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyDashboardBaseURL") as? String ?? "http://localhost:4000")!
     let identity: DeviceIdentity
@@ -1646,7 +1646,7 @@ final class BigDaddyClient: @unchecked Sendable {
         return NSBitmapImageRep(cgImage: scaled)
     }
 
-    /// 按家长在仪表盘选的压缩质量档位（30/40/50/65/80%）直接编码，不再事后偷偷改档。
+    /// 按家长在家长中心选的压缩质量档位（30/40/50/65/80%）直接编码，不再事后偷偷改档。
     ///
     /// 这里原来有一个"目标字节数"上限（300KB），超出就一路把 quality 往下砍到满足为止。
     /// 问题是：真实截图（代码编辑器、文字密集的界面）远比纯色测试图复杂，在"截图最大
@@ -1837,7 +1837,7 @@ final class BigDaddyClient: @unchecked Sendable {
         // 逐条 ack 但只需要刷新一次配置，不必每条各刷一次。
         let timeSessionCommands = response.data.filter { $0.type == "SYNC_TIME_SESSION" }
         let configCommands = response.data.filter { $0.type == "SYNC_CONFIG" }
-        // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在仪表盘改完压缩质量/
+        // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在家长中心改完压缩质量/
         // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
         // 可能落后 60 秒配置轮询）的旧配置，家长对比时就会觉得"改了质量没区别/压缩没生效"。
         let refreshResult: ConfigRefreshResult?
@@ -1879,7 +1879,7 @@ final class BigDaddyClient: @unchecked Sendable {
         }
     }
 
-    /// 旗帜首次在孩子屏幕上下拉展示后的回执，供家长在仪表盘确认"孩子真的看到了"
+    /// 旗帜首次在孩子屏幕上下拉展示后的回执，供家长在家长中心确认"孩子真的看到了"
     /// （三步走的第三步）。刻意 fire-and-forget：不解析响应、失败也不重试——旗帜每次
     /// 下拉都会打一发（见 AppDelegate 的里程碑排程），单次没送达不影响后续里程碑
     /// 继续尝试，且后端只记第一次，多打几次并无副作用。
@@ -1890,7 +1890,7 @@ final class BigDaddyClient: @unchecked Sendable {
 
     /// 孩子在到点提醒上点了「我知道了」。与 shown 的回执是两件事：shown 只说明旗帜
     /// 显示过（电脑前可能没人），这一条说明孩子本人此刻就在、并且亲手关掉了提醒。
-    /// 后端据此写一条 TIMER_ACKNOWLEDGED 审计，家长在仪表盘能看到。
+    /// 后端据此写一条 TIMER_ACKNOWLEDGED 审计，家长在家长中心能看到。
     ///
     /// 同样 fire-and-forget：孩子已经点过按钮、面板也已经收回，这是既成事实；为了一条
     /// 回执把界面卡住或弹错误提示，只会让孩子觉得"这个按钮点了没用"。真丢了就丢了，
@@ -1993,7 +1993,7 @@ final class BigDaddyClient: @unchecked Sendable {
         // 而它一旦解析失败会把已在后端提交成功的绑定误报成失败（传输错误由上面的 try 单独抛出）
         guard let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data) else {
             throw BigDaddyServerError(message: Localization.string(
-                zh: "服务器响应无法解析，请稍后在仪表盘确认绑定状态",
+                zh: "服务器响应无法解析，请稍后在家长中心确认绑定状态",
                 en: "Unable to parse server response. Please check binding status on the dashboard."
             ))
         }

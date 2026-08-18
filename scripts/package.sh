@@ -212,7 +212,7 @@ fi
 
 codesign --verify --deep --strict --verbose=2 "${APP_DIR}"
 
-# 签完立刻回读一次：这条 entitlement 一旦丢失，症状要等到用户装上正式版、家长在仪表盘上
+# 签完立刻回读一次：这条 entitlement 一旦丢失，症状要等到用户装上正式版、家长在家长中心上
 # 看到"网址未授权"才暴露，代价太高。构建期一行断言就能挡住。
 #
 # 直接在原始 XML 上做子串匹配，不经过 plutil -p 转成人类可读格式再解析——`codesign -d
