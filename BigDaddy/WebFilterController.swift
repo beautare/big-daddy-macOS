@@ -453,21 +453,6 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             return
         }
         configurationUpdateInFlight = true
-
-        // 抄近路：下面这条 NEFilterManager.saveToPreferences() → provider 的
-        // filterConfiguration KVO 管线是系统自己的配置分发路径，实测把新策略真正送到
-        // 一个已经在跑的 provider 进程可能要一两分钟——跟"家长打开限制、孩子的浏览器
-        // 应该立刻被掐断"差得远。主 App 手上此刻已经有这份策略，没理由干等，直接经
-        // 同一个 mach service 推一份过去（见 FilterDataProvider.applyPolicy 的注释）。
-        //
-        // provider 不在线时（还没激活、或系统扩展被人关掉）这次推送单纯失败，无副作用——
-        // 下面走 NEFilterManager 的那条路仍然是权威的、扛得住 provider 重启的持久化路径，
-        // 推送只是它的加速通道，不是替代品。
-        //
-        // 直接调、不包 Task：pushPolicy 本身不阻塞（XPC 单向发出，不等回复），而"发出顺序
-        // 必须等于调用顺序"是这条通道正确性的前提，见 pushPolicy 的注释。
-        providerConnection.pushPolicy(currentPolicy)
-
         let manager = NEFilterManager.shared()
         manager.loadFromPreferences { [weak self] error in
             Task { @MainActor [weak self] in

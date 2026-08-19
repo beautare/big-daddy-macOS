@@ -1,4 +1,7 @@
 import Foundation
+// Network 与 NetworkExtension 各有一个叫 NWEndpoint 的类型（前者是 Swift 枚举，后者是
+// 已废弃的类），isLikelyQUIC 里两个都要用到，所以那里一律写全限定名。
+import Network
 import NetworkExtension
 
 /// 域名级内容过滤。
@@ -24,17 +27,19 @@ import NetworkExtension
 /// 跟踪表，正是限制打开那一秒能立刻掐断 YouTube 的全部依仗（见
 /// WebFilterController.shouldRunContentFilter）。
 ///
+/// 3. 域名黑名单对 HTTP/3 天然无效——QUIC 的 ClientHello 整个是加密的，SNI 读不出来。
+///    抓手是把认出来的 QUIC 流掐掉，逼浏览器回落到握手明文的 TCP+TLS。这个"认出来"
+///    本来完全押在系统的远端端点 API 上（isLikelyQUIC），那个 API 静默失效过两次
+///    （macOS 15 废弃 remoteEndpoint，换成 remoteFlowEndpoint 之后依然会取不到值），
+///    没有任何报错，只会表现成"有的网站拦得住、有的怎么都拦不住"——实测正是这样：
+///    bilibili（TCP）秒拦，youtube（HTTP/3）想看多久看多久。所以现在主判据换成了
+///    QUICPacket.looksLikeQUIC，直接读 QUIC 长包头的字节特征，不问系统；isLikelyQUIC
+///    降级成兜底信号。见 QUICPacket 和 isLikelyQUIC 各自的注释。
+///
 /// 一条贯穿全文件的原则：**认不出来一律放行**。误拦会毫无征兆地掐断孩子电脑上任意一个
 /// 程序的网络，代价远大于漏拦一次。唯一的例外是生效期间判不出主机名的 UDP 443（QUIC），
 /// 见 handleNewFlow 里的说明。
 final class FilterDataProvider: NEFilterDataProvider {
-
-    /// 一份策略是从哪条通道来的。两条通道的可信度不同——系统配置是现读的当前值，推送是
-    /// 发送方在发送时刻抓的快照——所以落地时的处理也不同，见 applyPolicy。
-    private enum PolicySource: String {
-        case systemConfiguration
-        case push
-    }
 
     /// 一条正在跟踪的连接。放行之后仍然留着，好在策略变严时把它掐断。
     private final class TrackedFlow {
@@ -47,6 +52,9 @@ final class FilterDataProvider: NEFilterDataProvider {
         var handshake = Data()
         /// 记账序号，越大越新。只用来在跟踪表满了的时候挑最老的淘汰，别的地方不该看它。
         let sequence: UInt64
+        /// 从这条流的出站字节里认出过 QUIC。必须记下来：识别只在攒握手包那一小段窗口里
+        /// 发生，而"策略变严时该不该掐掉它"是日后才问的问题，那时原始字节早清掉了。
+        var sawQUIC = false
 
         init(flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool, sequence: UInt64) {
             self.flow = flow
@@ -111,13 +119,6 @@ final class FilterDataProvider: NEFilterDataProvider {
     }()
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
-        // 必须在 ipcListener?.start() 之前接上：listener 一旦 resume()，理论上就可能立刻
-        // 收到主 App 的 applyPolicy 调用（尤其是主 App 恰好在这个 provider 刚起来时重推
-        // 策略的场景）。闭包捕获 weak self 而不是让 IPC 层直接持有 trackedFlows/policyLock，
-        // 见 WebFilterProviderIPCListener.onPolicyPushed 的注释。
-        ipcListener?.onPolicyPushed = { [weak self] policy in
-            self?.applyPolicy(policy, from: .push)
-        }
         ipcListener?.start()
         configurationObservation = observe(\.filterConfiguration, options: [.new]) { [weak self] _, _ in
             self?.reloadPolicy()
@@ -133,10 +134,10 @@ final class FilterDataProvider: NEFilterDataProvider {
         configurationObservation = nil
         policyLock.lock()
         trackedFlows.removeAll()
-        // 策略一并清回默认值。provider 进程未必随过滤停止而退出，而"停掉再开"之间这台
-        // 机器可能已经换了家庭：解绑会让后端删掉设备行、级联重建配置，webFilterRevision
-        // 从 0 重新开始。不清的话，推送通道的 revision 守卫会拿旧家庭的高水位去挡新家庭的
-        // 策略（见 WebFilterPolicyReplacement）。清掉之后水位归零，两条通道都能正常落地。
+        // 策略一并清回默认值：被叫停之后就不该再留着一份"要拦什么"的记忆。provider 进程
+        // 未必随过滤停止而退出，而"停掉再开"之间这台机器可能已经换了家庭（解绑会让后端删掉
+        // 设备行、级联重建配置）。下次 startFilter 会走 reloadPolicy 重新读，不依赖这里留下
+        // 的任何东西。
         policy = Self.emptyPolicy
         policyLock.unlock()
         completionHandler()
@@ -204,7 +205,16 @@ final class FilterDataProvider: NEFilterDataProvider {
         // Chrome / Arc / Firefox 留了一条完全绕过限制的通道——实测正是这条通道让
         // "已生效，正在阻断"变成了一句空话。代价是这台 Mac 上其它程序的 QUIC 也会被
         // 掐，绝大多数会静默回落到 TCP。只在策略真正启用时才这么做。
-        if policy.enabled, isLikelyQUIC(socketFlow) {
+        //
+        // 判据以**包内容**为准（QUICPacket），系统给的 UDP/443 只当补充信号：那套端点
+        // API 已经静默失效过两次，不能再让整条 HTTP/3 防线单独押在它上面。
+        let quic = QUICPacket.looksLikeQUIC(handshake) || isLikelyQUIC(socketFlow)
+        if quic {
+            policyLock.lock()
+            trackedFlows[key]?.sawQUIC = true
+            policyLock.unlock()
+        }
+        if policy.enabled, quic {
             forget(key)
             return .drop()
         }
@@ -243,51 +253,38 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     // MARK: - 策略
 
-    /// 从系统的 vendorConfiguration 里重读策略——filterConfiguration 的 KVO 触发的那条路，
-    /// 也是 startFilter 里的初次加载。这条路径权威、但慢（见 applyPolicy 的注释），一份
-    /// 策略最终一定会经这里落地一次，哪怕更快的推送通道已经先应用过了。
+    /// 从系统的 vendorConfiguration 里重读策略并落地：filterConfiguration 的 KVO 触发的那条
+    /// 路，也是 startFilter 里的初次加载。这是策略进入 provider 的**唯一**入口。
+    ///
+    /// 曾经并行存在过一条"主 App 经 XPC 直接推策略"的加速通道，理由是"系统这条分发管线要
+    /// 一两分钟"。那个判断后来被证伪了——真正让限制迟迟不生效的是 HTTP/3 绕过（见
+    /// isLikelyQUIC），跟策略送达速度无关。加速通道因此连同它带来的一整套东西（可写的 XPC
+    /// 端点、新旧策略守卫、来源区分）一起撤掉了：没有实测支撑的复杂度，在监护类产品里是负资产。
+    /// 真要再引入，先拿下面那行日志量出系统这条路的实际延迟，用数据说话。
     private func reloadPolicy() {
         let nextPolicy = WebFilterPolicyTransport.policy(from: filterConfiguration.vendorConfiguration)
             ?? Self.emptyPolicy
-        applyPolicy(nextPolicy, from: .systemConfiguration)
-    }
 
-    /// 落地一份新策略，不管它是从哪条路来的：reloadPolicy 读到的系统配置，还是主 App
-    /// 经 ipcListener.onPolicyPushed 直接推过来的（见 WebFilterController.enableContentFilter
-    /// 里"抄近路"那段注释）。两条路最终都收敛到这一个方法，"哪些已跟踪的流该被掐断"这套
-    /// 判定只写一遍，也只在一处发回执。
-    ///
-    /// 推送通道**假设**存在的理由：NEFilterManager.saveToPreferences() 之后，新配置要走系统
-    /// 自己的分发管线才能传到这个已经在跑的 provider 进程、触发 filterConfiguration 的 KVO，
-    /// 而这一步可能慢到一两分钟——"家长打开限制、孩子的浏览器立刻被掐断"等不起。主 App 手上
-    /// 已经有同一份策略，直接经 mach service 推一份过来，一次 XPC 投递就能生效。
-    ///
-    /// **注意"可能慢到一两分钟"目前只是推断，还没有被实测证实。** 下面那行 NSLog 就是为了
-    /// 证实或推翻它而存在的：真机上比较 source=push 与 source=systemConfiguration 两条记录
-    /// 的时间差，才知道这条加速通道到底是不是对症的药。读数怎么解释见那行注释。
-    ///
-    /// 两条路最终都收敛到这一个方法，"哪些已跟踪的流该被掐断"这套判定只写一遍，也只在一处
-    /// 发回执。重复应用同一份策略是幂等的：nextPolicy 与已经生效的 policy 结构相同时，下面
-    /// 的判定不会产生任何新的掐断动作。
-    private func applyPolicy(_ nextPolicy: WebFilterPolicySnapshot, from source: PolicySource) {
         policyLock.lock()
-        // 守卫只套在推送上。系统配置那条路是**现读**当前值，结构上不可能陈旧，挡它只会
-        // 制造故障（换家庭后 revision 回到 0 那种），详见 WebFilterPolicyReplacement。
-        if source == .push,
-           !WebFilterPolicyReplacement.shouldReplace(current: policy, incoming: nextPolicy) {
-            policyLock.unlock()
-            NSLog("BigDaddyWebFilter: ignored stale pushed policy revision \(nextPolicy.revision)")
-            return
-        }
         policy = nextPolicy
         var flowsToDrop: [NEFilterSocketFlow] = []
+        // udp / quic 这两个计数是给 isLikelyQUIC 用的体检指标，不是凑热闹：它依赖的远端
+        // 端点 API 在新系统上可能拿不到值，而那会静默地让 HTTP/3 完全绕过限制。跟踪表里
+        // 明明有 UDP 流、认出来的 QUIC 却是 0，就是那个故障的确诊信号。
+        var udpCount = 0
+        var quicCount = 0
         for (key, tracked) in trackedFlows {
             // 主机名优先用已经认出来的那个；没有就再问一次系统——remoteHostname 可能
             // 在 handleNewFlow 之后才被填上，当场重读能让这类流赶上这次策略变化。
             let hostname = tracked.hostname ?? systemHostname(for: tracked.flow)
+            // sawQUIC 优先：那是从字节里认出来的、板上钉钉的结论，而 isLikelyQUIC 依赖的
+            // 系统端点 API 随时可能取不到值（已经发生过两次）。
+            let quic = tracked.sawQUIC || isLikelyQUIC(tracked.flow)
+            if tracked.flow.socketProtocol == IPPROTO_UDP { udpCount += 1 }
+            if quic { quicCount += 1 }
             let shouldDrop = WebFilterFlowDisposition.shouldTerminate(
                 hostname: hostname,
-                isLikelyQUIC: isLikelyQUIC(tracked.flow),
+                isLikelyQUIC: quic,
                 under: nextPolicy
             )
             if shouldDrop {
@@ -302,23 +299,23 @@ final class FilterDataProvider: NEFilterDataProvider {
             update(flow, using: .drop(), for: .any)
         }
 
-        // 这一行是给"限制打开之后到底卡在哪一步"用的量尺，别当成噪音删掉。三种读数分别
-        // 指向完全不同的病因：
-        //   · source=push 立刻出现、dropped>0，但浏览器照常能上 ⇒ 掐断动作本身没能拆掉
-        //     已建立的 socket，问题在 update(_:using:.drop()) 那一层，加速通道帮不上忙；
-        //   · source=push 立刻出现、dropped=0 ⇒ 那些连接压根没在跟踪表里（多半是它们
-        //     早于本 provider 进程启动——装新版会重启扩展并清空跟踪表），问题在覆盖面；
-        //   · source=push 立刻出现、source=systemConfiguration 隔一两分钟才出现 ⇒ 系统
-        //     配置分发确实慢，加速通道正是对症的那一味药。
+        // 这一行是这个功能唯一的量尺，别当成噪音删掉——它每一个字段都是拿故障换来的：
+        //   · 与家长操作的时间差 ⇒ 系统配置分发到底慢不慢（曾经靠猜，猜错过一次）；
+        //   · dropped=0 而浏览器照常能上 ⇒ 那些连接压根没在跟踪表里，问题在覆盖面
+        //     （装新版会重启扩展并清空跟踪表，头一次测总会撞上）；
+        //   · dropped>0 但浏览器照常能上 ⇒ 掐断动作没能拆掉已建立的 socket，
+        //     病在 update(_:using:.drop()) 那一层；
+        //   · udp>0 而 quic=0 ⇒ isLikelyQUIC 瞎了，HTTP/3 正在完全绕过黑名单。
+        //     这正是"bilibili 秒拦、youtube 怎么都拦不住"那次故障的确诊信号。
         NSLog("""
-            BigDaddyWebFilter: applied policy source=\(source.rawValue) \
-            revision=\(nextPolicy.revision) enforcing=\(nextPolicy.enabled) \
-            rules=\(nextPolicy.blockedDomains.count) dropped=\(flowsToDrop.count) \
-            tracked=\(trackedCount)
+            BigDaddyWebFilter: applied policy revision=\(nextPolicy.revision) \
+            enforcing=\(nextPolicy.enabled) rules=\(nextPolicy.blockedDomains.count) \
+            dropped=\(flowsToDrop.count) tracked=\(trackedCount) \
+            udp=\(udpCount) quic=\(quicCount)
             """)
 
         // 回执只在"这份策略确实是当前生效的那份"时才发：期间又来了一次更新的话，
-        // 由那一轮 applyPolicy 负责发它自己的回执，这一轮闭嘴，免得把已经被顶掉的
+        // 由那一轮 reloadPolicy 负责发它自己的回执，这一轮闭嘴，免得把已经被顶掉的
         // 旧 revision 报成"已应用"。
         policyLock.lock()
         let isStillCurrent = policy == nextPolicy
@@ -426,14 +423,32 @@ final class FilterDataProvider: NEFilterDataProvider {
         return nil
     }
 
-    /// 像不像 QUIC：UDP + 远端 443。
+    /// 像不像 QUIC：UDP + 远端 443。**只是补充信号，不是主判据。**
     ///
-    /// remoteEndpoint 在 handleNewFlow 时可能还是 nil（Apple 文档明确说了会在收到
-    /// 网络数据后才填上），所以这个判断只在拿到出站数据之后才用得准——调用点都在
-    /// handleOutboundDataFromFlow 和 reloadPolicy 里，那时它已经有值了。
+    /// 曾经这是全项目唯一拦得住 HTTP/3 的地方，代价是把整条防线押在系统的远端端点 API 上——
+    /// 而这个 API 已经静默失效过两次：`remoteEndpoint` 在 macOS 15 被废弃后换成了
+    /// `remoteFlowEndpoint`，换完之后实测**依然**会取不到值，且没有任何报错或降级提示。
+    /// 两次失效的共同后果：youtube 这类默认走 HTTP/3 的站点完全绕过限制，bilibili 这类走
+    /// TCP 的照常被拦，表现成"有的域名秒拦、有的怎么都拦不住"，查起来极难定位到这里。
+    ///
+    /// 所以主判据换成了 QUICPacket.looksLikeQUIC——直接读 QUIC 长包头的固定位模式和版本号，
+    /// 不问系统。本方法降级为 `||` 的另一侧：只在字节判据因为握手包还没攒够而暂时给不出
+    /// 结论时，多一次机会。调用点见 handleOutboundData 和 reloadPolicy 里 `quic =` 那两行。
+    ///
+    /// remoteEndpoint 在部署目标 12.4 上还用得到，所以两条路都留着：新系统优先用没废弃的
+    /// remoteFlowEndpoint，老系统回落到 remoteEndpoint。两者都可能在 handleNewFlow 时还是
+    /// nil（Apple 文档明确说了远端信息要等收到网络数据后才填上），这也是它只能当补充信号、
+    /// 不能独立扛下这条防线的另一个原因——它连"什么时候能读"都不能保证。
     private func isLikelyQUIC(_ flow: NEFilterSocketFlow) -> Bool {
         guard flow.socketProtocol == IPPROTO_UDP else { return false }
-        guard let endpoint = flow.remoteEndpoint as? NWHostEndpoint else { return false }
-        return endpoint.port == "443"
+        if #available(macOS 15.0, *), let endpoint = flow.remoteFlowEndpoint {
+            if case let .hostPort(_, port) = endpoint {
+                return port.rawValue == 443
+            }
+        }
+        if let endpoint = flow.remoteEndpoint as? NWHostEndpoint {
+            return endpoint.port == "443"
+        }
+        return false
     }
 }

@@ -23,6 +23,51 @@ enum HandshakeHostname {
     }
 }
 
+/// 认出一条流是不是 QUIC——**只看字节，不问系统**。
+///
+/// **为什么不能问系统。** 原来判 QUIC 靠的是"socketProtocol 是 UDP 且远端端口是 443"，
+/// 端口从 `NEFilterSocketFlow.remoteEndpoint` 取。那个属性 macOS 15 起就废弃了，实测在
+/// 新系统上取不到值；换用替代品 `remoteFlowEndpoint` 之后**依然**取不到。两次都是静默
+/// 失败：没有报错、没有降级提示，只是 QUIC 从此再没被认出来过。
+///
+/// 后果极其隐蔽：域名黑名单对 HTTP/3 天然无效（QUIC 的 ClientHello 整个加密，SNI 读不
+/// 出来），全靠"认出是 QUIC 就掐掉、逼它回落到明文握手的 TCP+TLS"这一手。这一手一瞎，
+/// youtube 这类默认走 HTTP/3 的站点就完全绕过限制，而 bilibili 这类走 TCP 的照常被拦——
+/// 表现成"有的网站秒拦、有的怎么都拦不住"，且没有任何报错指向真正的原因。
+///
+/// 所以改成看包本身。QUIC 长包头的头 5 个字节是稳定且自证的：
+///
+///   第 0 字节  1 1 T T R R P P   最高位 = 长包头形式，次高位 = 固定位（QUIC 强制为 1）
+///   第 1..4 字节                 32 位版本号
+///
+/// 只认版本号明确在册的那几个，不做"高两位对上就算"的宽松判断——UDP 上什么协议都有，
+/// 宽松匹配会把别的程序的流量误当成 QUIC 掐掉，那个代价比漏拦大得多。
+enum QUICPacket {
+    /// 在册的 QUIC 版本号。v1 是当前所有浏览器的默认；v2 已在 RFC 9369 定稿；两个 draft
+    /// 是仍能在真实流量里遇到的历史版本。版本协商包（version = 0）刻意不认——它不携带
+    /// 任何连接意图，掐它没有意义。
+    private static let knownVersions: Set<UInt32> = [
+        0x0000_0001, // RFC 9000 (QUIC v1)
+        0x6b33_43cf, // RFC 9369 (QUIC v2)
+        0xff00_001d, // draft-29
+        0xfaceb002, // Google QUIC Q046 之后的 draft 变体
+    ]
+
+    /// data 是这条流最开头的出站字节。QUIC 的第一个包必然是长包头（Initial），
+    /// 所以只看开头就够——不必等攒齐整个握手。
+    static func looksLikeQUIC(_ data: Data) -> Bool {
+        guard data.count >= 5 else { return false }
+        let bytes = [UInt8](data.prefix(5))
+        // 高两位必须是 11：最高位标记长包头，次高位是 QUIC 的固定位。
+        guard (bytes[0] & 0xC0) == 0xC0 else { return false }
+        let version = (UInt32(bytes[1]) << 24)
+            | (UInt32(bytes[2]) << 16)
+            | (UInt32(bytes[3]) << 8)
+            | UInt32(bytes[4])
+        return knownVersions.contains(version)
+    }
+}
+
 /// TLS ClientHello 里的 SNI（server_name 扩展）。
 ///
 /// 全程边界检查，任何一步对不上就返回 nil ——**认不出来一律当作"不知道"，绝不猜**。
