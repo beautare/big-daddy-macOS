@@ -125,6 +125,15 @@ struct ClientConfig: Codable, Equatable {
     /// 在入冬后凭空显得"更新了"，把孩子的本地覆盖无端清掉。存原文比就没有这个问题，
     /// 也顺带不依赖后端时钟单调（NTP 回拨同样会破坏先后比较）。
     var continuityModeUpdatedAt: String? = nil
+    /// 这台设备绑定到哪个家长账号，**已经由服务端脱敏**（t***@g***.com）。
+    ///
+    /// 完整邮箱从不下发到这里——看这块屏幕的往往是孩子，而客户端二进制是可以被逆向的。
+    /// 客户端把它显示在四处：菜单栏状态行、「关于」窗口、首启的知情披露、以及退出验证码
+    /// 弹窗。前三处是给孩子的透明度（数据到底去了谁那里），最后一处同时也是给家长的——
+    /// "我当初用的哪个邮箱注册的"这个问题，孩子那台电脑上恰好有最可靠的答案。
+    ///
+    /// 未绑定 / 旧后端时为 nil，四处都不显示这一行。
+    var boundToEmailMasked: String? = nil
 
     init() {
     }
@@ -149,6 +158,7 @@ struct ClientConfig: Codable, Equatable {
         timeSession = try container.decodeIfPresent(TimeSession.self, forKey: .timeSession)
         continuityMode = try container.decodeIfPresent(Bool.self, forKey: .continuityMode) ?? false
         continuityModeUpdatedAt = try container.decodeIfPresent(String.self, forKey: .continuityModeUpdatedAt)
+        boundToEmailMasked = try container.decodeIfPresent(String.self, forKey: .boundToEmailMasked)
     }
 }
 
@@ -1994,7 +2004,7 @@ final class BigDaddyClient: @unchecked Sendable {
         guard let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data) else {
             throw BigDaddyServerError(message: Localization.string(
                 zh: "服务器响应无法解析，请稍后在家长中心确认绑定状态",
-                en: "Unable to parse server response. Please check binding status on the dashboard."
+                en: "Unable to parse server response. Please check the binding status in the Parent Center."
             ))
         }
         if envelope.code == 200 {

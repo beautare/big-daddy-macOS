@@ -377,8 +377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.alertStyle = .warning
         alert.messageText = Localization.string(zh: "设备凭据失效", en: "Device Credentials Invalid")
         alert.informativeText = Localization.string(
-            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长端会显示设备离线。\n\n恢复方法：请家长在家长中心中点击「重新授权」按钮，设备将在 1 分钟内自动恢复。",
-            en: "This Mac's device key no longer matches the server record (usually after reinstalling or switching client builds). Guardian data cannot be reported and the dashboard will show this device as offline.\n\nTo recover: tap the \"Re-authorize\" button on the parent dashboard. The device will automatically recover within 1 minute."
+            zh: "本机的设备密钥与服务器存档不一致（通常发生在重装或更换客户端构建之后），守护数据暂时无法上报，家长中心会显示设备离线。\n\n恢复方法：请家长在家长中心中点击「重新授权」按钮，设备将在 1 分钟内自动恢复。",
+            en: "This Mac's device key no longer matches the server record (usually after reinstalling or switching client builds). Guardian data cannot be reported and the Parent Center will show this device as offline.\n\nTo recover: tap the \"Re-authorize\" button in the Parent Center. The device will automatically recover within 1 minute."
         )
         alert.runModal()
     }
@@ -461,7 +461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             let credentialItem = NSMenuItem(
                 title: Localization.string(
                     zh: "⚠️ 设备凭据需要重新授权：请家长在家长中心点击「重新授权」",
-                    en: "⚠️ Credentials need re-authorization: tap \"Re-authorize\" on the dashboard"
+                    en: "⚠️ Credentials need re-authorization: tap \"Re-authorize\" in the Parent Center"
                 ),
                 action: nil, keyEquivalent: ""
             )
@@ -471,10 +471,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
 
         if client.config.bound {
-            let statusItem = NSMenuItem(
-                title: Localization.string(zh: "守护状态：正常运行中", en: "Guardian Status: Active"),
-                action: nil, keyEquivalent: ""
-            )
+            // 状态行带上绑定到哪个家长账号（服务端脱敏过）。对孩子这是透明度——他知道
+            // 这些记录到底送给了谁；对家长这是"我当初用的哪个邮箱注册的"的现成答案。
+            // 旧后端不下发这个字段时退回原来那句话，不显示一个空的"家长 "。
+            let statusTitle: String
+            if let maskedEmail = client.config.boundToEmailMasked, !maskedEmail.isEmpty {
+                statusTitle = Localization.string(
+                    zh: "守护中 · 家长 \(maskedEmail)",
+                    en: "Guarding · parent \(maskedEmail)"
+                )
+            } else {
+                statusTitle = Localization.string(zh: "守护状态：正常运行中", en: "Guardian Status: Active")
+            }
+            let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
             statusItem.isEnabled = false
             menu.addItem(statusItem)
             menu.addItem(.separator())
@@ -1055,6 +1064,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         if client.config.bound {
             rows.append(.text(label: Localization.string(zh: "状态", en: "Status"),
                               value: Localization.string(zh: "已开启守护", en: "Active")))
+            // 绑定到哪个家长账号（服务端已脱敏）。放在"状态"正下方而不是往下埋：
+            // 这是这个窗口里唯一回答"这些记录到底给了谁"的一行，对孩子是透明度，
+            // 对忘了自己用哪个邮箱注册的家长是最可靠的线索。
+            if let owner = client.config.boundToEmailMasked, !owner.isEmpty {
+                rows.append(.text(label: Localization.string(zh: "家长账号", en: "Parent account"), value: owner))
+            }
             // 有进行中的约定时排在"状态"之后：这是家长"现在正在发生"的一件事，
             // 比下面截图/通知渠道这些长期不变的配置摘要更值得靠前看到。
             if let timeSessionText = currentTimeSessionRemainingText() {
@@ -1274,6 +1289,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                                 en: "This Mac is now linked to the parent account."
                             )
                         )
+                        // 绑定成功这一刻家长必然在场（码就是他刚输的），是把"去填邮箱"
+                        // 说清楚的唯一好时机。没有通知渠道的话，这套系统对他来说等于没在工作。
+                        self.showPostBindNextStep()
                     }
                     return
                 }
@@ -1601,8 +1619,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         postLocalNotice(
             title: Localization.string(zh: "网址记录未生效", en: "Website logging not working"),
             body: Localization.string(
-                zh: "BigDaddy 还不能读取 \(browserName) 的当前网址，家长端只会看到页面标题、看不到链接。请点开菜单栏的 BigDaddy 图标，选择「⚠️ 浏览器网址未授权 · 点此修复」。",
-                en: "BigDaddy can't read the current address in \(browserName), so the parent dashboard shows page titles without links. Click the BigDaddy menu bar icon and choose “⚠️ Browser URL access off · Fix it”."
+                zh: "BigDaddy 还不能读取 \(browserName) 的当前网址，家长中心只会看到页面标题、看不到链接。请点开菜单栏的 BigDaddy 图标，选择「⚠️ 浏览器网址未授权 · 点此修复」。",
+                en: "BigDaddy can't read the current address in \(browserName), so the Parent Center shows page titles without links. Click the BigDaddy menu bar icon and choose “⚠️ Browser URL access off · Fix it”."
             )
         )
     }
@@ -1934,7 +1952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     title: Localization.string(zh: "守护关系已解除", en: "Guardian binding removed"),
                     body: Localization.string(
                         zh: "家长已在家长中心解绑本设备，守护采集已停止。可随时重新绑定。",
-                        en: "Your parent unbound this Mac on the dashboard; guardian reporting has stopped. You can re-bind at any time."
+                        en: "Your parent unbound this Mac in the Parent Center; guardian reporting has stopped. You can re-bind at any time."
                     )
                 )
             }
@@ -2285,7 +2303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                         title: Localization.string(zh: "绑定信息已复制", en: "Binding info copied"),
                         body: Localization.string(
                             zh: "发送给家长，家长在家长中心输入绑定码即可完成绑定。",
-                            en: "Send it to your parent — they can finish binding by entering the code on the dashboard."
+                            en: "Send it to your parent — they can finish binding by entering the code in the Parent Center."
                         )
                     )
                 }
@@ -2724,6 +2742,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let shotStatusEn = shotEffectivelyOn
             ? "Screenshots are on right now — your parent can see your screen. Every time one is taken, this Mac pops up a notice to tell you, and writes it into the file mentioned below."
             : "Screenshots are off right now. It only notes the text above; it does not capture your screen."
+
+        // "谁能看到"这一句是整个披露里最关键的一行。有了服务端下发的脱敏邮箱之后，
+        // 它可以从一句抽象承诺（"绑定这台电脑的那位家长"）变成一个具体的、孩子可以
+        // 拿去对质的事实。旧后端不下发时退回原来的说法，不留空。
+        let maskedOwner = client.config.boundToEmailMasked
+        let whoCanSeeZh: String
+        let whoCanSeeEn: String
+        if let owner = maskedOwner, !owner.isEmpty {
+            whoCanSeeZh = "只有 \(owner) 这个账号的家长。"
+            whoCanSeeEn = "Only the parent using \(owner)."
+        } else {
+            whoCanSeeZh = "只有绑定这台电脑的那位家长。"
+            whoCanSeeEn = "Only the parent this Mac is linked to."
+        }
         alert.informativeText = Localization.string(
             zh: """
             爸爸妈妈在这台电脑上装了 BigDaddy。这不是偷偷装的——所以现在这个窗口才会弹出来告诉你。
@@ -2732,7 +2764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             你现在开着哪个应用、窗口标题上写着什么，比如"Safari — 某某网站"。它不看你打的字，也不读你的聊天内容。\(shotStatusZh)
 
             谁能看到？
-            只有绑定这台电脑的那位家长。截图路过服务器的时候立刻就转走了，服务器上不留。
+            \(whoCanSeeZh)截图路过服务器的时候立刻就转走了，服务器上不留。
 
             你怎么知道它在干什么？
             屏幕最上面那一排里有个小盾牌，一直都在，你随时能点开。盾牌旁边什么都没有，就是没在截图；多出一个小圆点，就是截图开着；圆点变成一个圈，就是这一刻正在截图——扫一眼就知道现在是哪种。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
@@ -2749,7 +2781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             Which app you have open and what the window is called, like "Safari — some website". It doesn't see what you type, and it doesn't read your chats. \(shotStatusEn)
 
             Who can see it?
-            Only the parent this Mac is linked to. Screenshots pass through the server and are sent straight on — nothing is kept there.
+            \(whoCanSeeEn) Screenshots pass through the server and are sent straight on — nothing is kept there.
 
             How do you know what it's doing?
             There's a small shield in the strip along the very top of the screen. It's always there, and you can open it any time. Nothing next to the shield means no screenshots are being taken; a small dot means they're on; the dot turning into a ring means a screenshot is being taken right this moment — one glance tells you which. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.
@@ -2829,6 +2861,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         host == "localhost" || host == "127.0.0.1" || host == "::1"
     }
 
+    /// 家长中心（网页）的主机名，用于当着孩子的面把"去哪儿"说清楚。
+    ///
+    /// 本地开发环境的 localhost 只代表这台 Mac，家长在自己的手机上照着敲会打不开，
+    /// 所以一律回落到生产域名——这条弹窗的读者从来不是开发者。
+    /// 与 showWrongMacHelp 里对营销站做的处理同源，只是那边要的是根域名。
+    private var parentCenterHost: String {
+        let host = client.dashboardBaseURL.host ?? "dashboard.bigdaddy.mom"
+        return Self.isLocalDashboardHost(host) ? "dashboard.bigdaddy.mom" : host
+    }
+
+    /// 直达"生成临时验证码"的深链接。家长登录后这一页会自动把验证码弹出来，
+    /// 不必再自己去「设置」里翻——这条路径此前有四级，是"不知道该去哪"的主因。
+    private var parentCenterExitCodeURL: URL {
+        URL(string: "https://\(parentCenterHost)/dashboard?action=exit-code")!
+    }
+
+    /// 验证码弹窗里的「打开家长中心」。放在 accessoryView 里而不是做成 NSAlert 的按钮：
+    /// NSAlert 的按钮一按就关窗，而家长开完网页还要回来把码念给孩子输进去，窗不能关。
+    @objc private func openParentCenterForExitCode() {
+        NSWorkspace.shared.open(parentCenterExitCodeURL)
+    }
+
+    @objc private func copyParentCenterURL(_ sender: NSButton) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(parentCenterExitCodeURL.absoluteString, forType: .string)
+        let original = sender.title
+        sender.title = Localization.string(zh: "已复制", en: "Copied")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak sender] in
+            sender?.title = original
+        }
+    }
+
     /// 在访达中定位本机守护记录文件，供孩子/家长查看或导出
     @objc private func exportAuditLog() {
         let url = AuditLog.auditFileURL
@@ -2838,15 +2902,123 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
-    /// 首次启动时，向使用本机的孩子展示一次知情披露
+    /// 首次启动时的两屏欢迎流：**先家长，后孩子**。
+    ///
+    /// 此前这里只有第二屏（写给孩子的知情披露）。但首次启动那一刻站在电脑前的多半是
+    /// 刚装完的家长，而他此刻需要知道的三件事——那个盾牌图标在哪、"还没绑定 = 还没开始
+    /// 工作"、下一步该去网页做什么——一件都不在那屏里：图标位置没说，"未绑定不采集"
+    /// 只写在菜单里（要先找到图标才看得到，循环依赖），绑定码则埋在菜单的第三层。
+    /// 于是家长装完看不到任何反馈，甚至不确定程序有没有在跑。
+    ///
+    /// 先家长后孩子的顺序也更符合"知情透明"的初衷：家长还在场，可以和孩子一起读第二屏。
     private func presentFirstRunDisclosureIfNeeded() {
         let marker = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/disclosure-shown")
         guard !FileManager.default.fileExists(atPath: marker.path) else { return }
-        showTransparencyInfo()
+
+        // 标记先落盘再弹窗：万一家长在弹窗上强杀进程，下次启动不该再从头骚扰一遍。
         try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? Data().write(to: marker)
+
+        // 第 1 屏只在未绑定时出现。已绑定的机器上首启（重装、换机恢复）不需要再讲一遍
+        // "怎么连上"，直接进孩子那一屏。
+        if !client.config.bound {
+            announceMenuBarPresence()
+            showParentWelcome()
+        }
+        showTransparencyInfo()
         AuditLog.record("DISCLOSURE_SHOWN 已向使用者展示知情披露")
+    }
+
+    /// 首启时先让人知道"它已经在跑了、就在屏幕最上面那一排"。
+    ///
+    /// 反馈原话是"第一次启动时不认识图标"。本机通知会从屏幕右上角滑出来——恰好就在
+    /// 菜单栏图标的正下方，所以这条通知本身同时也是一次**位置指示**，比在弹窗里写
+    /// "在屏幕右上角"更直接。
+    private func announceMenuBarPresence() {
+        postLocalNotice(
+            title: Localization.string(zh: "BigDaddy 已经在运行了", en: "BigDaddy is running"),
+            body: Localization.string(
+                zh: "看屏幕最上面那一排，右边多了一个盾牌图标 —— 所有操作都从它进入。",
+                en: "Look at the strip along the very top of the screen: there's a new shield on the right. Everything starts from there."
+            )
+        )
+    }
+
+    /// 首启第 1 屏 —— 给刚装完的家长。
+    ///
+    /// 一屏解决三件事：认识那个图标、知道"没绑定就什么都不记录"、知道下一步去哪。
+    /// 主按钮直接接到 showDeviceBindCode()，省掉"点图标 → 连接家长账号 → 显示绑定码"
+    /// 这三跳——那三跳的第一跳恰恰要求家长先认得那个他还不认识的图标。
+    private func showParentWelcome() {
+        let alert = NSAlert()
+        alert.messageText = Localization.string(
+            zh: "BigDaddy 装好了，但还没有开始工作",
+            en: "BigDaddy is installed — but it isn't working yet"
+        )
+        alert.informativeText = Localization.string(
+            zh: """
+            现在这台电脑什么都不会记录。要等你把它连上你的家长账号之后，守护才真正开始。
+
+            1. 屏幕最上面那一排（时间、电池旁边）多了一个盾牌图标 ⛨
+               以后所有操作都从它进入，孩子也随时能点开看它在做什么。
+
+            2. 点下面的「现在就连接」，这台电脑会显示一串 6 位数字。
+
+            3. 在你自己的手机或电脑上打开 \(parentCenterHost) 登录，把那 6 位数字输进去。
+               家长就在这台电脑前的话，连接界面上还有一个按钮可以直接在本机打开家长中心。
+
+            连上之后记得在家长中心填一个你常看的邮箱 —— 不填的话，每日摘要和截图都没有地方可送。
+            """,
+            en: """
+            Right now this Mac records nothing at all. Guarding only starts once you link it to your parent account.
+
+            1. There's a new shield ⛨ in the strip along the very top of the screen (next to the clock and battery).
+               Everything starts from there, and your child can open it any time to see what it's doing.
+
+            2. Press "Connect now" below and this Mac will show a 6-digit number.
+
+            3. On your own phone or computer, open \(parentCenterHost), sign in, and type those 6 digits in.
+               If you're sitting at this Mac, the connect screen also has a button to open the Parent Center right here.
+
+            Once linked, add an email address you actually check — without one, the daily summary and screenshots have nowhere to go.
+            """
+        )
+        applyShieldIcon(to: alert)
+        alert.addButton(withTitle: Localization.string(zh: "现在就连接", en: "Connect now"))
+        alert.addButton(withTitle: Localization.string(zh: "稍后再说", en: "Later"))
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            showDeviceBindCode()
+        }
+    }
+
+    /// 绑定成功后的最后一步引导：把家长送到家长中心去填通知渠道。
+    ///
+    /// 时机是刻意的——家长刚看到"成功"，注意力还在这台电脑上。错过这一刻，他多半就
+    /// 合上盖子走了，然后过几天来问"为什么我什么都没收到"。通知渠道一个都没配的话，
+    /// 这套系统对他来说确实等于没在工作。
+    private func showPostBindNextStep() {
+        let alert = NSAlert()
+        alert.messageText = Localization.string(zh: "连上了。还剩最后一件事", en: "Linked. One last thing")
+        alert.informativeText = Localization.string(
+            zh: """
+            到家长中心填一个你常看的邮箱 —— 不填的话，每日摘要和截图都没有地方可送，你会什么都收不到。
+
+            \(parentCenterHost)
+            """,
+            en: """
+            Add an email address you actually check in the Parent Center. Without one, the daily summary and screenshots have nowhere to go and you'll never hear anything.
+
+            \(parentCenterHost)
+            """
+        )
+        applyShieldIcon(to: alert)
+        alert.addButton(withTitle: Localization.string(zh: "打开家长中心", en: "Open Parent Center"))
+        alert.addButton(withTitle: Localization.string(zh: "知道了", en: "Got it"))
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string: "https://\(parentCenterHost)/dashboard")!)
+        }
     }
 
     @objc private func copyConfigPath() {
@@ -2858,8 +3030,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭 BigDaddy 守护程序", en: "Close BigDaddy Guard Process"),
             message: Localization.string(
-                zh: "请输入在网页端「家长中心」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭守护程序。",
-                en: "Please enter the 6-digit temporary verification code from Parent Center → Settings → More Actions → Get Temporary Verification Code (valid for 5 minutes)."
+                zh: "关掉守护程序需要家长同意。家长在下面这个网页上登录后，点「设置」→「生成临时验证码」，把拿到的 6 位数字念给你，填进下面的格子即可（5 分钟内有效）。",
+                en: "Closing the guard needs a parent's go-ahead. On the page below, the parent signs in, taps Settings → Generate temporary code, and reads you the 6 digits. Type them in below — they are good for 5 minutes."
             ),
             confirmTitle: Localization.string(zh: "关闭守护程序", en: "Close Guard Process")
         ) else { return }
@@ -2875,8 +3047,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
                     errorAlert.informativeText = Localization.string(
-                        zh: "临时验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The temporary verification code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                        zh: "这 6 位数字不对，或者已经超过 5 分钟失效了。请家长在家长中心重新生成一个再试。",
+                        en: "Those 6 digits are wrong, or more than 5 minutes have passed. Ask the parent to generate a new code in the Parent Center and try again."
                     )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
@@ -2938,8 +3110,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭开机自动启动", en: "Turn Off Start at Login"),
             message: Localization.string(
-                zh: "请输入在网页端「家长中心」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭开机自动运行。",
-                en: "Please enter the 6-digit temporary verification code from Parent Center → Settings → More Actions → Get Temporary Verification Code, to turn off Start at Login."
+                zh: "关掉开机自动运行需要家长同意。家长在下面这个网页上登录后，点「设置」→「生成临时验证码」，把拿到的 6 位数字念给你，填进下面的格子即可（5 分钟内有效）。",
+                en: "Turning off Start at Login needs a parent's go-ahead. On the page below, the parent signs in, taps Settings → Generate temporary code, and reads you the 6 digits. Type them in below — they are good for 5 minutes."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
@@ -2953,8 +3125,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
                     errorAlert.informativeText = Localization.string(
-                        zh: "临时验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The temporary verification code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                        zh: "这 6 位数字不对，或者已经超过 5 分钟失效了。请家长在家长中心重新生成一个再试。",
+                        en: "Those 6 digits are wrong, or more than 5 minutes have passed. Ask the parent to generate a new code in the Parent Center and try again."
                     )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
@@ -2978,8 +3150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         guard let code = promptParentVerificationCode(
             title: Localization.string(zh: "关闭崩溃后自动恢复", en: "Turn Off Relaunch After Crash"),
             message: Localization.string(
-                zh: "请输入在网页端「家长中心」→「设置」→「更多操作」→「获取临时验证码」中获取的 6 位临时验证码（有效期 5 分钟），验证通过后即可关闭崩溃后自动恢复。",
-                en: "Please enter the 6-digit temporary verification code from Parent Center → Settings → More Actions → Get Temporary Verification Code, to turn off relaunch after crash."
+                zh: "关掉崩溃后自动恢复需要家长同意。家长在下面这个网页上登录后，点「设置」→「生成临时验证码」，把拿到的 6 位数字念给你，填进下面的格子即可（5 分钟内有效）。",
+                en: "Turning off relaunch after crash needs a parent's go-ahead. On the page below, the parent signs in, taps Settings → Generate temporary code, and reads you the 6 digits. Type them in below — they are good for 5 minutes."
             ),
             confirmTitle: Localization.string(zh: "确认关闭", en: "Turn Off")
         ) else { return }
@@ -2998,8 +3170,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     let errorAlert = NSAlert()
                     errorAlert.messageText = Localization.string(zh: "认证失败", en: "Authentication Failed")
                     errorAlert.informativeText = Localization.string(
-                        zh: "临时验证码不正确或已过期，请重新在家长端生成后重试。",
-                        en: "The temporary verification code is incorrect or expired. Please generate a new one on the parent dashboard and try again."
+                        zh: "这 6 位数字不对，或者已经超过 5 分钟失效了。请家长在家长中心重新生成一个再试。",
+                        en: "Those 6 digits are wrong, or more than 5 minutes have passed. Ask the parent to generate a new code in the Parent Center and try again."
                     )
                     errorAlert.addButton(withTitle: "OK")
                     errorAlert.runModal()
@@ -3075,7 +3247,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // NSAlert 按 accessoryView 的 frame 预留空间。之前直接返回一个零 frame、
         // 纯 Auto Layout 的 NSStackView，弹窗按错误的高度排版，验证码输入框被
         // 正文/按钮遮住一部分。与其他弹窗一致：外层用带明确 frame 的 NSView 撑开。
-        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 88))
+        // 高度从 88 抬到 176：顶部多了"去哪儿拿这个码"的那一块（网址 + 两个按钮）。
+        // 这一块是反馈里"提示登陆家长控制端，不知道是网页还是另一个软件"的正面回答——
+        // 光把路径写进正文没用，得把网址摆出来、并且给一个能直接点开的按钮。
+        let parentView = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 200))
 
         let container = NSStackView()
         container.orientation = .vertical
@@ -3094,11 +3269,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         ])
 
 
+        // ── 「去哪儿拿这个码」──────────────────────────────────────────────
+        // 网址用可选中的等宽大字明文摆出来（家长可能在另一个房间，得能念、能抄），
+        // 旁边配「打开家长中心」和「复制网址」两个按钮。两个按钮都在 accessoryView 里，
+        // 点了不会关掉这个弹窗。
+        let whereStack = NSStackView()
+        whereStack.orientation = .vertical
+        whereStack.spacing = 6
+        whereStack.alignment = .centerX
+
+        // 这台电脑绑定到谁：孩子当场知道该去找家里的哪一位，家长也在这一刻被提醒
+        // 自己用的哪个账号——"忘了登录的账号"那条反馈里最难的一半，答案就在这行上。
+        if let owner = client.config.boundToEmailMasked, !owner.isEmpty {
+            let ownerLabel = NSTextField(labelWithString: Localization.string(
+                zh: "这台电脑绑定的家长账号是 \(owner)",
+                en: "This Mac is linked to \(owner)"
+            ))
+            ownerLabel.font = NSFont.systemFont(ofSize: 12)
+            ownerLabel.textColor = NSColor.secondaryLabelColor
+            ownerLabel.alignment = .center
+            ownerLabel.isSelectable = true
+            whereStack.addArrangedSubview(ownerLabel)
+        }
+
+        let whereLabel = NSTextField(labelWithString: Localization.string(
+            zh: "家长请在浏览器里打开这个网页：",
+            en: "Parent: open this page in a browser"
+        ))
+        whereLabel.font = NSFont.systemFont(ofSize: 12)
+        whereLabel.textColor = NSColor.secondaryLabelColor
+        whereLabel.alignment = .center
+
+        let urlField = NSTextField(labelWithString: parentCenterHost)
+        urlField.font = NSFont.monospacedSystemFont(ofSize: 15, weight: .semibold)
+        urlField.textColor = NSColor.labelColor
+        urlField.alignment = .center
+        urlField.isSelectable = true
+
+        let buttonRow = NSStackView()
+        buttonRow.orientation = .horizontal
+        buttonRow.spacing = 8
+        buttonRow.alignment = .centerY
+
+        let openButton = NSButton(
+            title: Localization.string(zh: "打开家长中心", en: "Open Parent Center"),
+            target: self, action: #selector(openParentCenterForExitCode)
+        )
+        openButton.bezelStyle = .rounded
+        let copyButton = NSButton(
+            title: Localization.string(zh: "复制网址", en: "Copy address"),
+            target: self, action: #selector(copyParentCenterURL(_:))
+        )
+        copyButton.bezelStyle = .rounded
+        buttonRow.addArrangedSubview(openButton)
+        buttonRow.addArrangedSubview(copyButton)
+
+        whereStack.addArrangedSubview(whereLabel)
+        whereStack.addArrangedSubview(urlField)
+        whereStack.addArrangedSubview(buttonRow)
+        container.addArrangedSubview(whereStack)
+
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        container.addArrangedSubview(separator)
+
         let digitsStack = NSStackView()
         digitsStack.orientation = .horizontal
         digitsStack.spacing = 8
         digitsStack.alignment = .centerY
-        
+
         self.exitDigitFields.removeAll()
         self.exitDigitPreviousValues = Array(repeating: "", count: 6)
 
@@ -3445,8 +3686,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                         en: "\(browserName) isn't running, so this can't be checked yet — BigDaddy will prompt when it's next opened"
                       )
                     : Localization.string(
-                        zh: "读取 \(browserName) 当前网址，家长端才能看到可点击的访问记录",
-                        en: "Read the current address in \(browserName) so the dashboard can show clickable links"
+                        zh: "读取 \(browserName) 当前网址，家长中心才能看到可点击的访问记录",
+                        en: "Read the current address in \(browserName) so the Parent Center can show clickable links"
                       ),
                 status: status,
                 action: #selector(authorizeAllBrowserAutomation)
@@ -3726,8 +3967,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         applyShieldIcon(to: alert)
         alert.messageText = Localization.string(zh: "需要辅助功能权限", en: "Accessibility permission needed")
         alert.informativeText = Localization.string(
-            zh: "缺少这项权限时，家长端看到的记录会没有窗口标题，Firefox 一类浏览器也读不到网址。\n\n点「去授权」后，系统会弹出询问并打开设置页面；在「隐私与安全性 → 辅助功能」的名单里把 BigDaddy 打开即可，开启后立即生效，不需要重启。",
-            en: "Without it, the parent dashboard shows records with no window title, and browsers like Firefox report no address.\n\nChoose “Authorize” — macOS will ask and open the settings page. Switch BigDaddy on under Privacy & Security → Accessibility. It takes effect immediately; no restart needed."
+            zh: "缺少这项权限时，家长中心看到的记录会没有窗口标题，Firefox 一类浏览器也读不到网址。\n\n点「去授权」后，系统会弹出询问并打开设置页面；在「隐私与安全性 → 辅助功能」的名单里把 BigDaddy 打开即可，开启后立即生效，不需要重启。",
+            en: "Without it, the Parent Center shows records with no window title, and browsers like Firefox report no address.\n\nChoose “Authorize” — macOS will ask and open the settings page. Switch BigDaddy on under Privacy & Security → Accessibility. It takes effect immediately; no restart needed."
         )
         alert.addButton(withTitle: Localization.string(zh: "去授权", en: "Authorize"))
         alert.addButton(withTitle: Localization.string(zh: "以后再说", en: "Later"))
@@ -4220,13 +4461,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 长网址会把弹窗撑得很宽，截断到能认出是哪一页即可
             let shown = sample.url.count > 80 ? String(sample.url.prefix(80)) + "…" : sample.url
             alert.informativeText = Localization.string(
-                zh: "刚刚从 \(browser) 读到的网址是：\n\(shown)\n\n下一次上报起，家长端的访问记录就会带上可点击的链接，不需要重启。",
-                en: "Just read this address from \(browser):\n\(shown)\n\nFrom the next report on, the parent dashboard will show clickable links — no restart needed."
+                zh: "刚刚从 \(browser) 读到的网址是：\n\(shown)\n\n下一次上报起，家长中心的访问记录就会带上可点击的链接，不需要重启。",
+                en: "Just read this address from \(browser):\n\(shown)\n\nFrom the next report on, the Parent Center will show clickable links — no restart needed."
             )
         } else {
             alert.messageText = Localization.string(zh: "授权已通过", en: "Authorization Granted")
             alert.informativeText = Localization.string(
-                zh: "系统已允许 BigDaddy 读取浏览器网址，但此刻浏览器没有打开任何网页，所以还没读到具体地址。孩子下次浏览网页时，家长端就会开始出现可点击的链接。",
+                zh: "系统已允许 BigDaddy 读取浏览器网址，但此刻浏览器没有打开任何网页，所以还没读到具体地址。孩子下次浏览网页时，家长中心就会开始出现可点击的链接。",
                 en: "macOS now allows BigDaddy to read browser addresses, but no page is open right now, so there was nothing to read yet. Clickable links will start appearing once your child browses again."
             )
         }
