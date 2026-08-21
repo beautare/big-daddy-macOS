@@ -2551,6 +2551,11 @@ enum OSLevelStatusCache {
     private static let ttl: TimeInterval = 60
     private static let lock = NSLock()
     private static var cached: [String: (value: String, at: Date)] = [:]
+    /// 每次 invalidate() 自增。compute() 跑在锁外（见下），一次真实的状态变更可能恰好
+    /// 夹在"读到过期缓存"和"探测结果写回"之间——不夹这道校验的话，那次探测捞回来的
+    /// 还是变更前的旧值，写回缓存时盖上新时间戳，等于把刚刚 invalidate() 掉的失效
+    /// 悄悄撤销，让本该立刻可见的自家操作又被压回最长 60 秒的 TTL 里。
+    private static var generation = 0
 
     static func value(for key: String, compute: () -> String) -> String {
         lock.lock()
@@ -2558,12 +2563,18 @@ enum OSLevelStatusCache {
             lock.unlock()
             return entry.value
         }
+        let generationAtStart = generation
         lock.unlock()
         // 刻意不在锁里跑 compute：它会 fork launchctl 并同步等待，占着锁会让另一个字段
         // 的查询一起阻塞。代价是偶尔两个线程各探一次，两次结果相同，无害。
         let value = compute()
         lock.lock()
-        cached[key] = (value, Date())
+        // generation 没变 ⇒ compute() 跑的这段时间里没人 invalidate 过，写回去安全。
+        // generation 变了 ⇒ 这次探测的结果可能已经是旧状态，不写回，把它让给下一次
+        // 调用重新探测；返回给这一次调用方的 value 不受影响，只是不再持久化。
+        if generation == generationAtStart {
+            cached[key] = (value, Date())
+        }
         lock.unlock()
         return value
     }
@@ -2571,6 +2582,7 @@ enum OSLevelStatusCache {
     static func invalidate() {
         lock.lock()
         cached.removeAll()
+        generation += 1
         lock.unlock()
     }
 }
@@ -2868,6 +2880,7 @@ enum ContinuityModeController {
         if Launchctl.isLoaded() {
             if Launchctl.jobPid() == nil {
                 _ = Launchctl.run(["kickstart", Launchctl.serviceTarget])
+                OSLevelStatusCache.invalidate()
                 AuditLog.record("CONTINUITY_MODE_ENABLED via=kickstart-idle")
                 if !isLaunchdManaged {
                     handoverExit()
@@ -2919,6 +2932,7 @@ enum ContinuityModeController {
             guard status == .enabled || status == .requiresApproval else { return }
             do {
                 try SMAppService.mainApp.unregister()
+                OSLevelStatusCache.invalidate()
                 AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService reason=continuity")
             } catch {
                 NSLog("BigDaddy: SMAppService unregister for continuity failed: \(error.localizedDescription)")
@@ -3177,11 +3191,9 @@ extension JSONEncoder {
     /// 把这个陷阱一次性堵死。
     static var bigDaddy: JSONEncoder {
         let encoder = JSONEncoder()
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         encoder.dateEncodingStrategy = .custom { date, encoder in
             var container = encoder.singleValueContainer()
-            try container.encode(formatter.string(from: date))
+            try container.encode(BigDaddyDateFormatter.iso8601Fractional.string(from: date))
         }
         return encoder
     }
@@ -3200,6 +3212,14 @@ extension JSONEncoder {
 /// 后端的时间戳格式由它决定。
 enum BigDaddyDateFormatter {
     static let iso8601 = ISO8601DateFormatter()
+    /// 带小数秒的变体，供 JSONEncoder.bigDaddy 编码 ClientConfig 里的 Date 字段用——
+    /// 必须跟 BigDaddyDateParser.iso8601Fractional 同一组 formatOptions，否则
+    /// 编码端写出去的字符串解码端读不回来（该类型的注释详述了这个坑）。
+    static let iso8601Fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 }
 
 enum BigDaddyDateParser {
