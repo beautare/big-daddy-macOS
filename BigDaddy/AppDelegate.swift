@@ -2916,10 +2916,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             .appendingPathComponent("Library/Application Support/BigDaddy/disclosure-shown")
         guard !FileManager.default.fileExists(atPath: marker.path) else { return }
 
-        // 标记先落盘再弹窗：万一家长在弹窗上强杀进程，下次启动不该再从头骚扰一遍。
-        try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? Data().write(to: marker)
-
         // 第 1 屏只在未绑定时出现。已绑定的机器上首启（重装、换机恢复）不需要再讲一遍
         // "怎么连上"，直接进孩子那一屏。
         if !client.config.bound {
@@ -2927,6 +2923,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             showParentWelcome()
         }
         showTransparencyInfo()
+
+        // 标记等孩子那屏真正弹出并关掉之后才落盘，而不是弹窗前——这是唯一一块有强制
+        // 披露含义的内容，落盘早了、家长又恰好在弹窗上强杀进程，这台机器就再也不会被
+        // 提醒。前两屏（家长欢迎）没有这个顾虑：万一强杀导致下次启动重放一遍，顶多是
+        // 家长觉得"这条我看过了"，比孩子永远看不到知情披露这个后果轻得多。
+        try? FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data().write(to: marker)
         AuditLog.record("DISCLOSURE_SHOWN 已向使用者展示知情披露")
     }
 
