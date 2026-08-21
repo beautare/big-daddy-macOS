@@ -99,6 +99,35 @@ final class PendingQueueTests: XCTestCase {
         XCTAssertEqual(PendingQueue.depth, 1)
     }
 
+    /// 回归测试：磁盘持续写不进去（磁盘满/权限问题）时，removeFirst 必须如实报告失败，
+    /// 且磁盘上的队首**没有**被真的摘掉。
+    ///
+    /// 这条钉的是一个真实发生过的 bug：removeFirst 曾经不管落盘成不成功都直接返回，
+    /// drainPendingQueue 因此会把这条"其实还在磁盘上"的记录当成新的队首重新读到、
+    /// 再发一次——服务端确认成功、摘除又落盘失败、再读到同一条——每隔几秒重复上报
+    /// 同一条记录，没有自然终止条件。用只读目录模拟持续写失败：只要 removeFirst
+    /// 老实报告 false，调用方（drainPendingQueue）就会跟网络失败一视同仁地退避，
+    /// 不会陷入这个循环。
+    func testRemoveFirstReportsFailureAndLeavesDiskUntouchedWhenPersistFails() throws {
+        PendingQueue.enqueue(body(event: "A"))
+        PendingQueue.enqueue(body(event: "B"))
+
+        // 去掉目录的写权限：atomic write 需要在同目录建临时文件再 rename，
+        // 目录只读时这一步必然失败——不依赖某个具体系统调用报错方式，是最贴近
+        // 真实"磁盘满/权限被收回"场景的模拟方式。
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        let removed = PendingQueue.removeFirst(1)
+        // 无论测试本身通过与否，都要把权限改回来，否则 tearDown 删不掉这个目录。
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
+        XCTAssertFalse(removed, "落盘失败时 removeFirst 必须报告 false，不能假装摘除已经生效")
+
+        // 重新读盘（模拟下一次访问）：A 必须还在队首，没有被真的摘掉。
+        PendingQueue.resetForTesting()
+        XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 10)), ["A", "B"],
+                       "磁盘写失败时，磁盘上的内容不该发生变化")
+    }
+
     private func body(event: String, reportedAt: Date = Date()) -> [String: Any] {
         [
             "eventType": event,

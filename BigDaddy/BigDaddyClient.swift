@@ -853,7 +853,15 @@ final class BigDaddyClient: @unchecked Sendable {
 
             do {
                 _ = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
-                PendingQueue.removeFirst(1)
+                guard PendingQueue.removeFirst(1) else {
+                    // 已经发送成功，但摘除没能落盘（磁盘满/权限问题）——磁盘上的队首
+                    // 其实还是这一条。跟网络失败一视同仁，立刻退出：继续循环只会把
+                    // 这条已经发过的记录当成"新的队首"再读到、每隔几秒重发一次，
+                    // 没有自然终止条件。留给下一个触发点（网络路径变化/下次心跳成功/
+                    // 60 秒兜底轮询）重试，那时磁盘问题可能已经恢复。
+                    NSLog("BigDaddy: backfill interrupted, sent but could not persist removal (disk write failing?)")
+                    return
+                }
                 sent += 1
                 consecutiveRateLimits = 0
             } catch let error as BigDaddyAPIError where error.isRateLimited {
@@ -874,7 +882,13 @@ final class BigDaddyClient: @unchecked Sendable {
                 // 必须丢掉它，否则这条"毒丸"会永远卡在队首，把它后面所有正常记录一起堵死
                 // （典型来源：旧版客户端写下的、字段已经不兼容的队列条目）。
                 NSLog("BigDaddy: dropping unacceptable queued entry (HTTP \(error.statusCode)): \(error.errorDescription ?? "")")
-                PendingQueue.removeFirst(1)
+                guard PendingQueue.removeFirst(1) else {
+                    // 同上：丢弃动作没能落盘，磁盘上这条"毒丸"还在队首。继续循环会
+                    // 把它当队首重新读到，重复走一遍同样注定失败的请求——同样退避，
+                    // 留给下一个触发点重试。
+                    NSLog("BigDaddy: backfill interrupted, could not persist drop of poison entry (disk write failing?)")
+                    return
+                }
                 continue
             } catch {
                 // 网络又断了：队列原样保留，等下一个触发点
@@ -2226,19 +2240,25 @@ enum PendingQueue {
         return currentEntries().prefix(limit).compactMap { decode($0.line) }
     }
 
-    /// 摘掉队首 count 条（已确认送达的）。
+    /// 摘掉队首 count 条（已确认送达的）。返回是否真的落盘成功。
     ///
     /// 仍然是**每摘一条落盘一次**，没有攒批：补发的语义是"服务端已经确认收下了这一条"，
     /// 把落盘推迟就等于在崩溃窗口里留下重复上报的机会。一次写盘（几百 KB 的密封+原子
     /// 写）本来也不是这里的瓶颈——瓶颈是原先每次都要把整份重新解析一遍，那部分已经被
     /// 内存镜像消掉了。
-    static func removeFirst(_ count: Int) {
-        guard count > 0 else { return }
+    ///
+    /// 返回值存在的理由：如果这次落盘失败（磁盘满/权限问题，见 persist 的注释），
+    /// 磁盘上的队首其实**没有**被摘掉，下次读盘还会读到同一条。调用方（drainPendingQueue）
+    /// 靠这个返回值判断"摘除到底有没有真的生效"，失败时必须停手，否则会把已经发送
+    /// 成功的同一条记录当成"新的队首"每隔几秒重发一次，没有自然终止条件。
+    @discardableResult
+    static func removeFirst(_ count: Int) -> Bool {
+        guard count > 0 else { return true }
         lock.lock()
         defer { lock.unlock() }
         var entries = currentEntries()
         entries.removeFirst(min(count, entries.count))
-        persist(entries)
+        return persist(entries)
     }
 
     private static func decode(_ line: String) -> [String: Any]? {
@@ -2278,16 +2298,19 @@ enum PendingQueue {
         readLines().map { Entry(line: $0, reportedAt: reportedAt(of: $0)) }
     }
 
-    /// 调用方必须已持有 lock。落盘成功才更新镜像。
-    private static func persist(_ entries: [Entry]) {
+    /// 调用方必须已持有 lock。落盘成功才更新镜像。返回是否真的落盘成功——
+    /// removeFirst 靠它判断"摘除有没有真的生效"，见该函数的注释。
+    @discardableResult
+    private static func persist(_ entries: [Entry]) -> Bool {
         guard write(entries.map(\.line)) else {
             // 落盘失败（磁盘满、权限、密钥读不出来）。镜像已经不能代表磁盘了，丢掉它，
             // 下次访问重新读盘——退回慢路径，但绝不拿一份跟磁盘对不上的账继续记：
             // 那会让"已经补发过的条目"在镜像里消失、在磁盘上还在，下次启动重复上报。
             cache = nil
-            return
+            return false
         }
         cache = entries
+        return true
     }
 
     /// 先按新的 AES-GCM 加密格式解密；如果失败（多半是磁盘上还留着升级前的旧版本
