@@ -610,7 +610,7 @@ final class BigDaddyClient: @unchecked Sendable {
             "ruleCount": report.ruleCount
         ]
         if let lastAppliedAt = report.lastAppliedAt {
-            body["lastAppliedAt"] = ISO8601DateFormatter().string(from: lastAppliedAt)
+            body["lastAppliedAt"] = BigDaddyDateFormatter.iso8601.string(from: lastAppliedAt)
         }
         if let error = report.error {
             body["error"] = error
@@ -671,13 +671,13 @@ final class BigDaddyClient: @unchecked Sendable {
         var body: [String: Any] = [
             "appVersion": version,
             "eventType": event.rawValue,
-            "lastHeartbeatAt": ISO8601DateFormatter().string(from: Date()),
+            "lastHeartbeatAt": BigDaddyDateFormatter.iso8601.string(from: Date()),
             "activeAppName": activeApp,
             "activeWindowTitle": windowTitle,
             "activeUrl": activeUrl,
             "switchCount": switchCount,
-            "previousCrashAt": reportedCrashAt.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
-            "reportedAt": ISO8601DateFormatter().string(from: Date()),
+            "previousCrashAt": reportedCrashAt.map { BigDaddyDateFormatter.iso8601.string(from: $0) } ?? NSNull(),
+            "reportedAt": BigDaddyDateFormatter.iso8601.string(from: Date()),
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
                 "accessibilityGranted": AXIsProcessTrustedWithOptions(nil),
@@ -719,7 +719,7 @@ final class BigDaddyClient: @unchecked Sendable {
         ]
         // 如果有截图记录，一并上报
         if let lastShot = lastScreenshotAt {
-            body["lastScreenshotAt"] = ISO8601DateFormatter().string(from: lastShot)
+            body["lastScreenshotAt"] = BigDaddyDateFormatter.iso8601.string(from: lastShot)
         } else {
             body["lastScreenshotAt"] = NSNull()
         }
@@ -1941,7 +1941,7 @@ final class BigDaddyClient: @unchecked Sendable {
         let body: [String: Any] = [
             "status": status,
             "message": message,
-            "completedAt": ISO8601DateFormatter().string(from: Date())
+            "completedAt": BigDaddyDateFormatter.iso8601.string(from: Date())
         ]
         _ = try? await request(path: "/bigdaddy/client/commands/\(commandId)/ack", method: "POST", body: body, signed: true)
     }
@@ -2028,6 +2028,13 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 2.5 秒就返回去删墓碑，超时后那条心跳仍在后台跑着。
     private static let runtimeLockGuard = NSLock()
     private static var runtimeLockRetired = false
+    /// 墓碑所在目录是否已经确认存在。只在 runtimeLockGuard 里读写。
+    ///
+    /// touchRuntimeLock 原先每次都无条件 createDirectory 一遍，而它由**每次心跳**调用，
+    /// 心跳又由每次前台切换应用触发（startActivitySwitchTracking），且这一句刻意跑在
+    /// 第一个 await 之前、也就是主线程上（原因见 sendHeartbeat 开头）。目录第一次建好
+    /// 之后，后面每一次都是纯浪费的主线程 syscall。
+    private static var runtimeLockDirectoryEnsured = false
 
     /// 把墓碑刷成"此刻仍然在线"。
     ///
@@ -2045,8 +2052,19 @@ final class BigDaddyClient: @unchecked Sendable {
         defer { runtimeLockGuard.unlock() }
         guard !runtimeLockRetired else { return }
         let lock = lockFileURL
-        try? FileManager.default.createDirectory(at: lock.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
+        if !runtimeLockDirectoryEnsured {
+            try? FileManager.default.createDirectory(
+                at: lock.deletingLastPathComponent(), withIntermediateDirectories: true)
+            runtimeLockDirectoryEnsured = true
+        }
+        do {
+            try "\(Date().timeIntervalSince1970)".data(using: .utf8)?.write(to: lock)
+        } catch {
+            // 写失败最可能的原因就是目录被人删了（清理工具、手动删 Application Support）。
+            // 忘掉"目录已存在"这个记忆，下次调用会重新建——原实现每次都 createDirectory，
+            // 自愈是它顺带具备的性质，缓存之后必须显式补回来，否则墓碑会永久停止刷新。
+            runtimeLockDirectoryEnsured = false
+        }
     }
 
     /// 供 AppDelegate 里独立的墓碑刷新定时器调用（每 30 秒一次），把"最后确认在线"的
@@ -2092,7 +2110,7 @@ enum AuditLog {
     }
 
     static func record(_ line: String) {
-        let stamp = ISO8601DateFormatter().string(from: Date())
+        let stamp = BigDaddyDateFormatter.iso8601.string(from: Date())
         let entry = "\(stamp)\t\(line)\n"
         let url = auditFileURL
         do {
@@ -2117,9 +2135,23 @@ enum AuditLog {
 /// BigDaddyClient 的 NWPathMonitor 触发补发，重新签名（HMAC 时间戳必须是发送时刻的
 /// 新值，不能复用失败时的旧签名）后清空。
 enum PendingQueue {
+    /// **仅供单测**：把队列文件挪到临时目录，避免测试踩坏用户真实的补发队列。
+    /// 生产代码任何地方都不设置它；设置之后必须调 resetForTesting() 把内存镜像一并清掉，
+    /// 否则会拿着上一个文件的镜像去回答新文件的问题。
+    static var testFileURLOverride: URL?
+
     static var queueFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let testFileURLOverride { return testFileURLOverride }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/BigDaddy/pending-heartbeats.jsonl")
+    }
+
+    /// **仅供单测**：丢掉内存镜像，下次访问重新读盘。也用来模拟"进程重启"——
+    /// 这正是验证"镜像和磁盘没有分叉"的唯一手段。
+    static func resetForTesting() {
+        lock.lock()
+        defer { lock.unlock() }
+        cache = nil
     }
 
     /// 队列的保留窗口：**按时长**而不是按条数裁剪。
@@ -2137,19 +2169,41 @@ enum PendingQueue {
 
     /// 队列文件的串行化锁：补发循环在后台任务里读写，实时心跳失败时会从别的线程追加，
     /// 两者都是"整份读出→改→整份写回"，不加锁会互相覆盖（丢事件或写出坏行）。
+    /// 内存镜像 cache 同样只在这把锁里读写。
     private static let lock = NSLock()
+
+    /// 一条队列条目：原始 JSON 行，外加**加载时解析一次**的 reportedAt。
+    ///
+    /// 把 reportedAt 跟着行一起存下来，是为了让按龄裁剪退化成纯 Date 比较。原先每次
+    /// 裁剪都要把每一行重新 JSONSerialization 解析一遍、再 ISO8601 解析一次时间戳，
+    /// 而裁剪在每个入口（depth/peek/removeFirst/enqueue）都要跑一次。
+    private struct Entry {
+        let line: String
+        /// 解析不出来时为 nil ⇒ 这条永不过期。宁可多补一条，不要静默丢。
+        let reportedAt: Date?
+    }
+
+    /// 队列的内存镜像；nil = 还没从磁盘加载过。**本进程是这个文件的唯一写者**
+    /// （多开会被 shouldExitAsDuplicate 挡掉），所以镜像可以当作权威，不必回头校验磁盘。
+    ///
+    /// 这是本类型性能上唯一要紧的地方。补发循环每处理一条就要 peekOldest + removeFirst
+    /// 各一次，而它们原先各自都是"整文件读 + AES-GCM 解密 + 每行 JSON 解析 + 每行
+    /// ISO8601 解析"——队列放满 5000 条时，排空一次就是 5000 轮 × 约一万次解析。加上
+    /// 心跳里还要读两次 depth，而心跳由每次前台切换应用触发（见 startActivitySwitchTracking），
+    /// 这个 O(n²) 是这个 App 最容易被真实用户撞上的性能坑。
+    private static var cache: [Entry]?
 
     static func enqueue(_ body: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: body),
               let line = String(data: data, encoding: .utf8) else { return }
         lock.lock()
         defer { lock.unlock() }
-        var lines = prunedLines()
-        lines.append(line)
-        if lines.count > maxEntries {
-            lines.removeFirst(lines.count - maxEntries)
+        var entries = currentEntries()
+        entries.append(Entry(line: line, reportedAt: reportedAt(of: line)))
+        if entries.count > maxEntries {
+            entries.removeFirst(entries.count - maxEntries)
         }
-        write(lines)
+        persist(entries)
     }
 
     /// 当前积压条数。随心跳上报给后端（metadata.pendingQueueDepth），家长端据此显示
@@ -2158,7 +2212,7 @@ enum PendingQueue {
     static var depth: Int {
         lock.lock()
         defer { lock.unlock() }
-        return prunedLines().count
+        return currentEntries().count
     }
 
     /// 读取**最老的** limit 条但不移除。补发成功后由调用方调 removeFirst 摘掉。
@@ -2169,17 +2223,22 @@ enum PendingQueue {
     static func peekOldest(limit: Int) -> [[String: Any]] {
         lock.lock()
         defer { lock.unlock() }
-        return prunedLines().prefix(limit).compactMap(decode)
+        return currentEntries().prefix(limit).compactMap { decode($0.line) }
     }
 
     /// 摘掉队首 count 条（已确认送达的）。
+    ///
+    /// 仍然是**每摘一条落盘一次**，没有攒批：补发的语义是"服务端已经确认收下了这一条"，
+    /// 把落盘推迟就等于在崩溃窗口里留下重复上报的机会。一次写盘（几百 KB 的密封+原子
+    /// 写）本来也不是这里的瓶颈——瓶颈是原先每次都要把整份重新解析一遍，那部分已经被
+    /// 内存镜像消掉了。
     static func removeFirst(_ count: Int) {
         guard count > 0 else { return }
         lock.lock()
         defer { lock.unlock() }
-        var lines = prunedLines()
-        lines.removeFirst(min(count, lines.count))
-        write(lines)
+        var entries = currentEntries()
+        entries.removeFirst(min(count, entries.count))
+        persist(entries)
     }
 
     private static func decode(_ line: String) -> [String: Any]? {
@@ -2188,24 +2247,52 @@ enum PendingQueue {
         return obj
     }
 
-    /// 读盘并丢掉超出保留窗口的条目。按 body 里的 reportedAt 判龄——那是事件真正发生的
-    /// 时刻，也正是补发上去之后家长在时间线上看到的时刻；用文件写入时间无法区分同一个
-    /// 文件里新旧混杂的条目。解析不出 reportedAt 的条目保留（宁可多补一条，不要静默丢）。
-    private static func prunedLines() -> [String] {
+    /// 一行的 reportedAt。只在这条行**进入内存镜像**的那一刻调用一次——要么是
+    /// enqueue 新追加的，要么是 loadFromDisk 首次读盘时的。
+    ///
+    /// 按 body 里的 reportedAt 判龄，而不是文件写入时间：那是事件真正发生的时刻，也正是
+    /// 补发上去之后家长在时间线上看到的时刻；用文件时间无法区分同一个文件里新旧混杂的条目。
+    private static func reportedAt(of line: String) -> Date? {
+        guard let obj = decode(line),
+              let stamp = obj["reportedAt"] as? String else { return nil }
+        return BigDaddyDateFormatter.iso8601.date(from: stamp)
+    }
+
+    /// 调用方必须已持有 lock。返回**已按保留窗口裁剪过**的当前队列，并把裁剪结果留在镜像里。
+    /// 裁剪只比较 Date，不碰磁盘也不解析任何 JSON。
+    ///
+    /// 跟原来一样，裁剪只发生在内存里：磁盘上的过期条目要等下一次 persist() 才真正消失。
+    private static func currentEntries() -> [Entry] {
         let cutoff = Date().addingTimeInterval(-maxAge)
-        let formatter = ISO8601DateFormatter()
-        return readLines().filter { line in
-            guard let obj = decode(line),
-                  let stamp = obj["reportedAt"] as? String,
-                  let reportedAt = formatter.date(from: stamp) else { return true }
+        let pruned = (cache ?? loadFromDisk()).filter { entry in
+            guard let reportedAt = entry.reportedAt else { return true }
             return reportedAt > cutoff
         }
+        cache = pruned
+        return pruned
+    }
+
+    /// 调用方必须已持有 lock。整份读盘并把每行的 reportedAt 解析出来——**每行只在这里
+    /// 解析一次**，此后都靠内存镜像。进程生命周期内正常只走一次。
+    private static func loadFromDisk() -> [Entry] {
+        readLines().map { Entry(line: $0, reportedAt: reportedAt(of: $0)) }
+    }
+
+    /// 调用方必须已持有 lock。落盘成功才更新镜像。
+    private static func persist(_ entries: [Entry]) {
+        guard write(entries.map(\.line)) else {
+            // 落盘失败（磁盘满、权限、密钥读不出来）。镜像已经不能代表磁盘了，丢掉它，
+            // 下次访问重新读盘——退回慢路径，但绝不拿一份跟磁盘对不上的账继续记：
+            // 那会让"已经补发过的条目"在镜像里消失、在磁盘上还在，下次启动重复上报。
+            cache = nil
+            return
+        }
+        cache = entries
     }
 
     /// 先按新的 AES-GCM 加密格式解密；如果失败（多半是磁盘上还留着升级前的旧版本
     /// 明文 JSONL 文件），一次性按明文兼容读取。读到的内容会在下一次 write()（无论是
-    /// enqueue 追加新条目，还是 drainAll 清空队列）时按新格式重新落盘，之后就不再
-    /// 需要兼容分支。
+    /// enqueue 追加新条目，还是补发摘除队首）时按新格式重新落盘，之后就不再需要兼容分支。
     private static func readLines() -> [String] {
         guard let data = try? Data(contentsOf: queueFileURL) else { return [] }
         if let text = decrypt(data) {
@@ -2218,12 +2305,19 @@ enum PendingQueue {
         return []
     }
 
-    private static func write(_ lines: [String]) {
+    /// 落盘。返回是否确实写成功——调用方（persist）靠它决定内存镜像还能不能信。
+    private static func write(_ lines: [String]) -> Bool {
         let url = queueFileURL
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let text = lines.joined(separator: "\n")
-        guard let sealed = encrypt(text) else { return }
-        try? sealed.write(to: url, options: .atomic)
+        guard let sealed = encrypt(text) else { return false }
+        do {
+            try sealed.write(to: url, options: .atomic)
+            return true
+        } catch {
+            NSLog("BigDaddy: pending queue write failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     private static func encrypt(_ text: String) -> Data? {
@@ -2251,7 +2345,23 @@ enum PendingQueueCrypto {
             .appendingPathComponent("Library/Application Support/BigDaddy/pending-queue-key")
     }
 
+    /// 进程内只读一次盘。上面那句"每次启动直接复用同一把密钥"说的就是这个意思——
+    /// 原先每次 encrypt/decrypt 都要重新读一遍密钥文件，而补发排空时这两个操作每条
+    /// 记录都要各走一次。密钥一旦确定，本进程生命周期内不会再变（真被外部换掉了，
+    /// 之前落盘的队列本来也解不开了）。
+    private static let keyLock = NSLock()
+    private static var cachedKey: SymmetricKey?
+
     static func loadOrCreateKey() -> SymmetricKey {
+        keyLock.lock()
+        defer { keyLock.unlock() }
+        if let cachedKey { return cachedKey }
+        let key = loadOrCreateKeyFromDisk()
+        cachedKey = key
+        return key
+    }
+
+    private static func loadOrCreateKeyFromDisk() -> SymmetricKey {
         if let data = try? Data(contentsOf: keyFileURL), data.count == 32 {
             return SymmetricKey(data: data)
         }
@@ -2315,6 +2425,7 @@ enum LaunchAtLoginController {
             guard status != .enabled && status != .requiresApproval else { return }
             do {
                 try SMAppService.mainApp.register()
+                OSLevelStatusCache.invalidate()
                 AuditLog.record("LAUNCH_AT_LOGIN_REGISTERED via=SMAppService")
             } catch {
                 // 常见于 DEBUG 裸二进制（非 .app bundle）或未签名场景；如实记录、不崩。
@@ -2335,6 +2446,7 @@ enum LaunchAtLoginController {
             guard status == .enabled || status == .requiresApproval else { return }
             do {
                 try SMAppService.mainApp.unregister()
+                OSLevelStatusCache.invalidate()
                 AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService")
             } catch {
                 NSLog("BigDaddy: SMAppService unregister failed: \(error.localizedDescription)")
@@ -2347,9 +2459,16 @@ enum LaunchAtLoginController {
     /// OS 层实际状态字符串，供心跳上报。它与本地偏好 LaunchAtLoginPreference 可能不一致：
     /// 家长端据此能看出"孩子在系统设置里手动关掉了自启"（偏好还是 enabled，但这里变成
     /// notRegistered）这类客户端 App 内开关拦不住的绕过。
+    ///
+    /// 走 OSLevelStatusCache：这个属性只被 sendHeartbeat 的 metadata 读，而下面那次探测
+    /// 压着一回 plist 读盘 + 一个 `launchctl print` 子进程。缓存的取舍见该类型的注释。
+    static var osLevelStatusDescription: String {
+        OSLevelStatusCache.value(for: "launchAtLogin") { probeOSLevelStatus() }
+    }
+
     /// 连续性模式打开时 13+ 会注销 SMAppService、改用 LaunchAgent RunAtLoad，所以这里
     /// 先看 agent 的 RunAtLoad，再回退到 SMAppService / 文件是否存在。
-    static var osLevelStatusDescription: String {
+    private static func probeOSLevelStatus() -> String {
         if let plist = LaunchAgentInstaller.readInstalled(), LaunchAgentPlist.runAtLoad(from: plist) {
             return Launchctl.isLoaded() ? "enabled" : "plistPresent"
         }
@@ -2414,6 +2533,48 @@ enum LaunchAgentPlist {
     }
 }
 
+/// 心跳上报用的 OS 层状态缓存。
+///
+/// LaunchAtLoginController / ContinuityModeController 的 osLevelStatusDescription 都要先读
+/// 一次 LaunchAgent plist、再 `launchctl print` 一把（后者在本进程不归 launchd 托管时还要
+/// 多一次 jobPid()）。每次 Launchctl.run 都是一次 fork + exec + waitUntilExit，实测约 8ms
+/// 挂在调用线程上。而这两个属性**只有一个调用点**——sendHeartbeat 的 metadata——心跳又由
+/// 每次前台切换应用触发（startActivitySwitchTracking，2 秒防抖），连续性模式开着、孩子在
+/// 密集 alt-tab 时，就是每 2 秒 fork 两三个进程、白等几十毫秒，只为了重复回答同一个答案。
+///
+/// 用 TTL 而不是永久缓存：这两个字段的意义恰恰是"察觉有人从系统设置里把自启/连续性关了"，
+/// 那是外部变化，必须还看得见。60 秒与活跃态心跳间隔同量级，家长端拿到的新鲜度不变，只是
+/// 把同一分钟内的重复探测合并掉。我们**自己**改状态的每条路径（装/卸 plist、SMAppService
+/// 注册注销、launchctl bootstrap/bootout/kickstart）都会显式 invalidate()，所以自家操作的
+/// 结果立刻可见，不必等 TTL 过期。
+enum OSLevelStatusCache {
+    private static let ttl: TimeInterval = 60
+    private static let lock = NSLock()
+    private static var cached: [String: (value: String, at: Date)] = [:]
+
+    static func value(for key: String, compute: () -> String) -> String {
+        lock.lock()
+        if let entry = cached[key], Date().timeIntervalSince(entry.at) < ttl {
+            lock.unlock()
+            return entry.value
+        }
+        lock.unlock()
+        // 刻意不在锁里跑 compute：它会 fork launchctl 并同步等待，占着锁会让另一个字段
+        // 的查询一起阻塞。代价是偶尔两个线程各探一次，两次结果相同，无害。
+        let value = compute()
+        lock.lock()
+        cached[key] = (value, Date())
+        lock.unlock()
+        return value
+    }
+
+    static func invalidate() {
+        lock.lock()
+        cached.removeAll()
+        lock.unlock()
+    }
+}
+
 enum Launchctl {
     static var uid: uid_t { getuid() }
     static var domain: String { "gui/\(uid)" }
@@ -2453,16 +2614,21 @@ enum Launchctl {
         return pid_t(digits)
     }
 
+    // 下面三条会改变 job 的加载状态，跑完必须作废 OSLevelStatusCache——否则家长端要等
+    // 最多一个 TTL 才看得到我们自己刚做的改动。只读的 print（isLoaded/jobPid）不用管。
     static func bootout() {
         _ = run(["bootout", serviceTarget])
+        OSLevelStatusCache.invalidate()
     }
 
     static func bootstrap(plistURL: URL) -> Bool {
-        run(["bootstrap", domain, plistURL.path]).status == 0
+        defer { OSLevelStatusCache.invalidate() }
+        return run(["bootstrap", domain, plistURL.path]).status == 0
     }
 
     static func kickstart() {
         _ = run(["kickstart", "-k", serviceTarget])
+        OSLevelStatusCache.invalidate()
     }
 }
 
@@ -2496,6 +2662,7 @@ enum LaunchAgentInstaller {
         guard let data = LaunchAgentPlist.data(from: plist) else { return }
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: url, options: .atomic)
+        OSLevelStatusCache.invalidate()
         AuditLog.record("LAUNCH_AGENT_INSTALLED path=\(executablePath) keepAlive=\(crashRelaunch) runAtLoad=\(runAtLoad)")
     }
 
@@ -2508,6 +2675,7 @@ enum LaunchAgentInstaller {
         let url = launchAgentURL
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         try? FileManager.default.removeItem(at: url)
+        OSLevelStatusCache.invalidate()
         AuditLog.record("LAUNCH_AGENT_UNINSTALLED")
     }
 }
@@ -2613,7 +2781,13 @@ enum ContinuityModeController {
         return env
     }
 
+    /// 走 OSLevelStatusCache，同 LaunchAtLoginController.osLevelStatusDescription。这一个更贵：
+    /// 未被 launchd 托管时 isLaunchdManaged 还要再 fork 一次 `launchctl print` 取 jobPid。
     static var osLevelStatusDescription: String {
+        OSLevelStatusCache.value(for: "continuityMode") { probeOSLevelStatus() }
+    }
+
+    private static func probeOSLevelStatus() -> String {
         guard let plist = LaunchAgentInstaller.readInstalled(),
               LaunchAgentPlist.crashRelaunch(from: plist) else {
             return "off"
@@ -3011,6 +3185,21 @@ extension JSONEncoder {
         }
         return encoder
     }
+}
+
+/// **输出**用的共享 ISO 8601 formatter（解析走 BigDaddyDateParser，那边另有一套
+/// 兼容多种格式的实例）。
+///
+/// 单独共享一份的理由是频率：ISO8601DateFormatter 的构造并不便宜（内部要建一个
+/// CFDateFormatter 并绑 locale），而 sendHeartbeat 一次就要用三四回，心跳本身又由
+/// **每次前台切换应用**触发（见 startActivitySwitchTracking，2 秒防抖），密集 alt-tab
+/// 时这是全 App 最高频的路径；AuditLog.record 也是每条记录新建一个。
+///
+/// 配置完之后只调 string(from:)/date(from:)，与 BigDaddyDateParser 里那几个共享静态
+/// 实例同一个用法。默认 formatOptions（.withInternetDateTime）必须保持不变——上报给
+/// 后端的时间戳格式由它决定。
+enum BigDaddyDateFormatter {
+    static let iso8601 = ISO8601DateFormatter()
 }
 
 enum BigDaddyDateParser {

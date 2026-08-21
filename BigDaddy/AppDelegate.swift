@@ -342,7 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 补报的 START 心跳上才计算，其余调用方留 nil，见 sendHeartbeat 的参数文档。
             var filterExtensionSurvivedGap: Bool?
             if let crashedAt = client.detectedPreviousCrash {
-                AuditLog.record("PREVIOUS_CRASH_DETECTED at=\(ISO8601DateFormatter().string(from: crashedAt))")
+                AuditLog.record("PREVIOUS_CRASH_DETECTED at=\(BigDaddyDateFormatter.iso8601.string(from: crashedAt))")
                 filterExtensionSurvivedGap = await webFilterController.extensionSurvivedGap(since: crashedAt)
             }
             await client.sendHeartbeat(event: .start, filterExtensionSurvivedGap: filterExtensionSurvivedGap)

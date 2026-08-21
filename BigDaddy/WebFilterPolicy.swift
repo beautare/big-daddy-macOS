@@ -20,6 +20,17 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     let blockedDomains: [WebFilterRule]
     let appliedAt: Date
 
+    /// blockedDomains 的预归一化索引。**不参与编码，也不参与相等判断**——它完全由
+    /// blockedDomains 决定，是同一份数据的另一种摆法，编进 vendorConfiguration 只会
+    /// 让线上格式凭空多出一份冗余，参与 == 则会让"同样的规则"因为索引内部顺序不同
+    /// 而判成不等（那会把 reloadPolicy 末尾的 `policy == nextPolicy` 守卫弄坏）。
+    /// 所以 CodingKeys 里没有它，== 也是手写的。
+    private let matcher: DomainMatcher
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, enabled, revision, blockedDomains, appliedAt
+    }
+
     init(
         configuration: WebFilterConfiguration,
         isDeviceBound: Bool,
@@ -30,18 +41,69 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         self.revision = configuration.revision
         self.blockedDomains = configuration.blockedDomains
         self.appliedAt = appliedAt
+        self.matcher = DomainMatcher(rules: configuration.blockedDomains)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        revision = try container.decode(Int64.self, forKey: .revision)
+        blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
+        appliedAt = try container.decode(Date.self, forKey: .appliedAt)
+        matcher = DomainMatcher(rules: blockedDomains)
+    }
+
+    static func == (lhs: WebFilterPolicySnapshot, rhs: WebFilterPolicySnapshot) -> Bool {
+        lhs.schemaVersion == rhs.schemaVersion
+            && lhs.enabled == rhs.enabled
+            && lhs.revision == rhs.revision
+            && lhs.blockedDomains == rhs.blockedDomains
+            && lhs.appliedAt == rhs.appliedAt
     }
 
     func blocks(hostname: String) -> Bool {
         guard enabled else { return false }
-        let candidate = DomainName.normalize(hostname)
-        return blockedDomains.contains { rule in
-            let blocked = DomainName.normalize(rule.domain)
-            if candidate == blocked {
-                return true
+        return matcher.matches(DomainName.normalize(hostname))
+    }
+}
+
+/// 域名黑名单的匹配索引：**规则侧的归一化只在策略构造时做一次**。
+///
+/// 为什么值得单独立一个类型：`blocks(hostname:)` 由 FilterDataProvider.handleNewFlow
+/// 逐条连接调用，是全项目唯一频率没有上限的路径（这台机器上**所有**程序的每一条新
+/// 连接都从那里过），而 reloadPolicy 还会拿跟踪表里最多 2048 条流各调一次。原先的写法
+/// 在这条路径上对**每条规则**重算一遍 `DomainName.normalize(rule.domain)`——三次字符串
+/// 堆分配——再拼一次 `".\(blocked)"` 又一次分配，可规则侧的结果是常量，策略不变它就
+/// 不会变。每条连接 × 每条规则 4 次分配，全部是白烧的。
+///
+/// 顺带把线性扫描换成 Set 精确匹配；子域仍然只能逐条比后缀，但那部分规则通常更少，
+/// 而且后缀字符串已经预先拼好了前导点。
+struct DomainMatcher {
+    /// 精确匹配的域名（已归一化）。注意**所有**规则都进这里，不只是 includeSubdomains
+    /// 为 false 的那些——原实现对每条规则都先试一次全等，行为要一致。
+    private let exact: Set<String>
+    /// 需要连子域一起匹配的规则，已经预先拼好前导点（".example.com"）。
+    private let dottedSuffixes: [String]
+
+    init(rules: [WebFilterRule]) {
+        var exact: Set<String> = []
+        var dottedSuffixes: [String] = []
+        for rule in rules {
+            let domain = DomainName.normalize(rule.domain)
+            exact.insert(domain)
+            if rule.includeSubdomains {
+                dottedSuffixes.append(".\(domain)")
             }
-            return rule.includeSubdomains && candidate.hasSuffix(".\(blocked)")
         }
+        self.exact = exact
+        self.dottedSuffixes = dottedSuffixes
+    }
+
+    /// candidate 必须是**已经过 DomainName.normalize** 的主机名。
+    func matches(_ candidate: String) -> Bool {
+        if exact.contains(candidate) { return true }
+        return dottedSuffixes.contains { candidate.hasSuffix($0) }
     }
 }
 

@@ -61,6 +61,52 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertEqual(WebFilterPolicyTransport.policy(from: vendorConfiguration), policy)
     }
 
+    /// 回归测试：**解码出来的策略也必须能拦**。
+    ///
+    /// provider 拿到策略只有一条路——vendorConfiguration → `init(from:)`（见
+    /// FilterDataProvider.reloadPolicy），构造器那条路只在主 App 侧走。匹配索引
+    /// DomainMatcher 是不编码的派生数据，两个初始化器都得各自把它建起来；`init(from:)`
+    /// 里漏掉的话，单测和主 App 全都照常绿灯，只有扩展里的 blocks() 会永远返回 false，
+    /// 表现成"限制开着、什么都拦不住"，且没有任何报错。这条断言专门钉住那个缺口。
+    func testDecodedPolicyStillBlocks() throws {
+        let policy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "example.com", includeSubdomains: true),
+            WebFilterRule(domain: "exact.org", includeSubdomains: false)
+        ])
+        let vendorConfiguration = try WebFilterPolicyTransport.vendorConfiguration(for: policy)
+        let decoded = try XCTUnwrap(WebFilterPolicyTransport.policy(from: vendorConfiguration))
+
+        XCTAssertTrue(decoded.blocks(hostname: "example.com"))
+        XCTAssertTrue(decoded.blocks(hostname: "cdn.example.com"))
+        XCTAssertTrue(decoded.blocks(hostname: "exact.org"))
+        XCTAssertFalse(decoded.blocks(hostname: "www.exact.org"))
+        XCTAssertFalse(decoded.blocks(hostname: "notexample.com"))
+    }
+
+    /// 多条规则混合时，includeSubdomains 必须**逐条**生效，不能被同一份索引里的
+    /// 其他规则带歪：只有标了 includeSubdomains 的那条才吃子域。
+    func testMixedRulesKeepPerRuleSubdomainScope() {
+        let policy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "wide.com", includeSubdomains: true),
+            WebFilterRule(domain: "narrow.com", includeSubdomains: false)
+        ])
+
+        XCTAssertTrue(policy.blocks(hostname: "wide.com"))
+        XCTAssertTrue(policy.blocks(hostname: "a.b.wide.com"))
+        XCTAssertTrue(policy.blocks(hostname: "narrow.com"))
+        XCTAssertFalse(policy.blocks(hostname: "a.narrow.com"))
+    }
+
+    /// 规则侧的大小写/空白/尾点在建索引时就要归一化掉，跟主机名侧一样。
+    func testRuleSideIsNormalizedWhenIndexed() {
+        let policy = makePolicy(enabled: true, rules: [
+            WebFilterRule(domain: "  EXAMPLE.COM.  ", includeSubdomains: true)
+        ])
+
+        XCTAssertTrue(policy.blocks(hostname: "example.com"))
+        XCTAssertTrue(policy.blocks(hostname: "CDN.Example.Com"))
+    }
+
     func testProviderAcknowledgementConfirmsMatchingPolicy() {
         let policy = makePolicy(enabled: true, rules: [
             WebFilterRule(domain: "example.com", includeSubdomains: true)
