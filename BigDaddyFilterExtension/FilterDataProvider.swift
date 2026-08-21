@@ -441,11 +441,17 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// 不能独立扛下这条防线的另一个原因——它连"什么时候能读"都不能保证。
     private func isLikelyQUIC(_ flow: NEFilterSocketFlow) -> Bool {
         guard flow.socketProtocol == IPPROTO_UDP else { return false }
+        // remoteFlowEndpoint 这个符号本身要 macOS 15 SDK（Xcode 16+）才存在于头文件里，
+        // #available 只挡运行时、挡不住编译期缺符号——CI 目前用 Xcode 15.4（macOS 14.5
+        // SDK）编译，没有 compiler(>=6.0) 这道闸门的话直接编译失败，跟能不能跑到 macOS 15
+        // 没关系。
+        #if compiler(>=6.0)
         if #available(macOS 15.0, *), let endpoint = flow.remoteFlowEndpoint {
             if case let .hostPort(_, port) = endpoint {
                 return port.rawValue == 443
             }
         }
+        #endif
         if let endpoint = flow.remoteEndpoint as? NWHostEndpoint {
             return endpoint.port == "443"
         }

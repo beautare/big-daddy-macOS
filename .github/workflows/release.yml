@@ -170,7 +170,16 @@ jobs:
       - name: Update appcast.xml on gh-pages
         env:
           MIN_OS: "12.4"
-          DMG_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
+          # DMG 走官网（Cloudflare Worker 代理 GitHub Release，见 big-daddy-dashboard
+          # 的 worker.ts）而不是直接给 github.com 的地址：直连 GitHub 下载在部分网络
+          # 环境下会失败，而失败的是**后台静默更新**，那台机器上没有任何人会看到报错，
+          # 结果就是它悄无声息地停在旧版本上。
+          #
+          # 这一条对**存量安装**同样生效：老客户端的 SUFeedURL 焊死在 Info.plist 里、
+          # 指向 gh-pages，改不了；但它们读到的 <enclosure url> 是这里生成的，所以从
+          # 这个版本起，它们的下载这一跳自动改走官网。取 feed 那一跳只有新装的客户端
+          # 能改（新 Info.plist 的 SUFeedURL 指向 https://bigdaddy.mom/appcast.xml）。
+          DMG_URL: https://bigdaddy.mom/downloads/mac/release/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
           EDSIGNATURE: ${{ steps.sparkle_sign.outputs.signature }}
           DMG_LENGTH: ${{ steps.sparkle_sign.outputs.length }}
           RELEASE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
