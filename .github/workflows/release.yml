@@ -167,35 +167,51 @@ jobs:
             dist/checksums.txt
           generate_release_notes: true
 
-      - name: Update appcast.xml on gh-pages
+      # gh-pages 上发两份 appcast，区别只在 <enclosure url> 指向哪里：
+      #
+      #   appcast.xml         DMG 走官网（Cloudflare Worker 代理 GitHub Release）
+      #   appcast-github.xml  DMG 走 github.com，全程不依赖官网
+      #
+      # 为什么要两份：客户端默认从官网取 feed、从官网下 DMG，这样孩子的 Mac 全程不需要
+      # 直连 GitHub（直连在部分网络环境下会失败，而失败的是**后台静默更新**，那台机器上
+      # 没有任何人会看到报错，结果是它悄无声息地停在旧版本上）。但万一官网本身出问题，
+      # 就需要一条和它完全无关的退路——客户端会回落到 appcast-github.xml，那份里的地址
+      # 从头到尾不碰官网（见 AppDelegate 的 feedURLStringForUpdater）。如果只发一份、
+      # 把地址全改成官网，这条退路就名存实亡：feed 换了源，DMG 还是下不来。
+      #
+      # 主 appcast.xml 用官网地址这件事对**存量安装**也有意义：老客户端的 SUFeedURL 焊死
+      # 在 Info.plist 里指向 gh-pages，改不了，但它们读到的 <enclosure url> 是这里生成的，
+      # 所以从这个版本起，它们的下载这一跳自动改走官网。
+      - name: Update appcasts on gh-pages
         env:
           MIN_OS: "12.4"
-          # DMG 走官网（Cloudflare Worker 代理 GitHub Release，见 big-daddy-dashboard
-          # 的 worker.ts）而不是直接给 github.com 的地址：直连 GitHub 下载在部分网络
-          # 环境下会失败，而失败的是**后台静默更新**，那台机器上没有任何人会看到报错，
-          # 结果就是它悄无声息地停在旧版本上。
-          #
-          # 这一条对**存量安装**同样生效：老客户端的 SUFeedURL 焊死在 Info.plist 里、
-          # 指向 gh-pages，改不了；但它们读到的 <enclosure url> 是这里生成的，所以从
-          # 这个版本起，它们的下载这一跳自动改走官网。取 feed 那一跳只有新装的客户端
-          # 能改（新 Info.plist 的 SUFeedURL 指向 https://bigdaddy.mom/appcast.xml）。
-          DMG_URL: https://bigdaddy.mom/downloads/mac/release/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
           EDSIGNATURE: ${{ steps.sparkle_sign.outputs.signature }}
           DMG_LENGTH: ${{ steps.sparkle_sign.outputs.length }}
           RELEASE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+          CDN_DMG_URL: https://bigdaddy.mom/downloads/mac/release/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
+          GITHUB_DMG_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
         run: |
           git fetch origin gh-pages --depth=1 2>/dev/null || true
           mkdir -p public
-          if git show origin/gh-pages:appcast.xml > public/appcast.xml.tmp 2>/dev/null; then
-            mv public/appcast.xml.tmp public/appcast.xml
-            echo "Loaded existing appcast.xml from gh-pages"
-          else
-            rm -f public/appcast.xml.tmp
-            echo "No existing gh-pages appcast.xml, will create a new one"
-          fi
-          APPCAST_PATH=public/appcast.xml ./scripts/update_appcast.sh
 
-      - name: Publish appcast.xml to gh-pages
+          # 两份都要先从 gh-pages 取回已有内容再追加。publish 那步是 keep_files: false，
+          # public/ 里没有的文件会被直接删掉——漏掉任何一份都等于把它的历史条目清空。
+          for name in appcast appcast-github; do
+            if git show "origin/gh-pages:${name}.xml" > "public/${name}.xml.tmp" 2>/dev/null; then
+              mv "public/${name}.xml.tmp" "public/${name}.xml"
+              echo "Loaded existing ${name}.xml from gh-pages"
+            else
+              rm -f "public/${name}.xml.tmp"
+              echo "No existing gh-pages ${name}.xml, will create a new one"
+            fi
+          done
+
+          APPCAST_PATH=public/appcast.xml DMG_URL="${CDN_DMG_URL}" ./scripts/update_appcast.sh
+          APPCAST_PATH=public/appcast-github.xml DMG_URL="${GITHUB_DMG_URL}" \
+            APPCAST_LINK=https://beautare.github.io/big-daddy-macOS/appcast-github.xml \
+            ./scripts/update_appcast.sh
+
+      - name: Publish appcasts to gh-pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}

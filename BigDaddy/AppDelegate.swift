@@ -2582,6 +2582,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         updaterController.checkForUpdates(nil)
     }
 
+    // MARK: - SPUUpdaterDelegate（feed 主备切换）
+
+    /// 官网挂掉时的备用 feed。它和主 feed 的唯一区别是里面的 <enclosure url> 指向
+    /// github.com 而不是官网（两份都由 release.yml 同时发布到 gh-pages），因此这条
+    /// 退路从取 feed 到下 DMG 全程不碰官网——否则"换了个地址取 feed、DMG 还是从挂掉的
+    /// 官网下"，等于没有退路。
+    private nonisolated static let fallbackFeedURL = "https://beautare.github.io/big-daddy-macOS/appcast-github.xml"
+
+    /// 下一次检查是否改用备用 feed。
+    ///
+    /// 存 UserDefaults 而不是存实例变量：feedURLStringForUpdater 要同步返回结果、没法
+    /// 跳回 @MainActor 读属性，而 UserDefaults 本身是线程安全的。顺带也扛得住重启——
+    /// 官网出问题往往不是一两分钟的事。
+    private nonisolated static let fallbackFeedDefaultsKey = "BigDaddyUpdateFeedUsingFallback"
+
+    private nonisolated static var usingFallbackFeed: Bool {
+        get { UserDefaults.standard.bool(forKey: fallbackFeedDefaultsKey) }
+        set { UserDefaults.standard.set(newValue, forKey: fallbackFeedDefaultsKey) }
+    }
+
+    /// 返回 nil = 用 Info.plist 里的 SUFeedURL（官网）。只有上一次检查明确栽在
+    /// "取 feed / 下载" 这类网络问题上时，这一次才改走备用 feed。
+    nonisolated func feedURLString(for updater: SPUUpdater) -> String? {
+        Self.usingFallbackFeed ? Self.fallbackFeedURL : nil
+    }
+
+    /// 一轮检查结束（成功、没有新版本、或者失败）时回调，用来决定下一次走哪个 feed。
+    ///
+    /// 注意 error 非 nil 不等于出错：没有可用更新时 Sparkle 也会带着 SUNoUpdateError
+    /// 回调，而那恰恰证明 feed 取回来了、解析也没问题，属于"当前这个 feed 是好的"。
+    /// 真正说明这条通道不通的只有取 feed 和下载这几类错误，其余（安装失败、用户取消）
+    /// 跟 feed 选谁无关，一律不动开关。
+    ///
+    /// 切换用的是"翻转"而不是"锁死到备用"：备用 feed 只是应急，官网恢复后要能自己回去。
+    /// 主 feed 一直坏着时，两个 feed 就交替上阵，每两轮里有一轮能正常查到更新。
+    nonisolated func updater(
+        _ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?
+    ) {
+        guard let error = error as NSError? else {
+            Self.usingFallbackFeed = false
+            return
+        }
+
+        // 只认 Sparkle 自己域里的错误码。底层网络错误 Sparkle 会包成 SUSparkleErrorDomain
+        // 再交上来，其他域的错误落到这里说明不是这套语义，不该拿去比对下面这些码。
+        guard error.domain == SUSparkleErrorDomain else { return }
+
+        switch error.code {
+        case Int(SUError.noUpdateError.rawValue):
+            // feed 是通的，只是没有新版本
+            Self.usingFallbackFeed = false
+        case Int(SUError.appcastError.rawValue),
+             Int(SUError.appcastParseError.rawValue),
+             Int(SUError.downloadError.rawValue):
+            let wasFallback = Self.usingFallbackFeed
+            Self.usingFallbackFeed = !wasFallback
+            AuditLog.record(
+                "UPDATE_FEED_SWITCH from=\(wasFallback ? "fallback" : "primary") code=\(error.code)"
+            )
+        default:
+            break
+        }
+    }
+
     // MARK: - SPUUpdaterDelegate（静默下载完成后，等设备空闲了由本 App 自己静默装上）
     //
     // Sparkle 的协议不带 actor 隔离，而 AppDelegate 整体是 @MainActor，实现只能声明成

@@ -8,13 +8,17 @@ set -euo pipefail
 : "${APPCAST_PATH:?}" "${VERSION:?}" "${BUILD_NUMBER:?}" "${MIN_OS:?}" \
   "${DMG_URL:?}" "${EDSIGNATURE:?}" "${DMG_LENGTH:?}" "${RELEASE_NOTES_URL:?}"
 
+# 新建文件时写进 <channel><link> 的地址。Sparkle 不读这个字段，纯粹是 RSS 元数据，
+# 但同时维护两份 appcast 时（见 release.yml），让每份指向自己的真实地址免得看的人认错。
+APPCAST_LINK="${APPCAST_LINK:-https://bigdaddy.mom/appcast.xml}"
+
 if [[ ! -f "${APPCAST_PATH}" ]]; then
-  cat > "${APPCAST_PATH}" <<'EOF'
+  cat > "${APPCAST_PATH}" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
     <title>BigDaddy Updates</title>
-    <link>https://beautare.github.io/big-daddy-macOS/appcast.xml</link>
+    <link>${APPCAST_LINK}</link>
     <description>BigDaddy for macOS release feed</description>
     <language>zh</language>
     <!-- ITEMS -->

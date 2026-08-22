@@ -37,8 +37,15 @@
   <string>http://localhost:8009/api/v1</string>
   <key>BigDaddyDashboardBaseURL</key>
   <string>http://localhost:4000</string>
+  <!-- feed 走官网而不是 gh-pages 上的 https://beautare.github.io/big-daddy-macOS/appcast.xml：
+       官网是 Cloudflare Worker，它在边缘侧回源取 gh-pages 的 appcast、把 <enclosure url>
+       改写成同域的下载地址（见 big-daddy-dashboard/worker.ts 的 /appcast.xml），于是
+       "取 feed"和"下 DMG"两跳都不再要求这台孩子的 Mac 能直连 GitHub。
+       之前两跳都直连 GitHub，在部分网络环境下必然失败——而且失败的是后台静默更新，
+       那台机器上没有任何人会看到报错，结果是它悄无声息地永远停在旧版本上。
+       Worker 挂掉时由 AppDelegate 的 feedURLStringForUpdater 回落到 gh-pages。 -->
   <key>SUFeedURL</key>
-  <string>https://beautare.github.io/big-daddy-macOS/appcast.xml</string>
+  <string>https://bigdaddy.mom/appcast.xml</string>
   <key>SUPublicEDKey</key>
   <string>+LI1alzpb3qC3FratMxA0qd+C4cDw4ElhV0NPh1U/+4=</string>
   <!-- 4 小时检查一次。Sparkle 对这个值有 1 小时的硬性下限
