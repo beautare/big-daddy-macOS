@@ -2590,22 +2590,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 官网下"，等于没有退路。
     private nonisolated static let fallbackFeedURL = "https://beautare.github.io/big-daddy-macOS/appcast-github.xml"
 
-    /// 下一次检查是否改用备用 feed。
-    ///
-    /// 存 UserDefaults 而不是存实例变量：feedURLStringForUpdater 要同步返回结果、没法
-    /// 跳回 @MainActor 读属性，而 UserDefaults 本身是线程安全的。顺带也扛得住重启——
-    /// 官网出问题往往不是一两分钟的事。
-    private nonisolated static let fallbackFeedDefaultsKey = "BigDaddyUpdateFeedUsingFallback"
-
-    private nonisolated static var usingFallbackFeed: Bool {
-        get { UserDefaults.standard.bool(forKey: fallbackFeedDefaultsKey) }
-        set { UserDefaults.standard.set(newValue, forKey: fallbackFeedDefaultsKey) }
-    }
-
     /// 返回 nil = 用 Info.plist 里的 SUFeedURL（官网）。只有上一次检查明确栽在
     /// "取 feed / 下载" 这类网络问题上时，这一次才改走备用 feed。
+    ///
+    /// 开关本身存在 UpdateFeedState 里（不是这里的私有静态量）：它同时还要被
+    /// sendHeartbeat 读去上报，那才是这次降级唯一能传出这台机器的通道。
     nonisolated func feedURLString(for updater: SPUUpdater) -> String? {
-        Self.usingFallbackFeed ? Self.fallbackFeedURL : nil
+        UpdateFeedState.usingFallback ? Self.fallbackFeedURL : nil
     }
 
     /// 一轮检查结束（成功、没有新版本、或者失败）时回调，用来决定下一次走哪个 feed。
@@ -2621,7 +2612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         _ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?
     ) {
         guard let error = error as NSError? else {
-            Self.usingFallbackFeed = false
+            UpdateFeedState.usingFallback = false
             return
         }
 
@@ -2632,12 +2623,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         switch error.code {
         case Int(SUError.noUpdateError.rawValue):
             // feed 是通的，只是没有新版本
-            Self.usingFallbackFeed = false
+            UpdateFeedState.usingFallback = false
         case Int(SUError.appcastError.rawValue),
              Int(SUError.appcastParseError.rawValue),
              Int(SUError.downloadError.rawValue):
-            let wasFallback = Self.usingFallbackFeed
-            Self.usingFallbackFeed = !wasFallback
+            let wasFallback = UpdateFeedState.usingFallback
+            UpdateFeedState.recordSwitch(toFallback: !wasFallback, errorCode: error.code)
             AuditLog.record(
                 "UPDATE_FEED_SWITCH from=\(wasFallback ? "fallback" : "primary") code=\(error.code)"
             )

@@ -28,6 +28,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 显式选 Xcode，不吃 runner 的默认值。
+      #
+      # 理由不是"想用新工具链"，而是 FilterDataProvider.isLikelyQUIC 里那道
+      # `#if compiler(>=6.0)`：remoteFlowEndpoint 要 macOS 15 SDK 才存在，闸门为假时
+      # 整段 macOS 15 路径**从二进制里消失**，而它兜的正是 HTTP/3 那条防线。产出的包
+      # 不会报错、只会在 macOS 15 上悄悄少一层防护——本仓库反复吃过亏的正是这类无声降级。
+      # 所以这里宁可让构建失败，也不让它静静地出一个退化的包。
+      - name: Select Xcode (needs Swift 6+ / macOS 15 SDK)
+        run: |
+          echo "Available Xcode versions:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "${NEWEST}" ]; then
+            sudo xcode-select -s "${NEWEST}/Contents/Developer"
+          fi
+          echo "Selected: $(xcode-select -p)"
+          xcodebuild -version
+          swift --version
+
+          # 断言 Swift >= 6.0。失败时给出可直接照做的修法，别让人对着一行版本号发呆。
+          SWIFT_MAJOR=$(swift -version 2>&1 | sed -n 's/.*Apple Swift version \([0-9]*\).*/\1/p' | head -1)
+          if [ -z "${SWIFT_MAJOR}" ] || [ "${SWIFT_MAJOR}" -lt 6 ]; then
+            echo "::error::需要 Swift 6+（Xcode 16+ / macOS 15 SDK），当前 runner 最新只有 $(swift -version 2>&1 | head -1)。" \
+                 "否则 isLikelyQUIC 的 macOS 15 分支会被 #if compiler(>=6.0) 编译掉，产出一个在 macOS 15 上" \
+                 "静默失去 HTTP/3 兜底信号的包。修法：把本 job 的 runs-on 换成 macos-15。"
+            exit 1
+          fi
+
       - name: Derive version from tag
         id: version
         run: |
@@ -189,27 +218,60 @@ jobs:
           DMG_LENGTH: ${{ steps.sparkle_sign.outputs.length }}
           RELEASE_NOTES_URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
           CDN_DMG_URL: https://bigdaddy.mom/downloads/mac/release/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
-          GITHUB_DMG_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
+          CDN_DOWNLOAD_PREFIX: https://bigdaddy.mom/downloads/mac/release/
+          GITHUB_DOWNLOAD_PREFIX: https://github.com/${{ github.repository }}/releases/download/
+          GITHUB_APPCAST_LINK: https://beautare.github.io/big-daddy-macOS/appcast-github.xml
         run: |
-          git fetch origin gh-pages --depth=1 2>/dev/null || true
           mkdir -p public
 
-          # 两份都要先从 gh-pages 取回已有内容再追加。publish 那步是 keep_files: false，
-          # public/ 里没有的文件会被直接删掉——漏掉任何一份都等于把它的历史条目清空。
-          for name in appcast appcast-github; do
-            if git show "origin/gh-pages:${name}.xml" > "public/${name}.xml.tmp" 2>/dev/null; then
-              mv "public/${name}.xml.tmp" "public/${name}.xml"
-              echo "Loaded existing ${name}.xml from gh-pages"
+          # appcast.xml 是**唯一的真相来源**，必须原样取回来再追加：publish 那步是
+          # keep_files: false，发上去什么 gh-pages 上就只剩什么。
+          #
+          # 这里刻意不写 `git fetch ... || true`：那样会把"分支不存在"（合法的首次发布）
+          # 和"fetch 失败了"（网络/权限抖动）混成同一条路径，双双走到"新建一份"，于是
+          # 一次抖动就能把 50 多条历史条目连同它们的签名永久抹掉，而 job 照样显示成功。
+          # 改成先用 ls-remote 问清分支到底存不存在，存在就必须 fetch 成功（set -e 兜底）。
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "gh-pages exists, fetching (a failure here must fail the job, not wipe history)"
+            git fetch origin gh-pages --depth=1
+            if git show origin/gh-pages:appcast.xml > public/appcast.xml.tmp 2>/dev/null; then
+              mv public/appcast.xml.tmp public/appcast.xml
+              echo "Loaded existing appcast.xml ($(grep -c '<item>' public/appcast.xml) items)"
             else
-              rm -f "public/${name}.xml.tmp"
-              echo "No existing gh-pages ${name}.xml, will create a new one"
+              rm -f public/appcast.xml.tmp
+              echo "Branch exists but has no appcast.xml yet, creating a new one"
             fi
-          done
+          else
+            echo "gh-pages branch does not exist yet, creating a new appcast.xml"
+          fi
 
           APPCAST_PATH=public/appcast.xml DMG_URL="${CDN_DMG_URL}" ./scripts/update_appcast.sh
-          APPCAST_PATH=public/appcast-github.xml DMG_URL="${GITHUB_DMG_URL}" \
-            APPCAST_LINK=https://beautare.github.io/big-daddy-macOS/appcast-github.xml \
-            ./scripts/update_appcast.sh
+
+          # 备用 feed 由主 feed **派生**，不再独立维护一份。
+          #
+          # 两份独立追加的写法有个隐蔽的坑：appcast-github.xml 是后来才加的，独立追加
+          # 意味着它从它诞生那一刻才开始攒条目——上线首日主 feed 51 条、备用 feed 1 条。
+          # 而 Sparkle 是按 minimumSystemVersion 在 feed 里挑 item 的，历史缺失意味着
+          # 老系统用户一旦回落到备用 feed 就可能一条可用条目都挑不到。派生则天然同构：
+          # 同样的条目、同样的签名，只差 <enclosure url> 指向哪个源。
+          sed -e "s#${CDN_DOWNLOAD_PREFIX}#${GITHUB_DOWNLOAD_PREFIX}#g" \
+              -e "s#<link>[^<]*</link>#<link>${GITHUB_APPCAST_LINK}</link>#" \
+              public/appcast.xml > public/appcast-github.xml
+
+          # 自检。派生是纯文本替换，替漏了不会报错、只会让备用 feed 悄悄指回官网——
+          # 那正好废掉它存在的全部意义（官网挂了才用它）。这里当场验，不留到线上。
+          primary_items=$(grep -c '<item>' public/appcast.xml)
+          fallback_items=$(grep -c '<item>' public/appcast-github.xml)
+          if [ "${primary_items}" -ne "${fallback_items}" ]; then
+            echo "::error::appcast-github.xml 条目数 ${fallback_items} != appcast.xml ${primary_items}"
+            exit 1
+          fi
+          if grep -q 'bigdaddy\.mom' public/appcast-github.xml; then
+            echo "::error::备用 feed 里仍残留官网地址，它就不再是一条独立退路了："
+            grep -n 'bigdaddy\.mom' public/appcast-github.xml
+            exit 1
+          fi
+          echo "Derived appcast-github.xml (${fallback_items} items, no bigdaddy.mom references)"
 
       - name: Publish appcasts to gh-pages
         uses: peaceiris/actions-gh-pages@v4
@@ -218,3 +280,62 @@ jobs:
           publish_dir: ./public
           publish_branch: gh-pages
           keep_files: false
+
+      # 发布后当场验官网这条主路：**这是"下载源降级"唯一能在发布当天被发现的机会**。
+      #
+      # 为什么非验不可：客户端从官网回落到 GitHub 是完全静默的——它只影响后台自动更新，
+      # 孩子和家长的界面上都不会有任何提示。如果 Worker 路由没部署好，官网会用 SPA 的
+      # catch-all 兜底返回 **HTTP 200 + text/html**（不是 404），Sparkle 拿到的就是一段
+      # 网页当 DMG，签名校验失败、更新静默失败。200 这个状态码意味着任何"看状态码"的
+      # 检查都发现不了它，所以下面一律核对 content-type 和字节内容本身。
+      #
+      # 这一步失败 = 这次 workflow 失败 = GitHub 给仓库所有者发一封失败通知邮件。
+      # 这就是"下载源出问题时我能收到通知"的那条通道，不需要额外搭任何东西。
+      - name: Verify CDN update path (guards against silent fallback to GitHub)
+        env:
+          CDN_DMG_URL: https://bigdaddy.mom/downloads/mac/release/${{ github.ref_name }}/${{ steps.sparkle_sign.outputs.dmg_name }}
+          DMG_NAME: ${{ steps.sparkle_sign.outputs.dmg_name }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          # 重试：GitHub Release 资产刚创建，官网 Worker 回源可能还没就绪；
+          # 边缘缓存也可能要一会儿才热。给足退避，别把"还没准备好"报成"坏了"。
+          attempt=0
+          until [ "${attempt}" -ge 5 ]; do
+            attempt=$((attempt + 1))
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -L --max-time 60 "${CDN_DMG_URL}" || echo 000)
+            [ "${code}" = "200" ] && break
+            echo "attempt ${attempt}: HTTP ${code}, retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+
+          ctype=$(curl -sS -o cdn.dmg -w '%{content_type}' -L --max-time 120 "${CDN_DMG_URL}") \
+            || fail "官网下载地址取不到：${CDN_DMG_URL}"
+
+          # content-type 是识破 SPA catch-all 的第一道关：它会以 200 + text/html 回应。
+          case "${ctype}" in
+            application/octet-stream*|binary/octet-stream*|application/x-apple-diskimage*) ;;
+            *) fail "官网下载地址返回的不是二进制（content-type=${ctype}）。这多半是 Worker 路由没生效、被官网 SPA 的 catch-all 兜住了：${CDN_DMG_URL}" ;;
+          esac
+
+          # 字节级比对。这是最终判据——只有它成立，Sparkle 那条 edSignature 才验得过，
+          # 因为签名是对 dist 里这个 DMG 的字节签的。
+          expected=$(shasum -a 256 "dist/${DMG_NAME}" | cut -d' ' -f1)
+          actual=$(shasum -a 256 cdn.dmg | cut -d' ' -f1)
+          if [ "${expected}" != "${actual}" ]; then
+            fail "官网发出的 DMG 与本次构建的产物不一致（expected ${expected}, got ${actual}, $(wc -c < cdn.dmg) bytes）。按这份 appcast 更新的客户端会签名校验失败、静默停在旧版本。"
+          fi
+          echo "CDN DMG OK: ${actual} ($(wc -c < cdn.dmg) bytes)"
+
+          # 主 feed 本身也要是 XML。新装客户端的 SUFeedURL 指向它，它一旦被 catch-all
+          # 兜成 HTML，客户端第一次检查就取不到 feed（之后靠回落自救，但那是降级运行）。
+          feed_ctype=$(curl -sS -o cdn-appcast.xml -w '%{content_type}' -L --max-time 60 https://bigdaddy.mom/appcast.xml) \
+            || fail "官网 appcast 取不到"
+          case "${feed_ctype}" in
+            *xml*) ;;
+            *) fail "官网 appcast 返回的不是 XML（content-type=${feed_ctype}），Worker 的 /appcast.xml 路由多半没生效。" ;;
+          esac
+          grep -q '<rss' cdn-appcast.xml || fail "官网 appcast 内容不是 RSS，前 200 字节：$(head -c 200 cdn-appcast.xml)"
+          echo "CDN appcast OK (${feed_ctype}, $(grep -c '<item>' cdn-appcast.xml) items)"
+
+          rm -f cdn.dmg cdn-appcast.xml

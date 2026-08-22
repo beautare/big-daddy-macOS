@@ -713,6 +713,18 @@ final class BigDaddyClient: @unchecked Sendable {
                 // 限速补发要花几十分钟，没有这个数字的话家长只会看到时间线在自己眼前
                 // 不断长出新内容，读起来像系统在乱跳。
                 "pendingQueueDepth": PendingQueue.depth,
+                // 自动更新的下载源有没有从官网 CDN 退到直连 GitHub（见 UpdateFeedState）。
+                // 这是一件**只有孩子那台机器知道、而且没有任何人会看到**的事：退化只影响
+                // 后台静默更新，界面上不会有任何提示。不上报的话，一次 CDN 故障的表现就是
+                // 一批设备悄无声息地停在旧版本上，而没有任何信号指向原因。
+                //
+                // 三个字段配合着看：usingFallback 是瞬时值（切换是翻转式的，可能恰好抓在
+                // 用主 feed 那一轮）；lastSwitchAt 才是"最近还在反复切换"的可靠依据；
+                // lastErrorCode 说明栽在哪一步（取 feed / 解析 / 下载）。
+                "updateFeedUsingFallback": UpdateFeedState.usingFallback,
+                "updateFeedLastSwitchAt": UpdateFeedState.lastSwitchAt
+                    .map { BigDaddyDateFormatter.iso8601.string(from: $0) } ?? NSNull(),
+                "updateFeedLastErrorCode": UpdateFeedState.lastErrorCode as Any? ?? NSNull(),
                 // 只在补报上次异常终止的那条 START 心跳上才非 nil，见本函数参数文档。
                 "filterExtensionSurvivedGap": filterExtensionSurvivedGap as Any? ?? NSNull()
             ]
@@ -2117,6 +2129,51 @@ final class BigDaddyClient: @unchecked Sendable {
 /// 本机守护记录（知情透明）：把每一次实际发生的采集/上报动作追加到本地明文日志，
 /// 孩子和家长都可以在设备上直接查看或导出，用于印证"采集了什么、什么时候采集"。
 /// 这是"可导出审计留痕"的落地，不是隐蔽后台行为。
+/// 自动更新当前走的是主 feed（官网 CDN）还是备用 feed（gh-pages + 直连 GitHub 下载）。
+///
+/// 从 AppDelegate 里挪出来单独成型，是因为它有两个互不相干的读者：AppDelegate 在
+/// SPUUpdaterDelegate 回调里翻转它，而 sendHeartbeat 要把它捎给后端。**后者才是重点**——
+/// "这台机器已经退到备用下载源了"只发生在孩子那台 Mac 上，本机不会有任何人看到，
+/// 不随心跳上报就等于没人知道（本地 AuditLog 里那条 UPDATE_FEED_SWITCH 只有主动导出
+/// 守护记录时才看得见，指望不上它来发现故障）。
+///
+/// 存 UserDefaults 而不是内存：feedURLString(for:) 要同步返回、没法跳回 @MainActor
+/// 读属性，而 UserDefaults 本身线程安全；顺带也扛得住重启——官网出问题往往不是
+/// 一两分钟的事。
+enum UpdateFeedState {
+    private static let usingFallbackKey = "BigDaddyUpdateFeedUsingFallback"
+    private static let lastSwitchAtKey = "BigDaddyUpdateFeedLastSwitchAt"
+    private static let lastErrorCodeKey = "BigDaddyUpdateFeedLastErrorCode"
+
+    /// 下一次检查是否改用备用 feed。
+    static var usingFallback: Bool {
+        get { UserDefaults.standard.bool(forKey: usingFallbackKey) }
+        set { UserDefaults.standard.set(newValue, forKey: usingFallbackKey) }
+    }
+
+    /// 最近一次主备切换发生在什么时候；从没切换过时为 nil。
+    ///
+    /// 光上报 usingFallback 这一个瞬时值是不够的：切换逻辑是**翻转**而不是锁死
+    /// （见 AppDelegate 里的说明），主 feed 一直坏着时两个 feed 会交替上阵，心跳
+    /// 恰好落在"这一轮用主 feed"上时 usingFallback 就是 false，故障看起来像没发生过。
+    /// 有这个时间戳，后端才能按"最近还在反复切换"来判定，而不是靠抓那个瞬时值。
+    static var lastSwitchAt: Date? {
+        UserDefaults.standard.object(forKey: lastSwitchAtKey) as? Date
+    }
+
+    /// 触发最近一次切换的 Sparkle 错误码；从没切换过时为 nil。
+    static var lastErrorCode: Int? {
+        UserDefaults.standard.object(forKey: lastErrorCodeKey) as? Int
+    }
+
+    /// 记一次主备切换：翻转开关，并留下时刻和错误码供心跳上报。
+    static func recordSwitch(toFallback: Bool, errorCode: Int) {
+        usingFallback = toFallback
+        UserDefaults.standard.set(Date(), forKey: lastSwitchAtKey)
+        UserDefaults.standard.set(errorCode, forKey: lastErrorCodeKey)
+    }
+}
+
 enum AuditLog {
     static var auditFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser

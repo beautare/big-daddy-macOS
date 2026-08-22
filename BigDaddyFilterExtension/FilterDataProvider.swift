@@ -442,15 +442,23 @@ final class FilterDataProvider: NEFilterDataProvider {
     private func isLikelyQUIC(_ flow: NEFilterSocketFlow) -> Bool {
         guard flow.socketProtocol == IPPROTO_UDP else { return false }
         // remoteFlowEndpoint 这个符号本身要 macOS 15 SDK（Xcode 16+）才存在于头文件里，
-        // #available 只挡运行时、挡不住编译期缺符号——CI 目前用 Xcode 15.4（macOS 14.5
-        // SDK）编译，没有 compiler(>=6.0) 这道闸门的话直接编译失败，跟能不能跑到 macOS 15
-        // 没关系。
+        // #available 只挡运行时、挡不住编译期缺符号——用老 Xcode 编译时，没有
+        // compiler(>=6.0) 这道闸门就直接编译失败，跟能不能跑到 macOS 15 没关系。
+        //
+        // 注意这道闸门是有代价的：它一旦为假，整段 macOS 15 的路径**从二进制里消失**，
+        // 而剩下的 remoteEndpoint 恰恰是在 macOS 15 上取不到值的那个（见上面的注释）。
+        // 也就是说用老 Xcode 构建出的包，在 macOS 15 上 isLikelyQUIC 近乎恒假——一次
+        // 无声的降级，正是本文件反复警告的那类故障。所以 CI 显式钉了 Xcode 版本
+        // （见 release.yml 的 "Select Xcode" 一步），这里再加一条编译期告警兜底：
+        // 万一有人在老工具链上出包，日志里至少能看见。
         #if compiler(>=6.0)
         if #available(macOS 15.0, *), let endpoint = flow.remoteFlowEndpoint {
             if case let .hostPort(_, port) = endpoint {
                 return port.rawValue == 443
             }
         }
+        #else
+        #warning("Swift < 6.0：macOS 15 的 remoteFlowEndpoint 路径已被编译掉，isLikelyQUIC 在 macOS 15+ 上近乎恒假（HTTP/3 兜底信号失效）。请用 Xcode 16+ 构建发布包。")
         #endif
         if let endpoint = flow.remoteEndpoint as? NWHostEndpoint {
             return endpoint.port == "443"
