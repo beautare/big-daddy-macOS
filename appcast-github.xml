@@ -7,6 +7,15 @@
     <language>zh</language>
     <!-- ITEMS -->
     <item>
+      <title>Version 0.16.17</title>
+      <pubDate>Sat, 22 Aug 2026 13:37:44 +0000</pubDate>
+      <sparkle:version>16017</sparkle:version>
+      <sparkle:shortVersionString>0.16.17</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.16.17">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.16.17/BigDaddy-v0.16.17.dmg" sparkle:edSignature="O+aRsmkBfk8jJXaP6f6fsQ5MLDY6eeHtUWQFT/78p8iPVFRrItLsNYPQ1ZI3Kh5hcQPNghEAZonYR6+FwgE+Cg==" length="2371378" type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 0.16.15</title>
       <pubDate>Sat, 22 Aug 2026 00:11:30 +0000</pubDate>
       <sparkle:version>16015</sparkle:version>
@@ -14,6 +23,456 @@
       <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
       <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.16.15">View release notes on GitHub</a></p>]]></description>
       <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.16.15/BigDaddy-v0.16.15.dmg" sparkle:edSignature="qhH4CUeVxa5rceRGDET9ZVhE38Fs6EYx/dsUDwIBW2JbopxjDZVp9N0w0WEIF8XOBXikARpP0ZNi74UwqTTGAw==" length="2425684" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.16.6</title>
+      <pubDate>Tue, 18 Aug 2026 09:53:06 +0000</pubDate>
+      <sparkle:version>16006</sparkle:version>
+      <sparkle:shortVersionString>0.16.6</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.16.6">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.16.6/BigDaddy-v0.16.6.dmg" sparkle:edSignature="0xN7iw/lnyo/sXbRX3L4eLnhT8aIid0IorOt4nIJgC0wcX9+ppHXdxgFK1qkQnTaOQrWz5ZxGIYC4QIWHd29DA==" length="2370841" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.15.5</title>
+      <pubDate>Sat, 15 Aug 2026 16:12:03 +0000</pubDate>
+      <sparkle:version>15005</sparkle:version>
+      <sparkle:shortVersionString>0.15.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.15.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.15.5/BigDaddy-v0.15.5.dmg" sparkle:edSignature="FIyJTgn5b8uoMPwWiW5KBGmPCxB6TLa+gIFMRamyjk0S4zHPHCagxS3v7IdW8zYyRGy07MIW7FGpG4i8n+aeAw==" length="2316431" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.15.4</title>
+      <pubDate>Sat, 15 Aug 2026 01:54:55 +0000</pubDate>
+      <sparkle:version>15004</sparkle:version>
+      <sparkle:shortVersionString>0.15.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.15.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.15.4/BigDaddy-v0.15.4.dmg" sparkle:edSignature="zwX06WLJJCI3y8JWnnjUQlMITbFEMtTy/E3QhUs/miX1a3mK6aIm4H5Ppxuqra7mKOraB6TxZEGWgkLab6XMBQ==" length="2316395" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.15.3</title>
+      <pubDate>Fri, 14 Aug 2026 06:36:56 +0000</pubDate>
+      <sparkle:version>15003</sparkle:version>
+      <sparkle:shortVersionString>0.15.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.15.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.15.3/BigDaddy-v0.15.3.dmg" sparkle:edSignature="Mwqz73Kn+5wCEbw9AqpfsYOmQrjla1jSPxL0ClwcPWLU4iNle8nogim5LHF7OTPP3mA288WjrmUc4Mv9vZbgBw==" length="2315846" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.14.6</title>
+      <pubDate>Thu, 13 Aug 2026 02:52:25 +0000</pubDate>
+      <sparkle:version>14006</sparkle:version>
+      <sparkle:shortVersionString>0.14.6</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.14.6">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.14.6/BigDaddy-v0.14.6.dmg" sparkle:edSignature="K2uCM1Em9jYO5CMjmPAt1dQGZ19UBHwQ00+Krsibq63mGgU7At219+ONHCO2Hp+dqFHPvBMVBiz/bat8G1h7Dw==" length="2276113" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.14.5</title>
+      <pubDate>Tue, 11 Aug 2026 12:39:57 +0000</pubDate>
+      <sparkle:version>14005</sparkle:version>
+      <sparkle:shortVersionString>0.14.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.14.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.14.5/BigDaddy-v0.14.5.dmg" sparkle:edSignature="FwZma47pkB3M+n7TCQaCQnkjAQuF0q7XOgbcxp7RUPlDofgfowX2CHYYNc6bkgb5JD07t/1zrIIHa7KdvHmBAw==" length="2273187" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.14.4</title>
+      <pubDate>Mon, 10 Aug 2026 11:54:51 +0000</pubDate>
+      <sparkle:version>14004</sparkle:version>
+      <sparkle:shortVersionString>0.14.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.14.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.14.4/BigDaddy-v0.14.4.dmg" sparkle:edSignature="oH7BKaLPFVEiuIhrFmwUS0PTpSJ8byLMoF5oCYlWByWg0bcCTrz7MsVjRieBG6iB7lHAcQnUhrwhIjLKhrM6CQ==" length="2273017" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.14.3</title>
+      <pubDate>Mon, 10 Aug 2026 02:41:37 +0000</pubDate>
+      <sparkle:version>14003</sparkle:version>
+      <sparkle:shortVersionString>0.14.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.14.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.14.3/BigDaddy-v0.14.3.dmg" sparkle:edSignature="lRyIiVYHF2gfAqcPerQSfXXGafv2IzV4M31UMleHCamwHTE22fCUHxfRbowj2kYhFULVQcNzfVS0EolDaxi8BQ==" length="2273004" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.13.14</title>
+      <pubDate>Fri, 07 Aug 2026 06:28:15 +0000</pubDate>
+      <sparkle:version>13014</sparkle:version>
+      <sparkle:shortVersionString>0.13.14</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.13.14">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.13.14/BigDaddy-v0.13.14.dmg" sparkle:edSignature="Hyh81gXb3aT5kGCi9l5Vvc6iJLQf4RmYE7tEBUOcCBy8Y8/MbS5Zfmo+dpSEsvBsa459SYCM3J9axPyDF4P9Bw==" length="2260044" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.13.13</title>
+      <pubDate>Fri, 07 Aug 2026 02:34:00 +0000</pubDate>
+      <sparkle:version>13013</sparkle:version>
+      <sparkle:shortVersionString>0.13.13</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.13.13">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.13.13/BigDaddy-v0.13.13.dmg" sparkle:edSignature="J0Ao5gymAeNR9wvCppqELiJD9smSGX2WJvFLWPMXlsP6uwNruyzEWgjmRhLFeh6Ab7A0s5guzdSxkFdsV4MCDA==" length="2260366" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.13.12</title>
+      <pubDate>Fri, 07 Aug 2026 00:30:27 +0000</pubDate>
+      <sparkle:version>13012</sparkle:version>
+      <sparkle:shortVersionString>0.13.12</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.13.12">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.13.12/BigDaddy-v0.13.12.dmg" sparkle:edSignature="I2cgb2REmYB9F+OrRfTCovn0sxvV6tvxafG4gToaH5+xxQdIRLVFSudZUsGhzqHzOytSgtYMTHpfEQ+urIrGDg==" length="2259489" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.13.11</title>
+      <pubDate>Thu, 06 Aug 2026 23:22:51 +0000</pubDate>
+      <sparkle:version>13011</sparkle:version>
+      <sparkle:shortVersionString>0.13.11</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.13.11">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.13.11/BigDaddy-v0.13.11.dmg" sparkle:edSignature="zPOfGZL0GaKKue7scLJFN+OenCgj+XljOpMTAGcM7D9UTq2SauIgYl5ORNJbzuCGJ5cjY8nSEdWrq/foOLXqAA==" length="2258520" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.6</title>
+      <pubDate>Tue, 04 Aug 2026 12:45:47 +0000</pubDate>
+      <sparkle:version>12006</sparkle:version>
+      <sparkle:shortVersionString>0.12.6</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.6">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.6/BigDaddy-v0.12.6.dmg" sparkle:edSignature="07+L+yz728hllKqIZJAbQk4dFjQWQcon3mwKnx6HKag0SZeSyvZUJDBpjRZQYrAabbp8yS92sxv+sRXm0ZS6DA==" length="1992596" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.5</title>
+      <pubDate>Mon, 03 Aug 2026 13:47:41 +0000</pubDate>
+      <sparkle:version>12005</sparkle:version>
+      <sparkle:shortVersionString>0.12.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.5/BigDaddy-v0.12.5.dmg" sparkle:edSignature="JumIiq7BoQX/iDZhzXyvN+gZDhSPRc2HpGnXsCW2k+FQ/taPoOox5E+QaHKL2nXtwwKk4jTJ+KROlgeUHRa8CQ==" length="1966242" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.4</title>
+      <pubDate>Mon, 03 Aug 2026 07:40:38 +0000</pubDate>
+      <sparkle:version>12004</sparkle:version>
+      <sparkle:shortVersionString>0.12.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.4/BigDaddy-v0.12.4.dmg" sparkle:edSignature="Y3ncABAekCeVRH3sjJGQnjb2FvC3Us7fDG6Q/v1dueYFLdLC/qVVT44mWNJnprzi0VGfobXaL+o1A65a0gt5DA==" length="1961962" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.3</title>
+      <pubDate>Sun, 02 Aug 2026 15:20:34 +0000</pubDate>
+      <sparkle:version>12003</sparkle:version>
+      <sparkle:shortVersionString>0.12.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.3/BigDaddy-v0.12.3.dmg" sparkle:edSignature="+j6STZ3HAOLMJJXVEqbNXm8NHrEeoYQRrpGE8dHYcK7rMQ2luoIVwnNxnQJ6dGH/SB7wsgx8e2BSRhb5VzZZCA==" length="1965249" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.2</title>
+      <pubDate>Sat, 01 Aug 2026 08:40:09 +0000</pubDate>
+      <sparkle:version>12002</sparkle:version>
+      <sparkle:shortVersionString>0.12.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.2">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.2/BigDaddy-v0.12.2.dmg" sparkle:edSignature="shV9EgOGID8dSOkmfl0EjjjWu+qeU5ZTxG2II6vKR/iEBpDy9Qd6jpsyeHQUevE48vowzw0OezYBo+zyTX2bBA==" length="1964417" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.1</title>
+      <pubDate>Fri, 31 Jul 2026 07:30:37 +0000</pubDate>
+      <sparkle:version>12001</sparkle:version>
+      <sparkle:shortVersionString>0.12.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.1/BigDaddy-v0.12.1.dmg" sparkle:edSignature="y6C0cDhdre4dEqD36E6/O8aStxu4BtJV1W0kvCdq8xP0fJCkkkasBFmyJQIQuKkM1ojcH7iLeHSz+4I4SPDZBA==" length="1956943" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.12.0</title>
+      <pubDate>Fri, 31 Jul 2026 04:35:32 +0000</pubDate>
+      <sparkle:version>12000</sparkle:version>
+      <sparkle:shortVersionString>0.12.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.12.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.12.0/BigDaddy-v0.12.0.dmg" sparkle:edSignature="4Fa8e5XEZb3Eu3SwDUTfQEMGWwGUWxGQawPVFch6tXeXr/JowLjQ513TXErwblnFUKl9gN39dFUdWTYRmjuHCA==" length="1957331" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.10.5</title>
+      <pubDate>Thu, 30 Jul 2026 17:36:58 +0000</pubDate>
+      <sparkle:version>81</sparkle:version>
+      <sparkle:shortVersionString>0.10.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.10.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.10.5/BigDaddy-v0.10.4.dmg" sparkle:edSignature="RM5vq1L/LBimPSiIikcvBli8ZR6Gi9bJNpNwelLYSUJWUTegT/SqSHHFGg5+rVjipR5mYKk69PG1BVhBFVT/Bw==" length="1936472" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.10.4</title>
+      <pubDate>Thu, 30 Jul 2026 17:28:47 +0000</pubDate>
+      <sparkle:version>81</sparkle:version>
+      <sparkle:shortVersionString>0.10.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.10.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.10.4/BigDaddy-v0.10.4.dmg" sparkle:edSignature="jxpIrO4ZAR7RWSJ1KJF/DpuE82xmcJ6+oK/dkri/KyStueT0kB3r80mx9K0KeLe/TbC2zDjFfA77MNIC3ARxCQ==" length="1936611" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.10.3</title>
+      <pubDate>Thu, 30 Jul 2026 16:55:13 +0000</pubDate>
+      <sparkle:version>80</sparkle:version>
+      <sparkle:shortVersionString>0.10.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.10.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.10.3/BigDaddy-v0.10.3.dmg" sparkle:edSignature="yhhADayjwsDcjQJplED1mO9IUr6YgE2DauZ7pcVfzq/x4YlaZvVAmd4QWMQELuuoFvmVAvZ7Mb94G8BG/2AABw==" length="1935766" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.10.2</title>
+      <pubDate>Thu, 30 Jul 2026 12:24:41 +0000</pubDate>
+      <sparkle:version>77</sparkle:version>
+      <sparkle:shortVersionString>0.10.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.10.2">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.10.2/BigDaddy-v0.10.2.dmg" sparkle:edSignature="AEHFWn+ymqYwnok8zJhgU4K+o8z8JV++yn1Em/fWif8IUx1EZwp9QbSvN/ft0tRsuZf0eP7hleRp5gIywsrHAw==" length="1924765" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.10.1</title>
+      <pubDate>Thu, 30 Jul 2026 09:38:58 +0000</pubDate>
+      <sparkle:version>75</sparkle:version>
+      <sparkle:shortVersionString>0.10.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.10.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.10.1/BigDaddy-v0.10.1.dmg" sparkle:edSignature="WrIii8A0mrdwaIBtrt+8/O6vp81qxp1EYLeeH0tSgiYEJmMrIiOdYRWooE/TQkd/bZ1wBhpC/PJ8S9vIYvMlBw==" length="1838328" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.10.0</title>
+      <pubDate>Thu, 30 Jul 2026 06:24:18 +0000</pubDate>
+      <sparkle:version>74</sparkle:version>
+      <sparkle:shortVersionString>0.10.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.10.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.10.0/BigDaddy-v0.10.0.dmg" sparkle:edSignature="J1qUgAyo9UFTVRe/6Ji4nDPUjA6I0368jxotsysWkEKd2vsv8YwHnwFfw/1X40mDNKQszH6IS45BCKV/hRHMCQ==" length="1836159" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.9</title>
+      <pubDate>Tue, 28 Jul 2026 14:43:55 +0000</pubDate>
+      <sparkle:version>73</sparkle:version>
+      <sparkle:shortVersionString>0.9.9</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.9">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.9/BigDaddy-v0.9.9.dmg" sparkle:edSignature="3QCZc9RpnxAwXw77cP1Pa2qsxDnH8npExbCsiNCfU8XzvJSGNmbx5xyKajJPOphUKVvkl4Puwz4scSEuAgvvCw==" length="1800178" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.8</title>
+      <pubDate>Tue, 28 Jul 2026 12:54:54 +0000</pubDate>
+      <sparkle:version>72</sparkle:version>
+      <sparkle:shortVersionString>0.9.8</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.8">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.8/BigDaddy-v0.9.8.dmg" sparkle:edSignature="y2k79z+xA1VHMs1ojvkZiD46FcvaLc9Ibo25goaO+eewHhbgfkfYnl3RUfe9qfLDExT5hZB1fKvcYNowXF8HDg==" length="1786985" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.7</title>
+      <pubDate>Tue, 28 Jul 2026 06:14:33 +0000</pubDate>
+      <sparkle:version>70</sparkle:version>
+      <sparkle:shortVersionString>0.9.7</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.7">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.7/BigDaddy-v0.9.7.dmg" sparkle:edSignature="ou532Sim8UVLDskxUIboXiPXLXfGTFBF5/DYQiIZSt6Cu8vCpeGg3a74TIh6UyxmV+cbzFglyh4nyLLKKd4rBw==" length="1786796" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.5</title>
+      <pubDate>Mon, 27 Jul 2026 15:22:05 +0000</pubDate>
+      <sparkle:version>68</sparkle:version>
+      <sparkle:shortVersionString>0.9.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.5/BigDaddy-v0.9.5.dmg" sparkle:edSignature="He402xhOAxQgH5xC3rAM91/6bBreQZZbw0I0Kk9ThGidHuxiOkv4FpVp5fQfgR+wj9YKtwM277XxfGGuEtfMAA==" length="1743323" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.4</title>
+      <pubDate>Mon, 27 Jul 2026 14:29:09 +0000</pubDate>
+      <sparkle:version>67</sparkle:version>
+      <sparkle:shortVersionString>0.9.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.4/BigDaddy-v0.9.4.dmg" sparkle:edSignature="7wNIN9ltcGA0kknBLbmZRXfabWvUGoU9PGah2NjOcWoLtvd2bA4lrYQu3hbanGWklRZvhVxCdqjqWiFmq4JrBg==" length="1741773" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.3</title>
+      <pubDate>Mon, 27 Jul 2026 13:52:55 +0000</pubDate>
+      <sparkle:version>66</sparkle:version>
+      <sparkle:shortVersionString>0.9.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.3/BigDaddy-v0.9.3.dmg" sparkle:edSignature="u3AU7a3JjKWNh1MFVPvlb1Q8IHWUyV4cu9RwRjE0fIt+TgVDxKogb/bRz87nM3f11ui1MFOpwcHpKRjxsXf4Bw==" length="1745299" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.2</title>
+      <pubDate>Mon, 27 Jul 2026 13:41:09 +0000</pubDate>
+      <sparkle:version>65</sparkle:version>
+      <sparkle:shortVersionString>0.9.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.2">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.2/BigDaddy-v0.9.2.dmg" sparkle:edSignature="0LI4woqJ9Q8IUtmJWpSOvaZ/pTFbrBimeX8/ipSlHwNFmAjhOQJcf/a4IISmSrOu3G5q25+MLQy29kc1hBc+Aw==" length="1745380" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.1</title>
+      <pubDate>Fri, 24 Jul 2026 17:27:57 +0000</pubDate>
+      <sparkle:version>64</sparkle:version>
+      <sparkle:shortVersionString>0.9.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.1/BigDaddy-v0.9.1.dmg" sparkle:edSignature="qLe13QOsrSgBoS+U0ys/sVGHNpMdxw+eD4giHcszgNY7Vx469GO/nmsB7zFi7fgkjhe81q/rUDblEPcFIVtVCQ==" length="1686715" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.9.0</title>
+      <pubDate>Fri, 24 Jul 2026 17:25:45 +0000</pubDate>
+      <sparkle:version>63</sparkle:version>
+      <sparkle:shortVersionString>0.9.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.9.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.9.0/BigDaddy-v0.9.0.dmg" sparkle:edSignature="ULycjX+xpYBmChY0nYCYwb6rzEKAYdyKiE/vrmFhHs8q0wtLAZtD0/zfK7F90NEHCbzCb0l9/qV+Lp5FQAytAw==" length="1686979" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.8.1</title>
+      <pubDate>Fri, 24 Jul 2026 15:47:49 +0000</pubDate>
+      <sparkle:version>61</sparkle:version>
+      <sparkle:shortVersionString>0.8.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.8.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.8.1/BigDaddy-v0.8.1.dmg" sparkle:edSignature="hGehywYEkeGmjvxYIM0ttI2zkz+mJKqgdGz3wvmi621liYSAKcagQqBtP7QT5kV1K0vQzDsL5VxgubHC6j+TAg==" length="1672871" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.8.0</title>
+      <pubDate>Fri, 24 Jul 2026 06:25:10 +0000</pubDate>
+      <sparkle:version>60</sparkle:version>
+      <sparkle:shortVersionString>0.8.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.8.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.8.0/BigDaddy-v0.8.0.dmg" sparkle:edSignature="5f++Gj4pkEY9LeE8qC2pqlRXBTqxmeFSJXS2rSgkPq5XPVDofiU0fgp1ztNTXf9JLfmkJ/Q24plEF0kpNJ37AA==" length="1666768" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.7.0</title>
+      <pubDate>Wed, 22 Jul 2026 07:29:41 +0000</pubDate>
+      <sparkle:version>50</sparkle:version>
+      <sparkle:shortVersionString>0.7.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.7.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.7.0/BigDaddy-v0.7.0.dmg" sparkle:edSignature="Go3mqk8YZQ+u/zcKw2pqXtNE5LbbN6mUBZkviJw7BLluOeEWNKIu03PD7n8QsfT6KYjwq6JkAkJHI9DfK/7GBA==" length="1643613" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.6.1</title>
+      <pubDate>Tue, 21 Jul 2026 16:33:32 +0000</pubDate>
+      <sparkle:version>49</sparkle:version>
+      <sparkle:shortVersionString>0.6.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.6.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.6.1/BigDaddy-v0.6.1.dmg" sparkle:edSignature="UpYwRTU5KnjQqcjdk/irLBQ9yJsxrSbTVW2h//c7/75BHf/tY/a29hI4/SZIK/0dcuaGSeCFj7KSt9FNcL4mBQ==" length="1643129" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.5.5</title>
+      <pubDate>Tue, 21 Jul 2026 06:51:43 +0000</pubDate>
+      <sparkle:version>46</sparkle:version>
+      <sparkle:shortVersionString>0.5.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.5.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.5.5/BigDaddy-v0.5.5.dmg" sparkle:edSignature="rcGR+17ZD9upwoNXBzeizOQIb5zCWPTf4QRiTHojSE7xEX9vi1I+PjkyHCzYvnNfWvfoBYLGLCtq9GYsT4cFAg==" length="1624119" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.5.4</title>
+      <pubDate>Tue, 21 Jul 2026 01:36:35 +0000</pubDate>
+      <sparkle:version>44</sparkle:version>
+      <sparkle:shortVersionString>0.5.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.5.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.5.4/BigDaddy-v0.5.4.dmg" sparkle:edSignature="pJ4iAYomKUINpZtwY+wVFZ6ZZsbqoqTEqMDNPTRLZbMPq+P1MuyOqI0nBm/lgZmj3DbN4KTLUu+8k4EbiOCQDw==" length="1628073" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.5.3</title>
+      <pubDate>Tue, 21 Jul 2026 00:16:52 +0000</pubDate>
+      <sparkle:version>43</sparkle:version>
+      <sparkle:shortVersionString>0.5.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.5.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.5.3/BigDaddy-v0.5.3.dmg" sparkle:edSignature="yKBCFMGmC1t+2nUHFRQLsfyoly80ohxajXFRhlZuGnE+3kJYcRV49WKmOZwbrLts6Usf8c7urDkOS2woPluTDA==" length="1627881" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.5.2</title>
+      <pubDate>Mon, 20 Jul 2026 15:25:43 +0000</pubDate>
+      <sparkle:version>42</sparkle:version>
+      <sparkle:shortVersionString>0.5.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.5.2">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.5.2/BigDaddy-v0.5.2.dmg" sparkle:edSignature="yi0Apf4lFVbI6JmKNRHEk94bL6LWWG7gWb7E/K+TQvaUqDN2HXpwSPw2N5z81d1rMGFXItWH9fWGNBLUxILDCw==" length="1627125" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.5.1</title>
+      <pubDate>Mon, 20 Jul 2026 06:42:45 +0000</pubDate>
+      <sparkle:version>40</sparkle:version>
+      <sparkle:shortVersionString>0.5.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.5.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.5.1/BigDaddy-v0.5.1.dmg" sparkle:edSignature="UdWzPj1nNh9q5dACtfQC5ncktBv9uwUR4Kt8/6qxcrjNyY5ojSqj1/Vzze/hcVc0G05EJowfokSOQgAUlAGABw==" length="479572" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.4.0</title>
+      <pubDate>Sat, 18 Jul 2026 13:48:38 +0000</pubDate>
+      <sparkle:version>32</sparkle:version>
+      <sparkle:shortVersionString>0.4.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.4.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.4.0/BigDaddy-v0.4.0.dmg" sparkle:edSignature="Zq5mlrVDNrsmc4UQtbaut3p6xo2lyDUaQc/XHtpYoxiZjcrUaofqyVkN9vY6IEih3VstDT8uaZ65N12+ka4KCg==" length="460468" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.3.0</title>
+      <pubDate>Fri, 17 Jul 2026 09:27:23 +0000</pubDate>
+      <sparkle:version>29</sparkle:version>
+      <sparkle:shortVersionString>0.3.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.3.0">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.3.0/BigDaddy-v0.3.0.dmg" sparkle:edSignature="YVf4imMTpbvVPel4/GKL5NEorEw19v0wlU+XMtUmThsj1TjJ9RUyR3zrKlCakSvk+NkBiOEiJvBE6V9CrcaqBw==" length="443587" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.2.5</title>
+      <pubDate>Thu, 16 Jul 2026 16:13:56 +0000</pubDate>
+      <sparkle:version>26</sparkle:version>
+      <sparkle:shortVersionString>0.2.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.2.5">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.2.5/BigDaddy-v0.2.5.dmg" sparkle:edSignature="hQKi8I2GxiZ9GRJ6dNhARf++Qj/frJso8/lvyDGkaLn1escDOfZSQbXA2sgsXjeTKnMnOBguw+1+rWc4Xf2VCg==" length="430308" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.2.4</title>
+      <pubDate>Wed, 15 Jul 2026 13:39:33 +0000</pubDate>
+      <sparkle:version>24</sparkle:version>
+      <sparkle:shortVersionString>0.2.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.2.4">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.2.4/BigDaddy-v0.2.4.dmg" sparkle:edSignature="X8TwcBfVtN9zbgq49U3WSMdSRPtS74MZ7NoRQ1besU7CKzZy3OZJWcs6IUXCm9787Txpba54AJOgoBcPDgcFCQ==" length="419893" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.2.3</title>
+      <pubDate>Tue, 14 Jul 2026 10:05:42 +0000</pubDate>
+      <sparkle:version>22</sparkle:version>
+      <sparkle:shortVersionString>0.2.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.2.3">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.2.3/BigDaddy-v0.2.3.dmg" sparkle:edSignature="G5hwbCPautEA2D4q29M3Yi0PnWw26NqgE866wfr9yORhQX7MI2fuZ95gzxl3L7xyuXJKzZErh2iGVMgsIPcHAA==" length="418851" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.2.2</title>
+      <pubDate>Sat, 11 Jul 2026 03:18:54 +0000</pubDate>
+      <sparkle:version>20</sparkle:version>
+      <sparkle:shortVersionString>0.2.2</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.2.2">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.2.2/BigDaddy-v0.2.2.dmg" sparkle:edSignature="mehKXF2Tm5AJZbf0AhDXOVER24k2WkgPn6rlxNKO5y/RdErU+AIQcg/qXCho9qyUPJ0YuICyOsyvPCZ9uCAGDA==" length="418405" type="application/octet-stream" />
+    </item>
+    <item>
+      <title>Version 0.2.1</title>
+      <pubDate>Sat, 11 Jul 2026 03:13:47 +0000</pubDate>
+      <sparkle:version>19</sparkle:version>
+      <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>12.4</sparkle:minimumSystemVersion>
+      <description><![CDATA[<p><a href="https://github.com/beautare/big-daddy-macOS/releases/tag/v0.2.1">View release notes on GitHub</a></p>]]></description>
+      <enclosure url="https://github.com/beautare/big-daddy-macOS/releases/download/v0.2.1/BigDaddy-v0.2.1.dmg" sparkle:edSignature="ZCe5J3tSt5bp9m81sa4j1vsjYVraVvSpNqlq62LFPOx3J+HCPjJSY881+cbtDKfPmowTmXtMcHuqg1NiUGLdDg==" length="418382" type="application/octet-stream" />
     </item>
   </channel>
 </rss>
