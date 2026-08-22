@@ -2,7 +2,7 @@
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
     <title>BigDaddy Updates</title>
-    <link>https://beautare.github.io/big-daddy-macOS/appcast.xml</link>
+    <link>https://bigdaddy.mom/appcast.xml</link>
     <description>BigDaddy for macOS release feed</description>
     <language>zh</language>
     <!-- ITEMS -->
