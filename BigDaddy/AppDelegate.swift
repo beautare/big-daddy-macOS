@@ -1075,10 +1075,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if let timeSessionText = currentTimeSessionRemainingText() {
                 rows.append(.timeSession(initialValue: timeSessionText))
             }
+            // 开了 AI 研判就必须在这里说出来。截图从此不再只是"发给家长"，而是先经过
+            // 一个第三方模型服务——这是数据流性质的改变，而不是同一件事的程度差异。
+            // 这块面板是给孩子看的知情披露，不能只在家长那边写清楚。
             rows.append(.text(
                 label: Localization.string(zh: "截图", en: "Screenshots"),
                 value: client.config.screenshotEnabled
-                    ? Localization.string(zh: "已开启（家长可远程截屏）", en: "ON (parent can capture)")
+                    ? (client.config.allowScreenshotAiProcessing
+                        ? Localization.string(zh: "已开启 · 截图会先交由 AI 判断是否需要提醒家长",
+                                              en: "ON · screenshots are reviewed by AI before your parent is alerted")
+                        : Localization.string(zh: "已开启（家长可远程截屏）", en: "ON (parent can capture)"))
                     : Localization.string(zh: "未开启", en: "OFF")
             ))
             rows.append(.text(label: Localization.string(zh: "最近连接时间", en: "Last connected"), value: client.lastHeartbeatDescription))
@@ -2818,6 +2824,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             whoCanSeeZh = "只有绑定这台电脑的那位家长。"
             whoCanSeeEn = "Only the parent this Mac is linked to."
         }
+
+        // 开了 AI 研判之后，下面原本那句"截图路过服务器就立刻转走、服务器上不留"**不再成立**：
+        // 画面会先交给一个第三方模型服务判断。这一段披露的整个价值就在于它说的是真话，
+        // 留着旧文案等于当着孩子的面撒谎——而这台电脑上每一处别的地方（菜单栏、守护记录）
+        // 都已经如实反映了这件事，唯独最该说清楚的这一页没说。
+        let aiReviewOn = shotEffectivelyOn && client.config.allowScreenshotAiProcessing
+        let aiNoteZh = aiReviewOn
+            ? "截图在发给家长之前，会先交给一个 AI 服务看一眼，判断有没有需要提醒家长的情况——所以画面也会经过那家服务商。除此之外不给任何人。"
+            : "截图路过服务器的时候立刻就转走了，服务器上不留。"
+        let aiNoteEn = aiReviewOn
+            ? "Before anything reaches your parent, an AI service looks at the screen once to decide whether there's something worth flagging — so the images also pass through that provider. Nobody else gets them."
+            : "Screenshots pass through the server and are sent straight on — nothing is kept there."
         alert.informativeText = Localization.string(
             zh: """
             爸爸妈妈在这台电脑上装了 BigDaddy。这不是偷偷装的——所以现在这个窗口才会弹出来告诉你。
@@ -2826,7 +2844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             你现在开着哪个应用、窗口标题上写着什么，比如"Safari — 某某网站"。它不看你打的字，也不读你的聊天内容。\(shotStatusZh)
 
             谁能看到？
-            \(whoCanSeeZh)截图路过服务器的时候立刻就转走了，服务器上不留。
+            \(whoCanSeeZh)\(aiNoteZh)
 
             你怎么知道它在干什么？
             屏幕最上面那一排里有个小盾牌，一直都在，你随时能点开。盾牌旁边什么都没有，就是没在截图；多出一个小圆点，就是截图开着；圆点变成一个圈，就是这一刻正在截图——扫一眼就知道现在是哪种。它做的每一件事都记在这台电脑上的一个文件里，点下面的按钮就能打开自己看。
@@ -2843,7 +2861,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             Which app you have open and what the window is called, like "Safari — some website". It doesn't see what you type, and it doesn't read your chats. \(shotStatusEn)
 
             Who can see it?
-            \(whoCanSeeEn) Screenshots pass through the server and are sent straight on — nothing is kept there.
+            \(whoCanSeeEn) \(aiNoteEn)
 
             How do you know what it's doing?
             There's a small shield in the strip along the very top of the screen. It's always there, and you can open it any time. Nothing next to the shield means no screenshots are being taken; a small dot means they're on; the dot turning into a ring means a screenshot is being taken right this moment — one glance tells you which. Everything it does is written into a file on this Mac — press the button below to open it and read it yourself.

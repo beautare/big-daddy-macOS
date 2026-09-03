@@ -1,8 +1,14 @@
 import AppKit
 import ApplicationServices
+// 系统音频输出状态（kAudioDevicePropertyDeviceIsRunningSomewhere）与显示休眠抑制断言
+// （IOPMCopyAssertionsStatus）：两个零成本的纯元数据信号，交给服务端的 AI 研判做交叉
+// 判断。"有人在出声"和"有进程在阻止息屏"合起来几乎就是"正在播放什么"的定义。
+import AudioToolbox
+import CoreAudio
 import CryptoKit
 import Darwin
 import Foundation
+import IOKit.pwr_mgt
 import Network
 import ScreenCaptureKit
 import Security
@@ -1035,6 +1041,132 @@ final class BigDaddyClient: @unchecked Sendable {
         return averageDiff < 8.0
     }
 
+    /// 16×16 分块的"任一块变化即算变化"判定，AI 模式下取代上面那个全局平均版本。
+    ///
+    /// 为什么不能沿用 8×8 全局平均：一个占屏幕 1/16 面积的画中画，在 8×8 缩略图上只落在
+    /// 1~2 个像素上，平均 diff 被其余 62 个静止像素稀释到远低于阈值——**恰恰是 AI 模式
+    /// 最想抓的"角落里偷偷放视频"，会被第一关无声滤掉**。漏斗和目标是矛盾的。
+    /// 改成分块后，只要有任何一小块区域在动，整屏就算变化。
+    ///
+    /// 阈值取 18 而不是全局版的 8：单块面积小、噪声占比更高，沿用 8 会被 JPEG 抖动、
+    /// 鼠标指针、闪烁的光标误触发，那样等于去重彻底失效、每一轮都上传。
+    ///
+    /// 与全局版共用 `lastImagePixelsByDisplay` 是**故意不做**的：两者的采样尺寸不同
+    /// （8×8 vs 16×16），共用一个槽位会在家长切换推送模式的那一轮拿 64 个字节去比
+    /// 256 个字节。各自分桶，切换模式时最多多传一轮。
+    private var lastBlockPixelsByDisplay: [CGDirectDisplayID: [UInt8]] = [:]
+
+    func isImageSimilarToLastBlockwise(cgImage: CGImage, displayID: CGDirectDisplayID) -> Bool {
+        let side = 16
+        var pixels = [UInt8](repeating: 0, count: side * side)
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let context = CGContext(
+            data: &pixels,
+            width: side,
+            height: side,
+            bitsPerComponent: 8,
+            bytesPerRow: side,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return false
+        }
+        context.interpolationQuality = .low
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: side, height: side))
+
+        guard let lastPixels = lastBlockPixelsByDisplay[displayID], lastPixels.count == pixels.count else {
+            lastBlockPixelsByDisplay[displayID] = pixels
+            return false
+        }
+        lastBlockPixelsByDisplay[displayID] = pixels
+
+        // 任一块超阈值即判为"有变化"。用最大值而不是平均值，正是全局版那个毛病的解药。
+        var maxDiff = 0
+        for i in 0..<pixels.count {
+            maxDiff = max(maxDiff, abs(Int(pixels[i]) - Int(lastPixels[i])))
+        }
+        NSLog("BigDaddy: Screenshot blockwise max diff = \(maxDiff) (display \(displayID))")
+        return maxDiff < 18
+    }
+
+    /// 系统当前是否有 App 在输出音频。
+    ///
+    /// "在看视频"与"在出声"高度相关，而这是个纯元数据信号：零 token、毫秒级、不需要
+    /// 任何额外权限。它单独不足以定性（会议软件也出声），但作为交叉证据非常强——
+    /// 前台是代码编辑器、画面看着在写作业、系统却在放声音，这三条凑一起就很说明问题。
+    ///
+    /// **判不出时返回 nil，绝不用 false 冒充"确定没有"**：服务端会把 nil 渲染成"未知"，
+    /// 而一个假的"静音"会让模型据此排除掉一个其实成立的可能。
+    func systemAudioActive() -> Bool? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr,
+            deviceID != kAudioObjectUnknown else {
+            return nil
+        }
+
+        var running = UInt32(0)
+        var runningSize = UInt32(MemoryLayout<UInt32>.size)
+        var runningAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(
+            deviceID, &runningAddress, 0, nil, &runningSize, &running) == noErr else {
+            return nil
+        }
+        return running != 0
+    }
+
+    /// 是否有进程持有"阻止显示器休眠"的电源断言，以及（尽力而为的）持有者名字。
+    ///
+    /// 视频播放器、游戏、正在播放的浏览器标签页几乎都会持有
+    /// `PreventUserIdleDisplaySleep`，这是"有东西在全速播放/运行"的强指示。同样零成本。
+    ///
+    /// 注意会议软件、演示软件也持有它——所以它是给模型的一条证据，不是判据。
+    /// 取不到时返回 nil（上报"未知"），同上：不用 false 冒充确定。
+    func displaySleepAssertion() -> (prevented: Bool, owner: String?)? {
+        var status: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsStatus(&status) == kIOReturnSuccess,
+              let dict = status?.takeRetainedValue() as? [String: Int] else {
+            return nil
+        }
+        let level = dict[kIOPMAssertionTypePreventUserIdleDisplaySleep as String] ?? 0
+        guard level > 0 else {
+            return (false, nil)
+        }
+        return (true, displaySleepAssertionOwner())
+    }
+
+    /// 尽力找出持有断言的进程名。拿不到就返回 nil——**没有名字不该让"有人在阻止息屏"
+    /// 这个已经确定的事实也一起丢掉**，所以它和上面那个函数是分开的两步。
+    private func displaySleepAssertionOwner() -> String? {
+        // IOPMCopyAssertionsByProcess 的出参是 CFDictionary（键是 pid 的 CFNumber），
+        // 不是 CFArray——签名里那个 "Array" 指的是每个 pid 对应的断言列表。
+        var byProcess: Unmanaged<CFDictionary>?
+        guard IOPMCopyAssertionsByProcess(&byProcess) == kIOReturnSuccess,
+              let entries = byProcess?.takeRetainedValue() as? [Int: [[String: Any]]] else {
+            return nil
+        }
+        let target = kIOPMAssertionTypePreventUserIdleDisplaySleep as String
+        for (pid, assertions) in entries {
+            for assertion in assertions {
+                let type = assertion[kIOPMAssertionTypeKey as String] as? String
+                let held = assertion[target] != nil
+                guard type == target || held else { continue }
+                if let name = NSRunningApplication(processIdentifier: pid_t(pid))?.localizedName {
+                    return name
+                }
+            }
+        }
+        return nil
+    }
+
     // 受支持的浏览器按 **bundle identifier** 匹配，不再按 localizedName 做子串匹配：
     // 应用名会随系统语言变化（中文系统下 Safari 的 localizedName 是"Safari浏览器"）、
     // 会被用户改名，而且子串匹配本身就脆——"Google Chrome" 会抢先命中
@@ -1618,6 +1750,23 @@ final class BigDaddyClient: @unchecked Sendable {
         return offset + 1
     }
 
+    /// 截图上传专用 session。
+    ///
+    /// **不能用 `URLSession.shared`**：它的 `timeoutIntervalForRequest` 默认 60 秒，而这条
+    /// 路径在服务端的预算是「AI 研判最长 12 秒 + 四个通知渠道并行投递 65 秒」。用默认值
+    /// 会在后端还在正常投递时就超时，客户端随即重传——同一张图重复调一次模型、家长收到
+    /// 两条一模一样的通知。
+    ///
+    /// 注意这个错配**在加 AI 之前就已经存在**（60 < 65），只是当时重传的代价仅仅是多一封
+    /// 邮件，没人注意到。服务端有幂等键（bigdaddy:aireview:idem:）兜底，但不该靠兜底来
+    /// 掩盖一个错的超时值。
+    private static let uploadSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 100
+        configuration.timeoutIntervalForResource = 120
+        return URLSession(configuration: configuration)
+    }()
+
     /// 把 N 张截图拼成一个 multipart body：每张一个**同名** `file` 部分，后端按
     /// `@RequestParam("file") MultipartFile[]` 收成数组，顺序即屏幕编号（幸存的主屏在前）。
     ///
@@ -1648,8 +1797,16 @@ final class BigDaddyClient: @unchecked Sendable {
     ///   不能想当然认为"第 1 张就是主屏"：`payload` 是按屏去重后**幸存**的画面拼出来的，
     ///   主屏静止不变时恰恰最容易被跳过、副屏反而在前——后端如果不看这个字段、只按位置
     ///   猜"第 1 张是主屏"，会在这种情况下把错误的画面标成主屏发给家长。
+    ///
+    /// - Parameter unchangedScreens: 本轮画面与上一轮完全一致的屏幕在 `images` 里的位置
+    ///   （1-based）。只在 AI 模式下有值——它进服务端的研判提示词，是判断"挂机 / 暂停的
+    ///   播放器"最便宜的一条证据。
+    /// - Parameter audioActive / displaySleepPrevented: **判不出时传 nil**，服务端渲染成
+    ///   "未知"。用 false 冒充"确定没有"会让模型排除掉一个其实成立的可能。
     func uploadScreenshots(images: [Data], activeApp: String, windowTitle: String, activeUrl: String,
-                           mainScreenPosition: Int?) async throws -> Data {
+                           mainScreenPosition: Int?, unchangedScreens: [Int] = [],
+                           audioActive: Bool? = nil, displaySleepPrevented: Bool? = nil,
+                           sleepAssertionOwner: String? = nil) async throws -> Data {
         let method = "POST"
         let boundary = "BigDaddy-Upload-\(UUID().uuidString)"
         var components = URLComponents(url: baseURL.appendingPathComponent("/bigdaddy/client/screenshot"), resolvingAgainstBaseURL: false)!
@@ -1657,7 +1814,13 @@ final class BigDaddyClient: @unchecked Sendable {
             URLQueryItem(name: "activeAppName", value: activeApp),
             URLQueryItem(name: "activeWindowTitle", value: windowTitle.isEmpty ? nil : windowTitle),
             URLQueryItem(name: "activeUrl", value: activeUrl.isEmpty ? nil : activeUrl),
-            URLQueryItem(name: "mainScreenPosition", value: mainScreenPosition.map(String.init))
+            URLQueryItem(name: "mainScreenPosition", value: mainScreenPosition.map(String.init)),
+            // 空数组时整个参数省略，而不是发一个空串：Spring 会把空串绑成 [""] 再解析失败。
+            URLQueryItem(name: "unchangedScreens",
+                         value: unchangedScreens.isEmpty ? nil : unchangedScreens.map(String.init).joined(separator: ",")),
+            URLQueryItem(name: "audioActive", value: audioActive.map { $0 ? "true" : "false" }),
+            URLQueryItem(name: "displaySleepPrevented", value: displaySleepPrevented.map { $0 ? "true" : "false" }),
+            URLQueryItem(name: "sleepAssertionOwner", value: sleepAssertionOwner)
         ]
         
         guard let url = components.url else { throw URLError(.badURL) }
@@ -1680,8 +1843,8 @@ final class BigDaddyClient: @unchecked Sendable {
         request.setValue(signature, forHTTPHeaderField: "X-Device-Signature")
         
         request.httpBody = Self.multipartBody(boundary: boundary, images: images)
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
+
+        let (data, response) = try await Self.uploadSession.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             let envelope = try? JSONDecoder.bigDaddy.decode(ApiEnvelope.self, from: data)
             let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0) }
@@ -1904,6 +2067,16 @@ final class BigDaddyClient: @unchecked Sendable {
         return (fallbackWidth, fallbackHeight)
     }
 
+    /// AI 模式下的截图宽度下限。家长选的清晰度档位仍然生效，但不低于这个值。
+    ///
+    /// 640px + 质量 0.5 下，一个占屏幕 1/9 的画中画只剩约 210×120 像素——模型能看出
+    /// "那里有个视频在播"，却认不出**是什么**。于是提示词里强制要求的"具体可核对依据"
+    /// 交不出来，家长收到的那句说明就退化成"副屏似乎在播放视频"，一句废话。
+    /// Flash 档的图片按 tile 计费，768→1024 的增量在这个调用频次下可以忽略。
+    private var effectiveMaxWidth: Int {
+        config.allowScreenshotAiProcessing ? max(config.compressMaxWidth, 1024) : config.compressMaxWidth
+    }
+
     /// 返回是否真正完成了一次截图上传尝试（用于命令回执：截图被禁用/无权限/上传失败
     /// 都不应该回执 SUCCEEDED，此前命令通道无条件回执成功，是一种"假成功"）。
     @discardableResult
@@ -1954,18 +2127,52 @@ final class BigDaddyClient: @unchecked Sendable {
         // captures 里"最终进入本轮上传"的那些条目，各自在原始显示器列表里的 index
         // （1-based，见 captureAllDisplayImages）——用于之后定位主屏在 payload 里的位置。
         var includedOriginalIndices: [Int] = []
+        // 本轮画面与上一轮完全一致的屏幕，在 payload 里的位置（1-based）。随上传一起
+        // 报给服务端进 AI 的提示词：「副屏画面与 15 分钟前完全一致」几乎等价于挂机、
+        // 暂停的播放器或游戏挂机——零 token 成本的强信号。
+        var unchangedScreens: [Int] = []
+
+        let aiMode = config.allowScreenshotAiProcessing
+
+        // 去重必须对每块屏都跑一遍（不能因为已经决定要发就短路），否则被跳过的那块屏
+        // 指纹不更新，下一轮它会拿几轮前的旧帧来比。这一条在两种模式下都成立。
+        //
+        // AI 模式下换用分块判定：8×8 全局平均会把"角落里 1/16 面积的画中画"当成没变化，
+        // 而那恰恰是开启 AI 模式最主要的目的。见 isImageSimilarToLastBlockwise。
+        var similarity: [Int: Bool] = [:]
         for capture in captures {
-            let similar = isImageSimilarToLast(cgImage: capture.image, displayID: capture.displayID)
-            if reason == "scheduled" && similar {
+            similarity[capture.index] = aiMode
+                ? isImageSimilarToLastBlockwise(cgImage: capture.image, displayID: capture.displayID)
+                : isImageSimilarToLast(cgImage: capture.image, displayID: capture.displayID)
+        }
+
+        // AI 模式下改成 all-or-nothing：所有屏都相似才整轮跳过，只要有一块屏变化就全部
+        // 上传。省钱效果几乎不变（整轮跳过才是省的大头），但**按屏丢图会毁掉隐蔽分心
+        // 的判据**——「主屏挂着静止的作业文档、副屏在放视频」是多屏下最常见的形态，
+        // 按屏去重只会上传副屏，服务端拿到一张孤零零的视频画面，没有"前台是学习软件"
+        // 的对照物；反过来主屏在动、副屏是暂停的播放器时，副屏被跳过，直接漏报。
+        let allSimilar = !similarity.isEmpty && similarity.values.allSatisfy { $0 }
+        if reason == "scheduled" && aiMode && allSimilar {
+            NSLog("BigDaddy: all displays unchanged (AI mode), skip this round entirely.")
+            return false
+        }
+
+        for capture in captures {
+            let similar = similarity[capture.index] ?? false
+            // 非 AI 模式保持原行为一个字节不变：按屏各自跳过。
+            if reason == "scheduled" && similar && !aiMode {
                 NSLog("BigDaddy: Screenshot for display \(capture.index)/\(capture.total) is similar to the last one, skip sending.")
                 continue
             }
-            guard let rep = resizeToMaxWidth(capture.image, maxWidth: config.compressMaxWidth) else {
+            guard let rep = resizeToMaxWidth(capture.image, maxWidth: effectiveMaxWidth) else {
                 NSLog("BigDaddy: Screenshot resize failed for display \(capture.index)/\(capture.total), skip sending.")
                 continue
             }
             payload.append(compressToTargetSize(rep, startQuality: config.compressQuality))
             includedOriginalIndices.append(capture.index)
+            if similar {
+                unchangedScreens.append(payload.count)
+            }
         }
         guard !payload.isEmpty else { return false }
         // 主屏画面在 payload 里的位置（1-based）；主屏这次没能进 payload（被去重跳过、
@@ -1983,13 +2190,29 @@ final class BigDaddyClient: @unchecked Sendable {
             self.activeWindowInfo()
         }.value
 
+        // 音频与息屏断言：只在 AI 模式下采集。非 AI 模式下服务端根本不会用到它们，
+        // 白白多两次系统调用，而且"能采集就采集"会让这两个信号出现在孩子端的守护记录
+        // 里却查不出用途——采什么、为什么采，必须和功能开关一一对应。
+        let audioActive = aiMode ? systemAudioActive() : nil
+        let sleepAssertion = aiMode ? displaySleepAssertion() : nil
+
         do {
             // 所有屏幕放在同一次上传里：后端据此合成一封多附件邮件 / 一次 sendMediaGroup，
             // 家长收到的是一条完整通知。拆成多次上传的话，后端无从知道这几张属于同一轮，
             // 只能各发各的，家长那边就是几条元数据一模一样、分不清谁是谁的重复推送。
+            // 交出去之前先记：图**已经离开这台电脑**这件事，在收到响应前就已经发生了。
+            // 等成功再记的话，一次超时失败就等于这次外发从未被记录过——而这条守护记录
+            // 是给孩子看的知情承诺，不是给我们看的成功日志。
+            if aiMode {
+                AuditLog.record("SCREENSHOT_AI_REVIEW_SENT screens=\(payload.count) provider=third-party")
+            }
             let responseData = try await uploadScreenshots(images: payload, activeApp: activeApp,
                                                            windowTitle: windowTitle, activeUrl: activeUrl,
-                                                           mainScreenPosition: mainScreenPosition)
+                                                           mainScreenPosition: mainScreenPosition,
+                                                           unchangedScreens: unchangedScreens,
+                                                           audioActive: audioActive,
+                                                           displaySleepPrevented: sleepAssertion?.prevented,
+                                                           sleepAssertionOwner: sleepAssertion?.owner)
             // 成功发送后更新截图时间
             lastScreenshotAt = Date()
             // 知情透明：把本次截图动作写入本机可查看/可导出的守护记录
@@ -1998,10 +2221,19 @@ final class BigDaddyClient: @unchecked Sendable {
             // 未送达时也要如实记录，避免家长/孩子都以为已经发出去了。
             if let decoded = try? JSONDecoder.bigDaddy.decode(ApiResponse<ScreenshotUploadResponse>.self, from: responseData),
                decoded.data.delivered == false {
-                let email = decoded.data.emailStatus ?? "UNKNOWN"
-                let telegram = decoded.data.telegramStatus ?? "UNKNOWN"
-                AuditLog.record("SCREENSHOT_NOT_DELIVERED screens=\(payload.count) reason=\(decoded.data.reason ?? "UNKNOWN") emailStatus=\(email) telegramStatus=\(telegram)")
-                NSLog("BigDaddy: Screenshot uploaded but not delivered to any channel: \(decoded.data.reason ?? "unknown") (email=\(email), telegram=\(telegram))")
+                // AI 静默是 delivered=false 里**唯一不是故障**的一种：家长选的就是
+                // "只在有问题时提醒我"，这一轮 AI 判断没问题，于是什么都没发。
+                // 沿用 SCREENSHOT_NOT_DELIVERED 会在孩子的守护记录里留下一长串假的
+                // "未送达"，看着像功能坏了，也会让真正的投递故障淹没在里面。
+                if decoded.data.reason == "AI_FILTERED_SILENT" {
+                    AuditLog.record("SCREENSHOT_AI_FILTERED screens=\(payload.count) verdict=no-alert-needed")
+                    NSLog("BigDaddy: Screenshot reviewed by AI, no alert needed.")
+                } else {
+                    let email = decoded.data.emailStatus ?? "UNKNOWN"
+                    let telegram = decoded.data.telegramStatus ?? "UNKNOWN"
+                    AuditLog.record("SCREENSHOT_NOT_DELIVERED screens=\(payload.count) reason=\(decoded.data.reason ?? "UNKNOWN") emailStatus=\(email) telegramStatus=\(telegram)")
+                    NSLog("BigDaddy: Screenshot uploaded but not delivered to any channel: \(decoded.data.reason ?? "unknown") (email=\(email), telegram=\(telegram))")
+                }
             }
             // 即时可见：广播截图事件，UI 层据此闪烁菜单栏图标并弹出本机通知。带上本轮
             // 真正发出去的张数：孩子端那条通知原文写死"一张"，多屏下会少报。
