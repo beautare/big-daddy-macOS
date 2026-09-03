@@ -988,9 +988,20 @@ final class BigDaddyClient: @unchecked Sendable {
         }
     }
 
-    private var lastImagePixels: [UInt8]?
+    /// 每块显示器各存一份上次的缩略指纹。之前是单个 `lastImagePixels`，多屏下会互相
+    /// 覆盖：主屏静止、副屏在放视频时，两屏轮流写同一个槽位，比较的永远是"这块屏 vs
+    /// 另一块屏"，diff 恒定很大，去重彻底失效（反过来两屏内容相近时又会互相压制）。
+    /// 按 displayID 分桶后，每块屏只和自己的上一帧比。
+    private var lastImagePixelsByDisplay: [CGDirectDisplayID: [UInt8]] = [:]
 
-    func isImageSimilarToLast(cgImage: CGImage) -> Bool {
+    /// 显示器被拔掉后，它那份指纹就成了永远不会再被比较、也不会再被覆盖的死数据。
+    /// 每轮截图后按当前在线的显示器裁剪一次——同一个 displayID 被系统回收再分配给
+    /// 另一块屏时，也不会拿旧屏的指纹去和新屏比。
+    private func pruneStaleDisplayFingerprints(keeping liveIDs: Set<CGDirectDisplayID>) {
+        lastImagePixelsByDisplay = lastImagePixelsByDisplay.filter { liveIDs.contains($0.key) }
+    }
+
+    func isImageSimilarToLast(cgImage: CGImage, displayID: CGDirectDisplayID) -> Bool {
         let width = 8
         let height = 8
         var pixels = [UInt8](repeating: 0, count: width * height)
@@ -1009,18 +1020,18 @@ final class BigDaddyClient: @unchecked Sendable {
         context.interpolationQuality = .low
         context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
         
-        guard let lastPixels = lastImagePixels else {
-            lastImagePixels = pixels
+        guard let lastPixels = lastImagePixelsByDisplay[displayID] else {
+            lastImagePixelsByDisplay[displayID] = pixels
             return false
         }
-        lastImagePixels = pixels
+        lastImagePixelsByDisplay[displayID] = pixels
         
         var diffSum: Int = 0
         for i in 0..<pixels.count {
             diffSum += abs(Int(pixels[i]) - Int(lastPixels[i]))
         }
         let averageDiff = Double(diffSum) / Double(pixels.count)
-        NSLog("BigDaddy: Screenshot similarity diff score = \(averageDiff)")
+        NSLog("BigDaddy: Screenshot similarity diff score = \(averageDiff) (display \(displayID))")
         return averageDiff < 8.0
     }
 
@@ -1595,14 +1606,58 @@ final class BigDaddyClient: @unchecked Sendable {
         return title
     }
 
-    func uploadScreenshot(imageData: Data, activeApp: String, windowTitle: String, activeUrl: String) async throws -> Data {
+    /// 给定"哪些屏最终进了本轮上传"（按原始显示器顺序排列的 index 列表，1 恒代表主屏，
+    /// 见 orderedDisplays/onlineDisplayIDs），算出主屏画面在上传结果里的 1-based 位置。
+    ///
+    /// 单独拆成纯函数是因为这正是上一版出过错的地方：曾经直接假设"payload 第一张就是
+    /// 主屏"，但主屏静止不变时恰恰最容易被按屏去重跳过，副屏反而会排到前面——那种情况
+    /// 下第一张其实是副屏，家长会收到一封把副屏错认成主屏的邮件。这里改成按 index 精确
+    /// 定位，index 里找不到 1 就说明主屏这次没有被上传，返回 nil，调用方不该再瞎猜。
+    static func mainScreenPosition(includedOriginalIndices: [Int]) -> Int? {
+        guard let offset = includedOriginalIndices.firstIndex(of: 1) else { return nil }
+        return offset + 1
+    }
+
+    /// 把 N 张截图拼成一个 multipart body：每张一个**同名** `file` 部分，后端按
+    /// `@RequestParam("file") MultipartFile[]` 收成数组，顺序即屏幕编号（幸存的主屏在前）。
+    ///
+    /// 手写 multipart 最容易错的是分隔符：每个部分的数据后面必须有 CRLF 才能接下一条
+    /// `--boundary`，最后一条是 `--boundary--`。错一个字节，服务端要么少收一个部分、
+    /// 要么整个请求解析失败——而这类错误只在真机上传时才暴露，所以单独拆出来做纯函数
+    /// 并加了测试。
+    static func multipartBody(boundary: String, images: [Data]) -> Data {
+        var body = Data()
+        for (index, imageData) in images.enumerated() {
+            // filename 带上编号只是为了抓包/日志可读，后端不依赖它来判断这是第几块屏。
+            let filename = images.count > 1 ? "screen-\(index + 1).jpg" : "screenshot.jpg"
+            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\nContent-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
+            body.append(imageData)
+            body.append("\r\n".data(using: .utf8)!)
+        }
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        return body
+    }
+
+    /// 一次请求把本轮所有屏幕的截图发上去：multipart 里放 N 个同名的 `file` 部分，
+    /// 顺序即屏幕编号（主屏在前，见下方 `mainScreenPosition` 参数的说明）。后端据此
+    /// 合成"一封多附件邮件 + 一次 sendMediaGroup"，家长收到的是一条包含全部屏幕的通知，
+    /// 而不是每块屏各来一条。
+    ///
+    /// - Parameter mainScreenPosition: 主屏画面在 `images` 里的 1-based 位置；主屏这次
+    ///   没有被上传（定时截图按屏去重跳过了未变化的主屏、或单独抓取失败）时传 nil。
+    ///   不能想当然认为"第 1 张就是主屏"：`payload` 是按屏去重后**幸存**的画面拼出来的，
+    ///   主屏静止不变时恰恰最容易被跳过、副屏反而在前——后端如果不看这个字段、只按位置
+    ///   猜"第 1 张是主屏"，会在这种情况下把错误的画面标成主屏发给家长。
+    func uploadScreenshots(images: [Data], activeApp: String, windowTitle: String, activeUrl: String,
+                           mainScreenPosition: Int?) async throws -> Data {
         let method = "POST"
         let boundary = "BigDaddy-Upload-\(UUID().uuidString)"
         var components = URLComponents(url: baseURL.appendingPathComponent("/bigdaddy/client/screenshot"), resolvingAgainstBaseURL: false)!
         components.queryItems = [
             URLQueryItem(name: "activeAppName", value: activeApp),
             URLQueryItem(name: "activeWindowTitle", value: windowTitle.isEmpty ? nil : windowTitle),
-            URLQueryItem(name: "activeUrl", value: activeUrl.isEmpty ? nil : activeUrl)
+            URLQueryItem(name: "activeUrl", value: activeUrl.isEmpty ? nil : activeUrl),
+            URLQueryItem(name: "mainScreenPosition", value: mainScreenPosition.map(String.init))
         ]
         
         guard let url = components.url else { throw URLError(.badURL) }
@@ -1624,11 +1679,7 @@ final class BigDaddyClient: @unchecked Sendable {
         request.setValue(nonce, forHTTPHeaderField: "X-Device-Nonce")
         request.setValue(signature, forHTTPHeaderField: "X-Device-Signature")
         
-        var body = Data()
-        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"screenshot.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".data(using: .utf8)!)
-        body.append(imageData)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
-        request.httpBody = body
+        request.httpBody = Self.multipartBody(boundary: boundary, images: images)
         
         let (data, response) = try await URLSession.shared.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -1642,6 +1693,8 @@ final class BigDaddyClient: @unchecked Sendable {
 
     /// 截图实际发生时广播，供 UI 层给孩子端即时可见提示
     static let screenshotSentNotification = Notification.Name("BigDaddyScreenshotSent")
+    /// screenshotSentNotification 的 userInfo 键：本轮实际发出去的截图张数（多屏时 > 1）
+    static let screenshotCountKey = "BigDaddyScreenshotCount"
     /// 自动路径（定时/家长下发命令）因缺屏幕录制权限而静默放弃截图时广播。手动测试
     /// （关于面板里点"测试截图"）不广播这个——用户当时就看着"关于"面板，⚠️ 按钮本身
     /// 已经是最直接的提示，不需要再额外弹一条本机通知重复同一件事。
@@ -1717,9 +1770,27 @@ final class BigDaddyClient: @unchecked Sendable {
         return fallback
     }
 
-    /// 抓取主显示器一帧画面。macOS 14+ 走 ScreenCaptureKit（`CGDisplayCreateImage`
+    /// 一台显示器的一帧画面，连同它的身份信息：`index`/`total` 用于在通知里标出
+    /// "这是第几块屏"，`displayID` 用于按屏各自做相似度去重。
+    struct CapturedDisplay {
+        let displayID: CGDirectDisplayID
+        let index: Int
+        let total: Int
+        let image: CGImage
+    }
+
+    /// 抓取**所有**在线显示器各一帧画面。macOS 14+ 走 ScreenCaptureKit（`CGDisplayCreateImage`
     /// 已在 macOS 15 被废除，目前仅靠向后兼容仍能运行，随时可能被移除）；更早的系统
     /// 保留旧路径——SCK 的单帧截图 API `SCScreenshotManager` 本身要求 macOS 14。
+    ///
+    /// 为什么必须遍历而不是只抓主屏：孩子接了外接显示器时，"主屏"只是带菜单栏的那一块。
+    /// 把游戏/视频放在副屏、主屏留个文档，家长收到的截图就完全无害——而同一次上传里的
+    /// 「正在使用的软件/窗口标题」取自前台窗口、与显示器无关，于是通知里会写着某游戏、
+    /// 附件却是那份文档，比不发更误导。这条路径此前只取 `CGMainDisplayID()`，副屏内容
+    /// 从来没有被采集过。
+    ///
+    /// 顺序固定为"主屏在前，其余按屏幕从左到右"：家长每次收到的第 1 张都是主屏，
+    /// 屏幕编号不会因为系统返回顺序变动而在两次截图之间对调。
     ///
     /// 关键：`SCDisplay.width/height` 的单位是"点"，而 `SCStreamConfiguration.width/height`
     /// 的单位是"像素"。之前直接把点数赋给像素数，等于在 Retina（2x）屏上按 1x 半分辨率
@@ -1728,15 +1799,22 @@ final class BigDaddyClient: @unchecked Sendable {
     /// （源图本来就没多少细节可供 JPEG 保留或丢弃）。改成按显示器原生像素分辨率抓取，
     /// 再交给下游 resizeToMaxWidth 做高质量降采样到 compressMaxWidth——同样的目标宽度下，
     /// "先原生抓取、再降采样"远比"直接 1x 抓取"清晰（等效于超采样抗锯齿）。
-    private func captureMainDisplayImage() async -> CGImage? {
+    private func captureAllDisplayImages() async -> [CapturedDisplay] {
         if #available(macOS 14.0, *) {
+            let displays: [SCDisplay]
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() })
-                        ?? content.displays.first else {
-                    NSLog("BigDaddy: ScreenCaptureKit returned no displays.")
-                    return nil
-                }
+                displays = orderedDisplays(content.displays)
+            } catch {
+                NSLog("BigDaddy: ScreenCaptureKit content query failed: \(error.localizedDescription)")
+                return []
+            }
+            guard !displays.isEmpty else {
+                NSLog("BigDaddy: ScreenCaptureKit returned no displays.")
+                return []
+            }
+            var captured: [CapturedDisplay] = []
+            for (offset, display) in displays.enumerated() {
                 let filter = SCContentFilter(display: display, excludingWindows: [])
                 let configuration = SCStreamConfiguration()
                 // 用 CGDisplayMode 拿当前显示模式的原生像素尺寸；拿不到就回退到点数（退化为
@@ -1747,15 +1825,73 @@ final class BigDaddyClient: @unchecked Sendable {
                 configuration.width = pixelWidth
                 configuration.height = pixelHeight
                 configuration.showsCursor = false
-                return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-            } catch {
-                NSLog("BigDaddy: ScreenCaptureKit capture failed: \(error.localizedDescription)")
-                return nil
+                do {
+                    let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+                    captured.append(CapturedDisplay(displayID: display.displayID,
+                                                    index: offset + 1,
+                                                    total: displays.count,
+                                                    image: image))
+                } catch {
+                    // 单块屏抓失败（例如刚被拔掉）不该连累其余屏幕：记录后继续，
+                    // 家长至少还能收到其他屏的画面。
+                    NSLog("BigDaddy: ScreenCaptureKit capture failed for display \(display.displayID): \(error.localizedDescription)")
+                }
             }
+            return captured
         } else {
             // CGDisplayCreateImage 本身就返回原生像素，旧系统路径不受上述点/像素问题影响。
-            return CGDisplayCreateImage(CGMainDisplayID())
+            let ids = onlineDisplayIDs()
+            var captured: [CapturedDisplay] = []
+            for (offset, displayID) in ids.enumerated() {
+                guard let image = CGDisplayCreateImage(displayID) else {
+                    NSLog("BigDaddy: CGDisplayCreateImage failed for display \(displayID).")
+                    continue
+                }
+                captured.append(CapturedDisplay(displayID: displayID,
+                                                index: offset + 1,
+                                                total: ids.count,
+                                                image: image))
+            }
+            return captured
         }
+    }
+
+    /// 主屏在前，其余按屏幕排布从左到右（同 x 时从上到下）。`SCShareableContent.displays`
+    /// 的顺序没有文档保证，不排序的话屏幕编号可能在两次截图之间对调。
+    @available(macOS 14.0, *)
+    private func orderedDisplays(_ displays: [SCDisplay]) -> [SCDisplay] {
+        let mainID = CGMainDisplayID()
+        return displays.sorted { lhs, rhs in
+            if (lhs.displayID == mainID) != (rhs.displayID == mainID) {
+                return lhs.displayID == mainID
+            }
+            return displaySortKey(lhs.displayID) < displaySortKey(rhs.displayID)
+        }
+    }
+
+    /// 旧系统路径的显示器列表，排序规则同 orderedDisplays。
+    private func onlineDisplayIDs() -> [CGDirectDisplayID] {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
+            return [CGMainDisplayID()]
+        }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &ids, &count) == .success else {
+            return [CGMainDisplayID()]
+        }
+        let mainID = CGMainDisplayID()
+        return ids.prefix(Int(count)).sorted { lhs, rhs in
+            if (lhs == mainID) != (rhs == mainID) {
+                return lhs == mainID
+            }
+            return displaySortKey(lhs) < displaySortKey(rhs)
+        }
+    }
+
+    /// 按显示器在桌面坐标系里的位置排序；displayID 兜底，保证顺序稳定且唯一。
+    private func displaySortKey(_ displayID: CGDirectDisplayID) -> (Double, Double, Double) {
+        let bounds = CGDisplayBounds(displayID)
+        return (bounds.origin.x, bounds.origin.y, Double(displayID))
     }
 
     /// 返回指定显示器当前显示模式的原生像素尺寸；无法获取时回退到传入的点数尺寸。
@@ -1801,48 +1937,81 @@ final class BigDaddyClient: @unchecked Sendable {
             }
             return false
         }
-        guard let image = await captureMainDisplayImage() else { return false }
+        let captures = await captureAllDisplayImages()
+        guard !captures.isEmpty else { return false }
+        pruneStaleDisplayFingerprints(keeping: Set(captures.map { $0.displayID }))
 
         // 相似度去重只对"定时截图"有意义——静态屏幕下每隔几分钟发一张几乎一样的图纯属
         // 噪音。手动测试（manual）和家长下发的命令（command）都是一次明确的"现在就给我
         // 一张"的请求，必须无条件发送：之前 manual 也走去重，导致静态屏幕下点"测试截图"
         // 悄无声息、什么都没发，被误判成功能坏了。
-        if reason == "scheduled" && isImageSimilarToLast(cgImage: image) {
-            NSLog("BigDaddy: Screenshot is similar to the last one, skip sending.")
-            return false
+        //
+        // 按屏各自判定，而不是"整轮一起跳过"：主屏挂着静止的文档、副屏在放视频是多屏
+        // 下最常见的形态，用整轮判定会被静止的主屏一票否决，副屏再热闹也一张都发不出去。
+        // 注意去重必须对每块屏都跑一遍（不能因为已经决定要发就短路），否则被跳过的那块
+        // 屏指纹不更新，下一轮它会拿几轮前的旧帧来比。
+        var payload: [Data] = []
+        // captures 里"最终进入本轮上传"的那些条目，各自在原始显示器列表里的 index
+        // （1-based，见 captureAllDisplayImages）——用于之后定位主屏在 payload 里的位置。
+        var includedOriginalIndices: [Int] = []
+        for capture in captures {
+            let similar = isImageSimilarToLast(cgImage: capture.image, displayID: capture.displayID)
+            if reason == "scheduled" && similar {
+                NSLog("BigDaddy: Screenshot for display \(capture.index)/\(capture.total) is similar to the last one, skip sending.")
+                continue
+            }
+            guard let rep = resizeToMaxWidth(capture.image, maxWidth: config.compressMaxWidth) else {
+                NSLog("BigDaddy: Screenshot resize failed for display \(capture.index)/\(capture.total), skip sending.")
+                continue
+            }
+            payload.append(compressToTargetSize(rep, startQuality: config.compressQuality))
+            includedOriginalIndices.append(capture.index)
         }
+        guard !payload.isEmpty else { return false }
+        // 主屏画面在 payload 里的位置（1-based）；主屏这次没能进 payload（被去重跳过、
+        // 或单独抓取/压缩失败）就是 nil。不能靠"payload[0] 就是主屏"这种位置假设——
+        // 主屏静止不变时恰恰最容易被去重跳过，副屏反而会排到前面。
+        let mainScreenPosition = Self.mainScreenPosition(includedOriginalIndices: includedOriginalIndices)
 
-        guard let rep = resizeToMaxWidth(image, maxWidth: config.compressMaxWidth) else { return false }
-        let jpeg = compressToTargetSize(rep, startQuality: config.compressQuality)
-
-        let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        // 前台窗口信息与显示器无关，整轮只取一次：一是本来就只有一个前台窗口，二是
+        // activeWindowInfo() 会走 AppleScript/AX，每块屏各调一次纯属放大开销与阻塞面。
         // 同 sendHeartbeat：把可能阻塞的 AppleScript/AX 调用放进 Task.detached，
         // 不依赖"这里执行时已经离开主线程"这种由 ScreenCaptureKit 内部调度决定、
         // 未来系统版本随时可能变化的隐式假设。
+        let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
         let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
             self.activeWindowInfo()
         }.value
 
         do {
-            let responseData = try await uploadScreenshot(imageData: jpeg, activeApp: activeApp, windowTitle: windowTitle, activeUrl: activeUrl)
+            // 所有屏幕放在同一次上传里：后端据此合成一封多附件邮件 / 一次 sendMediaGroup，
+            // 家长收到的是一条完整通知。拆成多次上传的话，后端无从知道这几张属于同一轮，
+            // 只能各发各的，家长那边就是几条元数据一模一样、分不清谁是谁的重复推送。
+            let responseData = try await uploadScreenshots(images: payload, activeApp: activeApp,
+                                                           windowTitle: windowTitle, activeUrl: activeUrl,
+                                                           mainScreenPosition: mainScreenPosition)
             // 成功发送后更新截图时间
             lastScreenshotAt = Date()
             // 知情透明：把本次截图动作写入本机可查看/可导出的守护记录
-            AuditLog.record("SCREENSHOT_SENT reason=\(reason) app=\(activeApp) window=\(windowTitle)")
+            AuditLog.record("SCREENSHOT_SENT reason=\(reason) screens=\(payload.count) app=\(activeApp) window=\(windowTitle)")
             // 后端会明确告知是否真的转发成功（而不是只确认"收到了文件"），
             // 未送达时也要如实记录，避免家长/孩子都以为已经发出去了。
             if let decoded = try? JSONDecoder.bigDaddy.decode(ApiResponse<ScreenshotUploadResponse>.self, from: responseData),
                decoded.data.delivered == false {
                 let email = decoded.data.emailStatus ?? "UNKNOWN"
                 let telegram = decoded.data.telegramStatus ?? "UNKNOWN"
-                AuditLog.record("SCREENSHOT_NOT_DELIVERED reason=\(decoded.data.reason ?? "UNKNOWN") emailStatus=\(email) telegramStatus=\(telegram)")
+                AuditLog.record("SCREENSHOT_NOT_DELIVERED screens=\(payload.count) reason=\(decoded.data.reason ?? "UNKNOWN") emailStatus=\(email) telegramStatus=\(telegram)")
                 NSLog("BigDaddy: Screenshot uploaded but not delivered to any channel: \(decoded.data.reason ?? "unknown") (email=\(email), telegram=\(telegram))")
             }
-            // 即时可见：广播截图事件，UI 层据此闪烁菜单栏图标并弹出本机通知
+            // 即时可见：广播截图事件，UI 层据此闪烁菜单栏图标并弹出本机通知。带上本轮
+            // 真正发出去的张数：孩子端那条通知原文写死"一张"，多屏下会少报。
+            let deliveredScreens = payload.count
             await MainActor.run {
-                NotificationCenter.default.post(name: BigDaddyClient.screenshotSentNotification, object: nil)
+                NotificationCenter.default.post(name: BigDaddyClient.screenshotSentNotification,
+                                                object: nil,
+                                                userInfo: [BigDaddyClient.screenshotCountKey: deliveredScreens])
             }
-            NSLog("BigDaddy: Screenshot uploaded (reason: \(reason)).")
+            NSLog("BigDaddy: Screenshot uploaded (reason: \(reason), screens: \(payload.count)).")
             return true
         } catch let error as BigDaddyAPIError where error.isAuthFailure {
             NSLog("BigDaddy: Screenshot upload rejected (401): \(error.errorDescription ?? "")")

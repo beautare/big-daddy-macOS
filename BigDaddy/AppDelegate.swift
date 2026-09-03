@@ -296,7 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         schedulePermissionPollTimer()
         // 监听"实际发生截图"事件，触发孩子端即时可见提示
         NotificationCenter.default.addObserver(
-            self, selector: #selector(onScreenshotSent),
+            self, selector: #selector(onScreenshotSent(_:)),
             name: BigDaddyClient.screenshotSentNotification, object: nil
         )
         // 监听"自动路径因缺权限静默放弃截图"事件，节流一次性提醒用户去"关于"重启
@@ -1427,14 +1427,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// 每次实际发生截图时被调用：图标短暂切到"相机"态，并推送本机通知，确保孩子端即时可见。
-    @objc private func onScreenshotSent() {
+    @objc private func onScreenshotSent(_ note: Notification) {
         updateStatusItemAppearance(capturing: true)
         screenshotFlashTimer?.invalidate()
         screenshotFlashTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in self?.updateStatusItemAppearance() }
         }
+        // 多屏时一轮会发出多张（每块显示器一张），写死"一张"就是少报——孩子端这条
+        // 通知是"知情透明"承诺的一部分，报少了比不报更糟。
+        let count = (note.userInfo?[BigDaddyClient.screenshotCountKey] as? Int) ?? 1
+        let title = count > 1
+            ? String(format: Localization.string(zh: "已向家长发送 %d 张截图（每块屏幕各一张）",
+                                                 en: "%d screenshots were sent to your parent (one per screen)"), count)
+            : Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent")
         postLocalNotice(
-            title: Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent"),
+            title: title,
             body: Localization.string(zh: "本次截图已写入“本机守护记录”，可在菜单中导出查看。",
                                       en: "This capture is written to the local Guardian Log; export it from the menu.")
         )
