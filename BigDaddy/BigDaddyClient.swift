@@ -1089,6 +1089,31 @@ final class BigDaddyClient: @unchecked Sendable {
         return maxDiff < 18
     }
 
+    /// 当前运行中、有 Dock 图标的**非前台**应用名（localizedName）。
+    ///
+    /// 服务端的「重点关注名单」承诺的是"前台**或后台**出现即深度盘查"，而
+    /// "前台挂着作业文档、后台开着 B 站"恰恰是这条规则最主要的场景——只上报前台应用的话，
+    /// 这一半承诺一次也兑现不了。
+    ///
+    /// 只取 `.regular` 激活策略的应用：`.accessory` / `.prohibited` 是菜单栏小工具和
+    /// 后台守护进程（包括本程序自己），它们对"孩子在干什么"没有任何信息量，
+    /// 全量上报只会让这个列表长到不可读，也是不必要的信息外泄。
+    ///
+    /// 名字里出现的逗号会被替换掉：这个列表以逗号拼进 query string，
+    /// 应用名里带逗号会把一条拆成两条，服务端匹配到的就是半截名字。
+    static func backgroundAppNames() -> [String] {
+        let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        return NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular && $0.processIdentifier != frontmostPid }
+            .compactMap { $0.localizedName }
+            .map { $0.replacingOccurrences(of: ",", with: " ") }
+            // 去重后截断：多显示器 + 多用户会话下这个列表可能意外地长，而 query string
+            // 有长度上限，撑爆了整次上传都会失败——宁可少报几个后台应用。
+            .reduce(into: [String]()) { acc, name in if !acc.contains(name) { acc.append(name) } }
+            .prefix(30)
+            .map { $0 }
+    }
+
     /// 系统当前是否有 App 在输出音频。
     ///
     /// "在看视频"与"在出声"高度相关，而这是个纯元数据信号：零 token、毫秒级、不需要
@@ -1806,7 +1831,8 @@ final class BigDaddyClient: @unchecked Sendable {
     func uploadScreenshots(images: [Data], activeApp: String, windowTitle: String, activeUrl: String,
                            mainScreenPosition: Int?, unchangedScreens: [Int] = [],
                            audioActive: Bool? = nil, displaySleepPrevented: Bool? = nil,
-                           sleepAssertionOwner: String? = nil) async throws -> Data {
+                           sleepAssertionOwner: String? = nil,
+                           activeBundleId: String? = nil, backgroundApps: [String] = []) async throws -> Data {
         let method = "POST"
         let boundary = "BigDaddy-Upload-\(UUID().uuidString)"
         var components = URLComponents(url: baseURL.appendingPathComponent("/bigdaddy/client/screenshot"), resolvingAgainstBaseURL: false)!
@@ -1820,7 +1846,16 @@ final class BigDaddyClient: @unchecked Sendable {
                          value: unchangedScreens.isEmpty ? nil : unchangedScreens.map(String.init).joined(separator: ",")),
             URLQueryItem(name: "audioActive", value: audioActive.map { $0 ? "true" : "false" }),
             URLQueryItem(name: "displaySleepPrevented", value: displaySleepPrevented.map { $0 ? "true" : "false" }),
-            URLQueryItem(name: "sleepAssertionOwner", value: sleepAssertionOwner)
+            URLQueryItem(name: "sleepAssertionOwner", value: sleepAssertionOwner),
+            // activeAppName 上报的是 localizedName，**随系统语言变化**（中文系统下
+            // Safari 是"Safari浏览器"）。家长在 Dashboard 上按提示输入 "Safari" 建的规则
+            // 因此永远匹配不上，而界面上它一直列着。bundle id 与语言无关，是这类规则
+            // 唯一可靠的锚点——这和本文件 1170 行那段"浏览器按 bundle id 匹配"是同一个理由。
+            URLQueryItem(name: "activeBundleId", value: activeBundleId),
+            // 重点关注名单承诺"前后台出现即深查"，而"前台挂着作业、后台开着 B 站"正是它
+            // 最主要的场景。空数组时整个参数省略，理由同 unchangedScreens。
+            URLQueryItem(name: "backgroundApps",
+                         value: backgroundApps.isEmpty ? nil : backgroundApps.joined(separator: ","))
         ]
         
         guard let url = components.url else { throw URLError(.badURL) }
@@ -2195,6 +2230,11 @@ final class BigDaddyClient: @unchecked Sendable {
         // 里却查不出用途——采什么、为什么采，必须和功能开关一一对应。
         let audioActive = aiMode ? systemAudioActive() : nil
         let sleepAssertion = aiMode ? displaySleepAssertion() : nil
+        // bundle id 与后台应用列表：同样只在 AI 模式下采集。非 AI 模式服务端用不到，
+        // 而"能采就采"会让这两项出现在孩子端的守护记录里却查不出用途——采什么、为什么采，
+        // 必须和功能开关一一对应（同 audioActive / sleepAssertion 的处置）。
+        let activeBundleId = aiMode ? NSWorkspace.shared.frontmostApplication?.bundleIdentifier : nil
+        let backgroundApps = aiMode ? Self.backgroundAppNames() : []
 
         do {
             // 所有屏幕放在同一次上传里：后端据此合成一封多附件邮件 / 一次 sendMediaGroup，
@@ -2212,7 +2252,9 @@ final class BigDaddyClient: @unchecked Sendable {
                                                            unchangedScreens: unchangedScreens,
                                                            audioActive: audioActive,
                                                            displaySleepPrevented: sleepAssertion?.prevented,
-                                                           sleepAssertionOwner: sleepAssertion?.owner)
+                                                           sleepAssertionOwner: sleepAssertion?.owner,
+                                                           activeBundleId: activeBundleId,
+                                                           backgroundApps: backgroundApps)
             // 成功发送后更新截图时间
             lastScreenshotAt = Date()
             // 知情透明：把本次截图动作写入本机可查看/可导出的守护记录
