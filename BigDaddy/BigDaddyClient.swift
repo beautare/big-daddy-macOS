@@ -1092,13 +1092,9 @@ final class BigDaddyClient: @unchecked Sendable {
         return maxDiff < 18
     }
 
-    /// 获取当前前台应用名称。若当前前台是系统锁屏/登录窗口（com.apple.loginwindow），
-    /// 返回空字符串，避免将锁屏待机界面作为应用程序上报与统计。
+    /// 获取当前前台应用名称。
     static func currentActiveAppName() -> String {
         guard let front = NSWorkspace.shared.frontmostApplication else { return "" }
-        if front.bundleIdentifier == "com.apple.loginwindow" || front.localizedName == "loginwindow" {
-            return ""
-        }
         return front.localizedName ?? ""
     }
 
