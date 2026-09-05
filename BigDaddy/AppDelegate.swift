@@ -1658,6 +1658,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     // 跟踪 IDLE/RESUME 状态转换
     private var wasIdle = false
+    /// 跟踪系统锁屏状态（com.apple.screenIsLocked ⇄ com.apple.screenIsUnlocked）
+    private(set) var isScreenLocked = false
+
+    /// 判断当前是否处于锁屏或系统登录/屏保窗口
+    var isScreenLockedOrLoginWindow: Bool {
+        if isScreenLocked { return true }
+        if let front = NSWorkspace.shared.frontmostApplication {
+            if front.bundleIdentifier == "com.apple.loginwindow" || front.localizedName == "loginwindow" {
+                return true
+            }
+        }
+        return false
+    }
 
     /// 电源与登录会话事件的监听。
     ///
@@ -1703,6 +1716,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
         ) { [weak self] _ in
             guard let self else { return }
+            self.isScreenLocked = true
+            self.wasIdle = true
+            self.stopIdleActivityMonitor()
             AuditLog.record("SCREEN_LOCKED")
             Task { await self.client.sendHeartbeat(event: .screenLock) }
         }
@@ -1710,6 +1726,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         distributed.addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
         ) { [weak self] _ in
+            guard let self else { return }
+            self.isScreenLocked = false
             Task { @MainActor [weak self] in
                 self?.handleResumeFromSystemEvent(event: .screenUnlock, auditLine: "SCREEN_UNLOCKED")
             }
@@ -1850,6 +1868,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         heartbeatTimer = scheduleCommonModeTimer(interval: interval, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                if self.isScreenLockedOrLoginWindow {
+                    self.isScreenLocked = true
+                    self.wasIdle = true
+                    self.stopIdleActivityMonitor()
+                    await self.client.sendHeartbeat(event: .screenLock)
+                    self.scheduleNextHeartbeat()
+                    return
+                }
                 let previouslyIdle = self.wasIdle
                 let isIdle = self.client.isIdle
                 let transition = ActivityStateTransition.resolve(previouslyIdle: previouslyIdle, isIdle: isIdle)
@@ -2225,7 +2251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     private func performScheduledScreenshot() {
-        guard !client.isIdle else { return }
+        guard !isScreenLockedOrLoginWindow, !client.isIdle else { return }
         Task {
             await client.captureAndSendScreenshot(reason: "scheduled")
             await client.sendHeartbeat(event: .heartbeat)

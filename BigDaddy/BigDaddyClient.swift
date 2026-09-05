@@ -408,9 +408,12 @@ final class BigDaddyClient: @unchecked Sendable {
             guard let self else { return }
             // 弹任何 NSAlert（绑定码/关于/凭据失效/退出密码……）都要求 BigDaddy 自己短暂
             // 变成 active app（key window 的前提），不过滤的话孩子每次跟客户端自身界面
-            // 交互都会被误记成"切换到了 BigDaddy"，污染 switchCount 和审计日志。
+            // 交互都会被误记成"切换到了 BigDaddy"，污染 switchCount 和审计日志；
+            // 切到系统锁屏/登录窗口（loginwindow）同理不属于用户切换前台应用。
             if let activated = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-               activated.processIdentifier == ownPID {
+               activated.processIdentifier == ownPID
+                || activated.bundleIdentifier == "com.apple.loginwindow"
+                || activated.localizedName == "loginwindow" {
                 return
             }
             self.switchCounter.increment()
@@ -657,7 +660,7 @@ final class BigDaddyClient: @unchecked Sendable {
         // BigDaddyDeviceAuthService 拒绝——不再徒劳重试，等下一轮 register() 恢复。
         guard !credentialsInvalid else { return false }
         let version = AppVersion.current
-        let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        let activeApp = Self.currentActiveAppName()
         // activeWindowInfo 浏览器场景下靠 NSAppleScript 给目标浏览器发 Apple Event 并同步
         // 等回复，没有超时保护；目标浏览器卡顿/无响应时能一直等下去。这个调用之前直接摆在
         // sendHeartbeat 开头、第一个 await 之前——而 sendHeartbeat 的调用方全部是
@@ -1087,6 +1090,25 @@ final class BigDaddyClient: @unchecked Sendable {
         }
         NSLog("BigDaddy: Screenshot blockwise max diff = \(maxDiff) (display \(displayID))")
         return maxDiff < 18
+    }
+
+    /// 获取当前前台应用名称。若当前前台是系统锁屏/登录窗口（com.apple.loginwindow），
+    /// 返回空字符串，避免将锁屏待机界面作为应用程序上报与统计。
+    static func currentActiveAppName() -> String {
+        guard let front = NSWorkspace.shared.frontmostApplication else { return "" }
+        if front.bundleIdentifier == "com.apple.loginwindow" || front.localizedName == "loginwindow" {
+            return ""
+        }
+        return front.localizedName ?? ""
+    }
+
+    /// 获取当前前台应用的 Bundle ID。若是 loginwindow 则返回 nil。
+    static func currentActiveBundleId(aiMode: Bool) -> String? {
+        guard aiMode, let front = NSWorkspace.shared.frontmostApplication else { return nil }
+        if front.bundleIdentifier == "com.apple.loginwindow" || front.localizedName == "loginwindow" {
+            return nil
+        }
+        return front.bundleIdentifier
     }
 
     /// 当前运行中、有 Dock 图标的**非前台**应用名（localizedName）。
@@ -2220,7 +2242,7 @@ final class BigDaddyClient: @unchecked Sendable {
         // 同 sendHeartbeat：把可能阻塞的 AppleScript/AX 调用放进 Task.detached，
         // 不依赖"这里执行时已经离开主线程"这种由 ScreenCaptureKit 内部调度决定、
         // 未来系统版本随时可能变化的隐式假设。
-        let activeApp = NSWorkspace.shared.frontmostApplication?.localizedName ?? ""
+        let activeApp = Self.currentActiveAppName()
         let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
             self.activeWindowInfo()
         }.value
@@ -2233,7 +2255,7 @@ final class BigDaddyClient: @unchecked Sendable {
         // bundle id 与后台应用列表：同样只在 AI 模式下采集。非 AI 模式服务端用不到，
         // 而"能采就采"会让这两项出现在孩子端的守护记录里却查不出用途——采什么、为什么采，
         // 必须和功能开关一一对应（同 audioActive / sleepAssertion 的处置）。
-        let activeBundleId = aiMode ? NSWorkspace.shared.frontmostApplication?.bundleIdentifier : nil
+        let activeBundleId = Self.currentActiveBundleId(aiMode: aiMode)
         let backgroundApps = aiMode ? Self.backgroundAppNames() : []
 
         do {
