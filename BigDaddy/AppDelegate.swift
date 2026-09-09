@@ -59,7 +59,7 @@ final class BindTokenMailbox: @unchecked Sendable {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, NSWindowDelegate, SPUUpdaterDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate, NSWindowDelegate, SPUUpdaterDelegate, NSUserNotificationCenterDelegate {
     private var statusItem: NSStatusItem?
     private let client = BigDaddyClient()
     private let webFilterController = WebFilterController()
@@ -180,6 +180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// "关于"窗口里"时间约定"行的剩余时间字段，与 aboutCountdownField 共用同一个
     /// aboutCountdownTimer 每秒刷新；仅在渲染了该行（有进行中的约定）时非空。
     private weak var aboutTimeSessionField: NSTextField?
+    /// "关于"窗口里"测试截图"按钮弱引用，方便异步更新按钮文字和状态（防连点、Loading、完成反馈）。
+    private weak var aboutTestScreenshotButton: NSButton?
+    /// 是否正在进行测试截屏，用于防连点防抖。
+    private var isTestCapturing = false
 
     // MARK: - 时间约定（家长设定的可用时长）
 
@@ -250,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         print("BigDaddy: StatusItem created")
         NSApp.setActivationPolicy(.accessory)
+        NSUserNotificationCenter.default.delegate = self
         installSignalHandlers()
         print("BigDaddy: signal handlers installed")
         client.startNetworkMonitoring()
@@ -916,6 +921,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         aboutCountdownTimer = nil
         aboutCountdownField = nil
         aboutTimeSessionField = nil
+        aboutTestScreenshotButton = nil
+        isTestCapturing = false
     }
 
     /// 只在"关于"窗口里渲染了"下次截屏"或"时间约定"任一行时才起定时器，两个字段
@@ -948,9 +955,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// "关于"窗口里"测试截图"按钮的响应：不关闭窗口（方便连续测试、观察倒计时），
-    /// 直接走手动截图路径（reason: manual，已不受相似度去重影响，见 captureAndSendScreenshot）。
+    /// 点击后防连点，按钮展示 Loading（截图中…）并在完成后给出明确反馈（已发送 / 画面正常 / 失败）。
     @objc private func aboutTestScreenshotTapped() {
-        sendScreenshotNow()
+        guard !isTestCapturing else { return }
+        isTestCapturing = true
+        aboutTestScreenshotButton?.isEnabled = false
+        aboutTestScreenshotButton?.title = Localization.string(zh: "截图中…", en: "Capturing…")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await self.client.refreshConfig()
+            let result = await self.client.captureAndSendScreenshot(reason: "manual")
+
+            guard let button = self.aboutTestScreenshotButton else {
+                self.isTestCapturing = false
+                return
+            }
+
+            switch result {
+            case .sent:
+                button.title = Localization.string(zh: "已发送 ✓", en: "Sent ✓")
+            case .aiSilent:
+                button.title = Localization.string(zh: "画面正常 ✓", en: "All Good ✓")
+            case .missingPermission:
+                button.title = Localization.string(zh: "缺录屏权限 ✕", en: "No Permission ✕")
+            case .disabledOrUnbound, .noDisplaysOrResizeFailed, .unchangedSkipped, .uploadFailed, .notDelivered:
+                button.title = Localization.string(zh: "截屏失败 ✕", en: "Failed ✕")
+            }
+
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            self.aboutTestScreenshotButton?.title = Localization.string(zh: "测试截图", en: "Test")
+            self.aboutTestScreenshotButton?.isEnabled = true
+            self.isTestCapturing = false
+        }
     }
 
     /// "关于"窗口按钮的统一响应入口：tag 是按钮在 actions 数组里的下标，关掉窗口后
@@ -1189,6 +1227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         testButton.controlSize = .small
         testButton.font = NSFont.systemFont(ofSize: 11)
         testButton.setContentHuggingPriority(.required, for: .horizontal)
+        aboutTestScreenshotButton = testButton
 
         row.addArrangedSubview(labelField)
         row.addArrangedSubview(valueField)
@@ -1442,15 +1481,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 多屏时一轮会发出多张（每块显示器一张），写死"一张"就是少报——孩子端这条
         // 通知是"知情透明"承诺的一部分，报少了比不报更糟。
         let count = (note.userInfo?[BigDaddyClient.screenshotCountKey] as? Int) ?? 1
-        let title = count > 1
-            ? String(format: Localization.string(zh: "已向家长发送 %d 张截图（每块屏幕各一张）",
-                                                 en: "%d screenshots were sent to your parent (one per screen)"), count)
-            : Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent")
-        postLocalNotice(
-            title: title,
-            body: Localization.string(zh: "本次截图已写入“本机守护记录”，可在菜单中导出查看。",
-                                      en: "This capture is written to the local Guardian Log; export it from the menu.")
-        )
+        let isAiSilent = (note.userInfo?[BigDaddyClient.screenshotAiSilentKey] as? Bool) ?? false
+        if isAiSilent {
+            let title = Localization.string(zh: "截图已完成 AI 研判", en: "Screenshot Reviewed by AI")
+            let body = Localization.string(
+                zh: "画面状态正常，未触发告警（已写入“本机守护记录”）。",
+                en: "Content is normal; no parent alert triggered (written to Guardian Log)."
+            )
+            postLocalNotice(title: title, body: body)
+        } else {
+            let title = count > 1
+                ? String(format: Localization.string(zh: "已向家长发送 %d 张截图（每块屏幕各一张）",
+                                                     en: "%d screenshots were sent to your parent (one per screen)"), count)
+                : Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent")
+            postLocalNotice(
+                title: title,
+                body: Localization.string(zh: "本次截图已写入“本机守护记录”，可在菜单中导出查看。",
+                                          en: "This capture is written to the local Guardian Log; export it from the menu.")
+            )
+        }
     }
 
     /// 定时/命令截图因缺屏幕录制权限静默失败时被调用。节流成"同一段缺权限期间只提醒
@@ -1654,6 +1703,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         notice.title = title
         notice.informativeText = body
         NSUserNotificationCenter.default.deliver(notice)
+    }
+
+    // MARK: - NSUserNotificationCenterDelegate
+
+    /// 即使 BigDaddy 处于前台活跃状态，也允许横幅正常在桌面悬浮展示，避免前台操作时横幅被系统默认静默吸收。
+    nonisolated func userNotificationCenter(_ center: NSUserNotificationCenter, shouldPresent notification: NSUserNotification) -> Bool {
+        true
     }
 
     // 跟踪 IDLE/RESUME 状态转换

@@ -1850,11 +1850,12 @@ final class BigDaddyClient: @unchecked Sendable {
                            mainScreenPosition: Int?, unchangedScreens: [Int] = [],
                            audioActive: Bool? = nil, displaySleepPrevented: Bool? = nil,
                            sleepAssertionOwner: String? = nil,
-                           activeBundleId: String? = nil, backgroundApps: [String] = []) async throws -> Data {
+                            activeBundleId: String? = nil, backgroundApps: [String] = [],
+                            reason: String? = nil) async throws -> Data {
         let method = "POST"
         let boundary = "BigDaddy-Upload-\(UUID().uuidString)"
         var components = URLComponents(url: baseURL.appendingPathComponent("/bigdaddy/client/screenshot"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "activeAppName", value: activeApp),
             URLQueryItem(name: "activeWindowTitle", value: windowTitle.isEmpty ? nil : windowTitle),
             URLQueryItem(name: "activeUrl", value: activeUrl.isEmpty ? nil : activeUrl),
@@ -1875,6 +1876,10 @@ final class BigDaddyClient: @unchecked Sendable {
             URLQueryItem(name: "backgroundApps",
                          value: backgroundApps.isEmpty ? nil : backgroundApps.joined(separator: ","))
         ]
+        if let reason, !reason.isEmpty {
+            queryItems.append(URLQueryItem(name: "reason", value: reason))
+        }
+        components.queryItems = queryItems
         
         guard let url = components.url else { throw URLError(.badURL) }
         var request = URLRequest(url: url)
@@ -1911,6 +1916,29 @@ final class BigDaddyClient: @unchecked Sendable {
     static let screenshotSentNotification = Notification.Name("BigDaddyScreenshotSent")
     /// screenshotSentNotification 的 userInfo 键：本轮实际发出去的截图张数（多屏时 > 1）
     static let screenshotCountKey = "BigDaddyScreenshotCount"
+    /// screenshotSentNotification 的 userInfo 键：本轮截图是否被后端 AI 研判判定正常而静默过滤（Bool）
+    static let screenshotAiSilentKey = "BigDaddyScreenshotAiSilent"
+
+    /// 截屏与上传尝试的完整结果，供 UI 反馈与命令回执精确判断
+    enum CaptureResult: Sendable, Equatable {
+        case sent(screenCount: Int)
+        case aiSilent(screenCount: Int)
+        case notDelivered(reason: String)
+        case disabledOrUnbound
+        case missingPermission
+        case noDisplaysOrResizeFailed
+        case unchangedSkipped
+        case uploadFailed(String)
+
+        var succeeded: Bool {
+            switch self {
+            case .sent, .aiSilent:
+                return true
+            default:
+                return false
+            }
+        }
+    }
     /// 自动路径（定时/家长下发命令）因缺屏幕录制权限而静默放弃截图时广播。手动测试
     /// （关于面板里点"测试截图"）不广播这个——用户当时就看着"关于"面板，⚠️ 按钮本身
     /// 已经是最直接的提示，不需要再额外弹一条本机通知重复同一件事。
@@ -2018,9 +2046,13 @@ final class BigDaddyClient: @unchecked Sendable {
     private func captureAllDisplayImages() async -> [CapturedDisplay] {
         if #available(macOS 14.0, *) {
             let displays: [SCDisplay]
+            let selfWindows: [SCWindow]
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 displays = orderedDisplays(content.displays)
+                // 排除当前进程自身的所有窗口（如"软件版本与运行状态"面板），避免遮挡屏幕真实画面
+                let currentPid = NSRunningApplication.current.processIdentifier
+                selfWindows = content.windows.filter { $0.owningApplication?.processID == currentPid }
             } catch {
                 NSLog("BigDaddy: ScreenCaptureKit content query failed: \(error.localizedDescription)")
                 return []
@@ -2031,7 +2063,7 @@ final class BigDaddyClient: @unchecked Sendable {
             }
             var captured: [CapturedDisplay] = []
             for (offset, display) in displays.enumerated() {
-                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let filter = SCContentFilter(display: display, excludingWindows: selfWindows)
                 let configuration = SCStreamConfiguration()
                 // 用 CGDisplayMode 拿当前显示模式的原生像素尺寸；拿不到就回退到点数（退化为
                 // 旧的 1x 行为，至少不崩）。宽高都按原生像素设，保持长宽比、避免拉伸/加黑边。
@@ -2130,10 +2162,10 @@ final class BigDaddyClient: @unchecked Sendable {
         config.allowScreenshotAiProcessing ? max(config.compressMaxWidth, 1024) : config.compressMaxWidth
     }
 
-    /// 返回是否真正完成了一次截图上传尝试（用于命令回执：截图被禁用/无权限/上传失败
+    /// 返回截屏上传尝试的详细结果（用于命令回执与 UI 反馈：截图被禁用/无权限/上传失败
     /// 都不应该回执 SUCCEEDED，此前命令通道无条件回执成功，是一种"假成功"）。
     @discardableResult
-    func captureAndSendScreenshot(reason: String) async -> Bool {
+    func captureAndSendScreenshot(reason: String) async -> CaptureResult {
         // 未绑定设备只做最基础登记、不采集行为明细——这是给孩子看的明确承诺（见「守护
         // 说明」弹窗）。screenshotEnabled 单独判断不够：解绑时 refreshConfig() 只翻转
         // bound、刻意保留 screenshotEnabled 原值（不能用"未绑定"信号覆盖整份本地配置），
@@ -2143,13 +2175,13 @@ final class BigDaddyClient: @unchecked Sendable {
         // 状态下截屏（哪怕上传大概率被后端拒收，本机截屏动作本身已经发生）。
         guard config.bound else {
             NSLog("BigDaddy: device not bound, ignoring capture request (reason: \(reason)).")
-            return false
+            return .disabledOrUnbound
         }
         // screenshotEnabled 由后端配置控制，默认关闭。
         // 任何路径（定时/手动/命令）都必须在开启后才允许截屏，命令通道不再绕过此开关。
         guard config.screenshotEnabled else {
             NSLog("BigDaddy: screenshot disabled, ignoring capture request (reason: \(reason)).")
-            return false
+            return .disabledOrUnbound
         }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
@@ -2161,10 +2193,10 @@ final class BigDaddyClient: @unchecked Sendable {
                     NotificationCenter.default.post(name: BigDaddyClient.screenshotMissingPermissionNotification, object: nil)
                 }
             }
-            return false
+            return .missingPermission
         }
         let captures = await captureAllDisplayImages()
-        guard !captures.isEmpty else { return false }
+        guard !captures.isEmpty else { return .noDisplaysOrResizeFailed }
         pruneStaleDisplayFingerprints(keeping: Set(captures.map { $0.displayID }))
 
         // 相似度去重只对"定时截图"有意义——静态屏幕下每隔几分钟发一张几乎一样的图纯属
@@ -2207,7 +2239,7 @@ final class BigDaddyClient: @unchecked Sendable {
         let allSimilar = !similarity.isEmpty && similarity.values.allSatisfy { $0 }
         if reason == "scheduled" && aiMode && allSimilar {
             NSLog("BigDaddy: all displays unchanged (AI mode), skip this round entirely.")
-            return false
+            return .unchangedSkipped
         }
 
         for capture in captures {
@@ -2227,7 +2259,7 @@ final class BigDaddyClient: @unchecked Sendable {
                 unchangedScreens.append(payload.count)
             }
         }
-        guard !payload.isEmpty else { return false }
+        guard !payload.isEmpty else { return .noDisplaysOrResizeFailed }
         // 主屏画面在 payload 里的位置（1-based）；主屏这次没能进 payload（被去重跳过、
         // 或单独抓取/压缩失败）就是 nil。不能靠"payload[0] 就是主屏"这种位置假设——
         // 主屏静止不变时恰恰最容易被去重跳过，副屏反而会排到前面。
@@ -2272,15 +2304,17 @@ final class BigDaddyClient: @unchecked Sendable {
                                                            displaySleepPrevented: sleepAssertion?.prevented,
                                                            sleepAssertionOwner: sleepAssertion?.owner,
                                                            activeBundleId: activeBundleId,
-                                                           backgroundApps: backgroundApps)
+                                                           backgroundApps: backgroundApps,
+                                                           reason: reason)
             // 成功发送后更新截图时间
             lastScreenshotAt = Date()
             // 知情透明：把本次截图动作写入本机可查看/可导出的守护记录
             AuditLog.record("SCREENSHOT_SENT reason=\(reason) screens=\(payload.count) app=\(activeApp) window=\(windowTitle)")
             // 后端会明确告知是否真的转发成功（而不是只确认"收到了文件"），
             // 未送达时也要如实记录，避免家长/孩子都以为已经发出去了。
-            if let decoded = try? JSONDecoder.bigDaddy.decode(ApiResponse<ScreenshotUploadResponse>.self, from: responseData),
-               decoded.data.delivered == false {
+            let decoded = try? JSONDecoder.bigDaddy.decode(ApiResponse<ScreenshotUploadResponse>.self, from: responseData)
+            let isAiSilent = (decoded?.data.delivered == false && decoded?.data.reason == "AI_FILTERED_SILENT")
+            if let decoded, decoded.data.delivered == false {
                 // AI 静默是 delivered=false 里**唯一不是故障**的一种：家长选的就是
                 // "只在有问题时提醒我"，这一轮 AI 判断没问题，于是什么都没发。
                 // 沿用 SCREENSHOT_NOT_DELIVERED 会在孩子的守护记录里留下一长串假的
@@ -2296,22 +2330,31 @@ final class BigDaddyClient: @unchecked Sendable {
                 }
             }
             // 即时可见：广播截图事件，UI 层据此闪烁菜单栏图标并弹出本机通知。带上本轮
-            // 真正发出去的张数：孩子端那条通知原文写死"一张"，多屏下会少报。
+            // 真正发出去的张数以及是否为 AI 静默过滤。
             let deliveredScreens = payload.count
             await MainActor.run {
                 NotificationCenter.default.post(name: BigDaddyClient.screenshotSentNotification,
                                                 object: nil,
-                                                userInfo: [BigDaddyClient.screenshotCountKey: deliveredScreens])
+                                                userInfo: [
+                                                    BigDaddyClient.screenshotCountKey: deliveredScreens,
+                                                    BigDaddyClient.screenshotAiSilentKey: isAiSilent
+                                                ])
             }
-            NSLog("BigDaddy: Screenshot uploaded (reason: \(reason), screens: \(payload.count)).")
-            return true
+            NSLog("BigDaddy: Screenshot uploaded (reason: \(reason), screens: \(payload.count), aiSilent: \(isAiSilent)).")
+            if isAiSilent {
+                return .aiSilent(screenCount: deliveredScreens)
+            } else if let decoded, decoded.data.delivered == false {
+                return .notDelivered(reason: decoded.data.reason ?? "UNKNOWN")
+            } else {
+                return .sent(screenCount: deliveredScreens)
+            }
         } catch let error as BigDaddyAPIError where error.isAuthFailure {
             NSLog("BigDaddy: Screenshot upload rejected (401): \(error.errorDescription ?? "")")
             markCredentialsInvalid()
-            return false
+            return .uploadFailed("401 Unauthorized")
         } catch {
             NSLog("BigDaddy: Screenshot upload failed: \(error.localizedDescription)")
-            return false
+            return .uploadFailed(error.localizedDescription)
         }
     }
 
@@ -2346,7 +2389,7 @@ final class BigDaddyClient: @unchecked Sendable {
         for command in screenshotCommands {
             // 之前无条件回执 SUCCEEDED，哪怕截图因为未开启/无权限/上传失败而根本没发生，
             // 家长在 Dashboard 看到的命令状态是假的。现在按实际结果回执。
-            let succeeded = await captureAndSendScreenshot(reason: "command")
+            let succeeded = (await captureAndSendScreenshot(reason: "command")).succeeded
             await ack(
                 commandId: command.commandId,
                 status: succeeded ? "SUCCEEDED" : "FAILED",
