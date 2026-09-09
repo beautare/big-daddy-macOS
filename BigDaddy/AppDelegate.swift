@@ -1471,34 +1471,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         updateStatusItemAppearance()
     }
 
-    /// 每次实际发生截图时被调用：图标短暂切到"相机"态，并推送本机通知，确保孩子端即时可见。
+    /// 每次实际发生截图时被调用：图标短暂切到"相机"态（闪烁 4 秒），确保孩子端通过菜单栏视觉轻量知情。
+    /// 不弹桌面横幅通知：避免高频截图打扰孩子写作业/网课的心流，减少被监视的心理压力；
+    /// 知情透明由“菜单栏图标闪烁 + 本机守护记录随时可查”兑现，测试按钮由其自身的即时状态反馈兑现。
     @objc private func onScreenshotSent(_ note: Notification) {
         updateStatusItemAppearance(capturing: true)
         screenshotFlashTimer?.invalidate()
         screenshotFlashTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in self?.updateStatusItemAppearance() }
-        }
-        // 多屏时一轮会发出多张（每块显示器一张），写死"一张"就是少报——孩子端这条
-        // 通知是"知情透明"承诺的一部分，报少了比不报更糟。
-        let count = (note.userInfo?[BigDaddyClient.screenshotCountKey] as? Int) ?? 1
-        let isAiSilent = (note.userInfo?[BigDaddyClient.screenshotAiSilentKey] as? Bool) ?? false
-        if isAiSilent {
-            let title = Localization.string(zh: "截图已完成 AI 研判", en: "Screenshot Reviewed by AI")
-            let body = Localization.string(
-                zh: "画面状态正常，未触发告警（已写入“本机守护记录”）。",
-                en: "Content is normal; no parent alert triggered (written to Guardian Log)."
-            )
-            postLocalNotice(title: title, body: body)
-        } else {
-            let title = count > 1
-                ? String(format: Localization.string(zh: "已向家长发送 %d 张截图（每块屏幕各一张）",
-                                                     en: "%d screenshots were sent to your parent (one per screen)"), count)
-                : Localization.string(zh: "已向家长发送一张截图", en: "A screenshot was sent to your parent")
-            postLocalNotice(
-                title: title,
-                body: Localization.string(zh: "本次截图已写入“本机守护记录”，可在菜单中导出查看。",
-                                          en: "This capture is written to the local Guardian Log; export it from the menu.")
-            )
         }
     }
 
