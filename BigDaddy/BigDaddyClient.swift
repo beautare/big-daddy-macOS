@@ -622,6 +622,18 @@ final class BigDaddyClient: @unchecked Sendable {
         config.continuityMode = false
         config.continuityModeUpdatedAt = nil
         config.boundToEmailMasked = nil
+        
+        // newly added fields
+        config.aiEnabled = false
+        config.allowScreenshotAiProcessing = false
+        config.hasExitPassword = false
+        config.screenshotIntervalMins = 5
+        config.compressQuality = 0.6
+        config.compressMaxWidth = 1280
+        config.heartbeatActiveSeconds = 60
+        config.heartbeatIdleSeconds = 900
+        config.idleThresholdSeconds = 180
+        
         ConfigStore.save(config)
         NotificationCenter.default.post(
             name: Self.webFilterConfigChangedNotification,
