@@ -322,6 +322,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.syncTimeSessionState() }
         }
+        // 监听凭据失效（401）通知：解绑或服务端凭据失效时立即触发 pollConfigForChildVisibility()，
+        // 将解绑感知从最长 60 秒轮询压到秒级
+        NotificationCenter.default.addObserver(
+            forName: BigDaddyClient.credentialsInvalidNotification, object: client, queue: .main
+        ) { [weak self] _ in
+            Task { [weak self] in await self?.pollConfigForChildVisibility() }
+        }
         installPowerAndSessionObservers()
         rebuildMenu()
         print("BigDaddy: menu rebuilt")
@@ -2022,7 +2029,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 AuditLog.record("SCREENSHOT_INTERVAL_UPDATED mins=\(client.config.screenshotIntervalMins) source=remote")
             }
             if boundChanged && !client.config.bound {
-                AuditLog.record("DEVICE_UNBOUND 家长已在家长中心解除本设备的守护关系")
+                // 1. 重置本地配置中的敏感业务数据（家长通知渠道、网页过滤黑名单等）
+                client.resetConfigOnUnbind()
+                // 2. 清空本地积压的离线心跳/补发队列
+                PendingQueue.clear()
+                // 3. 清空本地时间约定锚点
+                TimeSessionAnchorStore.clear()
+                // 4. 清空历史审计日志，并记录全新解绑日志
+                AuditLog.clear()
+                AuditLog.record("DEVICE_UNBOUND 家长已在家长中心解除本设备的守护关系，本地历史记录已清空")
                 postLocalNotice(
                     title: Localization.string(zh: "守护关系已解除", en: "Guardian binding removed"),
                     body: Localization.string(

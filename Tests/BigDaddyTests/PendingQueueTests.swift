@@ -128,6 +128,22 @@ final class PendingQueueTests: XCTestCase {
                        "磁盘写失败时，磁盘上的内容不该发生变化")
     }
 
+    func testClearRemovesFileAndResetsMemory() {
+        PendingQueue.enqueue(body(event: "A"))
+        PendingQueue.enqueue(body(event: "B"))
+        XCTAssertEqual(PendingQueue.depth, 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: PendingQueue.queueFileURL.path))
+
+        PendingQueue.clear()
+
+        XCTAssertEqual(PendingQueue.depth, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: PendingQueue.queueFileURL.path))
+
+        // 重新读盘（模拟重启），确认磁盘文件也是空的
+        PendingQueue.resetForTesting()
+        XCTAssertEqual(PendingQueue.depth, 0)
+    }
+
     private func body(event: String, reportedAt: Date = Date()) -> [String: Any] {
         [
             "eventType": event,

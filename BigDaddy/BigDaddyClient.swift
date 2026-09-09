@@ -218,6 +218,7 @@ struct TimeSessionAnchor: Equatable {
 final class BigDaddyClient: @unchecked Sendable {
     static var lastSharedInstance: BigDaddyClient?
     static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
+    static let credentialsInvalidNotification = Notification.Name("BigDaddyCredentialsInvalid")
 
     let baseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")!
     /// 家长家长中心地址：正式 .app 由打包脚本写入 Info.plist（BigDaddyDashboardBaseURL），
@@ -484,6 +485,7 @@ final class BigDaddyClient: @unchecked Sendable {
         credentialsInvalid = true
         if !wasInvalid {
             NSLog("BigDaddy: signed request rejected as unauthorized (401); marking credentials invalid, will retry via register()")
+            NotificationCenter.default.post(name: Self.credentialsInvalidNotification, object: self)
         }
     }
 
@@ -607,6 +609,24 @@ final class BigDaddyClient: @unchecked Sendable {
         }
         ContinuityModeController.sync(enabled: config.continuityMode && ContinuityModePreference.isEnabled)
         return config != previous ? .successChanged : .successUnchanged
+    }
+
+    /// 解除绑定时重置本地配置：将 bound 设为 false，清空家长通知渠道、网页黑名单、时间约定等敏感配置
+    func resetConfigOnUnbind() {
+        config.bound = false
+        config.hasPendingCommand = false
+        config.screenshotEnabled = false
+        config.notificationChannels = NotificationChannels()
+        config.webFilter = WebFilterConfiguration()
+        config.timeSession = nil
+        config.continuityMode = false
+        config.continuityModeUpdatedAt = nil
+        config.boundToEmailMasked = nil
+        ConfigStore.save(config)
+        NotificationCenter.default.post(
+            name: Self.webFilterConfigChangedNotification,
+            object: self
+        )
     }
 
     func reportWebFilterStatus(_ report: WebFilterStatusReport) async {
@@ -2702,6 +2722,11 @@ enum AuditLog {
             NSLog("BigDaddy: audit log write failed: \(error.localizedDescription)")
         }
     }
+
+    /// 解绑时清空本地历史审计日志文件
+    static func clear() {
+        try? FileManager.default.removeItem(at: auditFileURL)
+    }
 }
 
 /// 断网容错：心跳/事件发送失败时，把请求体缓存到本地文件（内存中每行一条 JSON），
@@ -2727,6 +2752,14 @@ enum PendingQueue {
         lock.lock()
         defer { lock.unlock() }
         cache = nil
+    }
+
+    /// 解除设备绑定时物理清空本地积压队列与内存镜像，防止残留敏感行为数据泄露
+    static func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        cache = []
+        try? FileManager.default.removeItem(at: queueFileURL)
     }
 
     /// 队列的保留窗口：**按时长**而不是按条数裁剪。
