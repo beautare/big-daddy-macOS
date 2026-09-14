@@ -20,6 +20,7 @@ enum EventType: String, Codable {
     case idle = "IDLE"
     case resume = "RESUME"
     case shutdown = "SHUTDOWN"
+    case systemShutdown = "SYSTEM_SHUTDOWN"
     case forceKill = "FORCE_KILL"
     case configUpdated = "CONFIG_UPDATED"
     case commandAck = "COMMAND_ACK"
@@ -110,8 +111,8 @@ struct ClientConfig: Codable, Equatable {
     /// 已绑定设备恒为 true：退出验证不是持久化开关，而是家长每次都要在 Dashboard
     /// 实时生成临时验证码（见 verifyExitPassword），这里只用于 UI 展示"是否需要验证退出"。
     var hasExitPassword: Bool = false
-    var heartbeatActiveSeconds: Int = 60
-    var heartbeatIdleSeconds: Int = 900
+    var heartbeatActiveSeconds: Int = 30
+    var heartbeatIdleSeconds: Int = 30
     var idleThresholdSeconds: Int = 180
     var hasPendingCommand: Bool = false
     var webFilter: WebFilterConfiguration = WebFilterConfiguration()
@@ -156,8 +157,8 @@ struct ClientConfig: Codable, Equatable {
         aiEnabled = try container.decodeIfPresent(Bool.self, forKey: .aiEnabled) ?? false
         allowScreenshotAiProcessing = try container.decodeIfPresent(Bool.self, forKey: .allowScreenshotAiProcessing) ?? false
         hasExitPassword = try container.decodeIfPresent(Bool.self, forKey: .hasExitPassword) ?? false
-        heartbeatActiveSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatActiveSeconds) ?? 60
-        heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 900
+        heartbeatActiveSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatActiveSeconds) ?? 30
+        heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 30
         idleThresholdSeconds = try container.decodeIfPresent(Int.self, forKey: .idleThresholdSeconds) ?? 180
         hasPendingCommand = try container.decodeIfPresent(Bool.self, forKey: .hasPendingCommand) ?? false
         webFilter = try container.decodeIfPresent(WebFilterConfiguration.self, forKey: .webFilter) ?? WebFilterConfiguration()
@@ -630,8 +631,8 @@ final class BigDaddyClient: @unchecked Sendable {
         config.screenshotIntervalMins = 5
         config.compressQuality = 0.6
         config.compressMaxWidth = 1280
-        config.heartbeatActiveSeconds = 60
-        config.heartbeatIdleSeconds = 900
+        config.heartbeatActiveSeconds = 30
+        config.heartbeatIdleSeconds = 30
         config.idleThresholdSeconds = 180
         
         ConfigStore.save(config)
@@ -682,6 +683,8 @@ final class BigDaddyClient: @unchecked Sendable {
     ///   心跳上才有意义，其余调用方一律留 nil。见 WebFilterController.extensionSurvivedGap
     ///   的注释——这是内容过滤系统扩展能否证明"本机在那段空窗期里其实一直通电在线"的
     ///   事后取证信号，nil 表示问不出来（不代表"否"）。
+    private let activityInfoCollector = ActivityInfoCollector()
+
     @discardableResult
     func sendHeartbeat(event: EventType, filterExtensionSurvivedGap: Bool? = nil) async -> Bool {
         // 墓碑刷成"此刻仍然在线"。放在函数最前面（第一个 await 之前）是刻意的：正常退出/
@@ -693,16 +696,18 @@ final class BigDaddyClient: @unchecked Sendable {
         guard !credentialsInvalid else { return false }
         let version = AppVersion.current
         let activeApp = Self.currentActiveAppName()
-        // activeWindowInfo 浏览器场景下靠 NSAppleScript 给目标浏览器发 Apple Event 并同步
-        // 等回复，没有超时保护；目标浏览器卡顿/无响应时能一直等下去。这个调用之前直接摆在
-        // sendHeartbeat 开头、第一个 await 之前——而 sendHeartbeat 的调用方全部是
-        // Task { @MainActor in ... } 或主队列的信号处理器，函数体在第一次挂起前跟调用方
-        // 同线程执行，等于每次心跳都可能拿主线程去顶浏览器的 Apple Event 超时，
-        // 表现为整个客户端（含菜单栏图标）间歇性卡住。挪进 Task.detached 让它跑在
-        // 后台线程，主线程不再被这个不受控的阻塞调用拖住。
-        let (windowTitle, activeUrl) = await Task.detached(priority: .utility) { [self] in
-            self.activeWindowInfo()
-        }.value
+        // 固定事件发生时间；慢采集或网络重试不能把旧事件排到后来的锁屏/睡眠之后。
+        let occurredAt = Date()
+        let windowTitle: String
+        let activeUrl: String
+        if event.needsActivityDetails {
+            (windowTitle, activeUrl) = await activityInfoCollector.capture { [self] in
+                self.activeWindowInfo()
+            }
+        } else {
+            // 电源、会话和空闲事件必须能在系统退出/睡眠前发送，不等待浏览器 Apple Event。
+            (windowTitle, activeUrl) = ("", "")
+        }
         // 先取走计数并清零，即便这次心跳发送失败被塞进 PendingQueue 重试，这个区间的
         // 切换次数也已经落进这份 body 里，不会因为重试而重复计数或者丢失。
         let switchCount = switchCounter.takeAndReset()
@@ -712,13 +717,13 @@ final class BigDaddyClient: @unchecked Sendable {
         var body: [String: Any] = [
             "appVersion": version,
             "eventType": event.rawValue,
-            "lastHeartbeatAt": BigDaddyDateFormatter.iso8601.string(from: Date()),
+            "lastHeartbeatAt": BigDaddyDateFormatter.iso8601.string(from: occurredAt),
             "activeAppName": activeApp,
             "activeWindowTitle": windowTitle,
             "activeUrl": activeUrl,
             "switchCount": switchCount,
             "previousCrashAt": reportedCrashAt.map { BigDaddyDateFormatter.iso8601.string(from: $0) } ?? NSNull(),
-            "reportedAt": BigDaddyDateFormatter.iso8601.string(from: Date()),
+            "reportedAt": BigDaddyDateFormatter.iso8601.string(from: occurredAt),
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
                 "accessibilityGranted": AXIsProcessTrustedWithOptions(nil),
@@ -777,7 +782,7 @@ final class BigDaddyClient: @unchecked Sendable {
             body["lastScreenshotAt"] = NSNull()
         }
         do {
-            let data = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
+            let data = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true, timeout: 10)
             if let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<HeartbeatResponse>.self, from: data),
                let pending = response.data.hasPendingCommand {
                 config.hasPendingCommand = pending
@@ -814,7 +819,7 @@ final class BigDaddyClient: @unchecked Sendable {
     }
 
     private var pathMonitor: NWPathMonitor?
-    private var lastPathSatisfied = false
+    private var lastPathSatisfied: Bool?
 
     /// 用 NWPathMonitor 监听网络恢复：一旦从"不可达"变为"可达"，尝试补发积压的心跳。
     ///
@@ -822,14 +827,14 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 不改变 path.status（酒店/学校的强制门户、DNS 黑洞、后端 5xx、被限流），此时 Wi-Fi
     /// 始终是 .satisfied，路径永远不翻转。所以补发还有另外两个触发点：每次实时心跳成功后
     /// （见 sendHeartbeat），以及 60 秒配置轮询的兜底（见 AppDelegate）。
-    func startNetworkMonitoring() {
+    func startNetworkMonitoring(onRecovery: @escaping @Sendable () -> Void) {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
             let satisfied = path.status == .satisfied
-            if satisfied && !self.lastPathSatisfied {
-                Task { await self.startBackfillIfNeeded() }
+            if satisfied && self.lastPathSatisfied == false {
+                onRecovery()
             }
             self.lastPathSatisfied = satisfied
         }
@@ -2508,12 +2513,12 @@ final class BigDaddyClient: @unchecked Sendable {
         _ = try? await request(path: "/bigdaddy/client/commands/\(commandId)/ack", method: "POST", body: body, signed: true)
     }
 
-    private func request(path: String, method: String, body: [String: Any]?, signed: Bool) async throws -> Data {
+    private func request(path: String, method: String, body: [String: Any]?, signed: Bool, timeout: TimeInterval = 60) async throws -> Data {
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
         guard let url = URL(string: baseURL.absoluteString + normalizedPath) else {
             throw URLError(.badURL)
         }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url, timeoutInterval: timeout)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var bodyData = Data()

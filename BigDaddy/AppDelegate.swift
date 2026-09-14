@@ -257,7 +257,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         NSUserNotificationCenter.default.delegate = self
         installSignalHandlers()
         print("BigDaddy: signal handlers installed")
-        client.startNetworkMonitoring()
+        client.startNetworkMonitoring { [weak self] in
+            Task { @MainActor [weak self] in self?.synchronizePresence() }
+        }
         print("BigDaddy: network monitoring started")
         webFilterController.onStateChanged = { [weak self] in
             guard let self else { return }
@@ -337,8 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         print("BigDaddy: timers scheduled")
         Task {
             print("BigDaddy: async task background started")
-            let configRefreshResult = await client.refreshConfig()
-            let configChanged = configRefreshResult.changed
+            async let configRefresh = client.refreshConfig()
             print("BigDaddy: async task background heartbeat sending started")
             // 本次启动永远是 START 事件；如果检测到上次异常终止，通过
             // previousCrashAt 字段"如实补报"，而不是把这次正常启动本身
@@ -358,6 +359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 filterExtensionSurvivedGap = await webFilterController.extensionSurvivedGap(since: crashedAt)
             }
             await client.sendHeartbeat(event: .start, filterExtensionSurvivedGap: filterExtensionSurvivedGap)
+            let configRefreshResult = await configRefresh
+            let configChanged = configRefreshResult.changed
             // 如果配置有变化，额外发送 CONFIG_UPDATED 事件
             if configChanged {
                 await client.sendHeartbeat(event: .configUpdated)
@@ -396,6 +399,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if isSystemShuttingDown { BigDaddyClient.notePlannedRelaunch() }
         // SHUTDOWN 心跳只在 quitWithPassword 里校验通过后同步发送一次；这里不再重复
         // 调用 sendShutdownSync()，否则用户点击"安全退出"时会先在 quitWithPassword
         // 里发一次，随后 NSApp.terminate(nil) 触发本方法时又发一次，导致家长端收到
@@ -1703,6 +1707,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var wasIdle = false
     /// 跟踪系统锁屏状态（com.apple.screenIsLocked ⇄ com.apple.screenIsUnlocked）
     private(set) var isScreenLocked = false
+    private var isSystemSleeping = false
+    // 注销可以被其它 App 取消；短暂保留退出意图，后续心跳仍能恢复真实状态。
+    private var systemShutdownRequestedAt: Date?
+    private var isSystemShuttingDown: Bool {
+        guard let at = systemShutdownRequestedAt else { return false }
+        return Date().timeIntervalSince(at) < 10
+    }
+    private var presenceSyncTask: Task<Void, Never>?
 
     /// 判断当前是否处于锁屏或系统登录/屏保窗口
     var isScreenLockedOrLoginWindow: Bool {
@@ -1726,18 +1738,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private func installPowerAndSessionObservers() {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
 
-        // willSleep 的处理块是**同步**执行的，系统会等它返回（只给几秒）才真正睡下去。
-        // 这正是唯一能在睡眠前把 SLEEP 发出去的窗口，所以这里刻意用同步发送——
-        // 编译器会警告"不能从 Sendable 闭包引用 MainActor 隔离的 client 属性"（queue: nil
-        // 意味着这个闭包可能在任意线程同步执行，不保证是主线程），但这里**不能**用
-        // `Task { @MainActor in ... }` 包一层去满足它：那样这次调用会变成排到下一轮主
-        // 循环才执行的异步任务，闭包本身立即返回、系统立刻继续休眠流程，等于完全废掉
-        // "同步阻塞、确保这条心跳已经发出"这个设计的全部意义。`client` 是一个不涉及
-        // AppDelegate 自身状态、专为跨线程调用设计的普通类实例，这里保留警告、不做处理。
+        // 睡眠前只做限时发送；系统可能在网络请求完成前睡下，失败由补传和存活超时兜底。
         let client = self.client
         workspaceCenter.addObserver(
-            forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
-        ) { [client] _ in
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { [weak self, client] _ in
+            self?.isSystemSleeping = true
+            self?.presenceSyncTask?.cancel()
             AuditLog.record("SYSTEM_WILL_SLEEP")
             client.sendEventSync(event: .sleep, timeout: 2.0)
         }
@@ -1750,8 +1757,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 包一层 Task { @MainActor in } 是本文件里 scheduleNextHeartbeat 等处已经在用
             // 的标准写法，让编译器认可这次调用合法，运行时行为不变（下一轮主循环立即执行）。
             Task { @MainActor [weak self] in
-                self?.handleResumeFromSystemEvent(event: .wake, auditLine: "SYSTEM_DID_WAKE")
+                guard let self else { return }
+                self.isSystemSleeping = false
+                if self.isScreenLockedOrLoginWindow {
+                    self.synchronizePresence()
+                } else {
+                    self.handleResumeFromSystemEvent(event: .wake, auditLine: "SYSTEM_DID_WAKE")
+                }
             }
+        }
+
+        workspaceCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification, object: nil, queue: .main
+        ) { [weak self, client] _ in
+            self?.systemShutdownRequestedAt = Date()
+            self?.presenceSyncTask?.cancel()
+            AuditLog.record("SYSTEM_WILL_POWER_OFF")
+            client.sendEventSync(event: .systemShutdown, timeout: 2.0)
         }
 
         let distributed = DistributedNotificationCenter.default()
@@ -1763,7 +1785,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self.wasIdle = true
             self.stopIdleActivityMonitor()
             AuditLog.record("SCREEN_LOCKED")
-            Task { await self.client.sendHeartbeat(event: .screenLock) }
+            self.scheduleNextHeartbeat()
+            self.synchronizePresence(initialEvent: .screenLock)
         }
 
         distributed.addObserver(
@@ -1782,7 +1805,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 四件事必须一起做，少任何一件都会留下"家长端显示空闲、孩子其实已经在用"的窗口，
     /// 或时间约定倒计时算错：
     /// 1. 重置空闲计时起点——否则 `isIdle` 会把睡眠期间累积的无输入时长算成空闲；
-    /// 2. 把 wasIdle 归位并按活跃节奏重排心跳——否则下一次心跳还排在 15 分钟之后；
+    /// 2. 把 wasIdle 归位并按活跃节奏重排心跳——确保下一次心跳按最新配置执行；
     /// 3. 顺手推一次补发——睡眠期间积压的队列正等着一个触发点，而网络路径可能并未翻转
     ///    （唤醒后 Wi-Fi 自动重连通常会翻转，但有线网络/一直可达的情况不会）；
     /// 4. 重新拉一次配置，用服务端的权威值校正时间约定——TimeSessionAnchor 的
@@ -1793,6 +1816,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     ///    不必单独判断 event 类型来跳过。
     private func handleResumeFromSystemEvent(event: EventType, auditLine: String) {
         handleResume(event: event, auditLine: auditLine, resetActivityFloor: true)
+    }
+
+    /// 网络恢复和唤醒优先报告现在的状态。失败后短重试，每次重新取状态，避免补发旧的唤醒。
+    private func synchronizePresence(initialEvent: EventType? = nil) {
+        guard !isSystemShuttingDown else { return }
+        presenceSyncTask?.cancel()
+        presenceSyncTask = Task { [weak self] in
+            for delay in [0, 2, 5, 10] {
+                do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
+                catch { return }
+                guard let self, !Task.isCancelled, !self.isSystemShuttingDown else { return }
+                let event = delay == 0 ? initialEvent ?? self.currentPresenceEvent : self.currentPresenceEvent
+                if await self.client.sendHeartbeat(event: event) { return }
+                if self.client.credentialsInvalid { return }
+            }
+        }
+    }
+
+    private var currentPresenceEvent: EventType {
+        .currentPresence(isSleeping: isSystemSleeping, isLocked: isScreenLockedOrLoginWindow,
+                         isIdle: client.isIdle)
     }
 
     private func stopIdleActivityMonitor() {
@@ -1833,9 +1877,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         stopIdleActivityMonitor()
         scheduleNextHeartbeat()
         scheduleNextCommandPoll()
+        synchronizePresence(initialEvent: event)
         Task {
-            await client.sendHeartbeat(event: event)
-            await client.startBackfillIfNeeded()
             let intervalBeforeResume = client.config.screenshotIntervalMins
             _ = await client.refreshConfig()
             await MainActor.run { [weak self] in
@@ -1900,9 +1943,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    /// 心跳定时器自我重排：活跃态用 heartbeatActiveSeconds（默认 60s），空闲态改用
-    /// heartbeatIdleSeconds（默认 900s/15 分钟）。此前是固定间隔的 repeating Timer，
-    /// 空闲时只是心跳里的 eventType 换成 IDLE，触发频率从未真正降下来。
+    /// 醒着时持续签到，锁屏/空闲也不能失去存活信号；实际睡眠由系统暂停定时器。
     private func scheduleNextHeartbeat() {
         heartbeatTimer?.invalidate()
         let interval: TimeInterval = wasIdle
@@ -1911,6 +1952,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         heartbeatTimer = scheduleCommonModeTimer(interval: interval, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard !self.isSystemSleeping, !self.isSystemShuttingDown else {
+                    self.scheduleNextHeartbeat()
+                    return
+                }
                 if self.isScreenLockedOrLoginWindow {
                     self.isScreenLocked = true
                     self.wasIdle = true
@@ -1978,6 +2023,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let before = client.config.screenshotEnabled
         // 记录旧的截图间隔，用于判断是否需要在配置变化后重排定时截图计时器
         let intervalBefore = client.config.screenshotIntervalMins
+        let activeHeartbeatBefore = client.config.heartbeatActiveSeconds
+        let idleHeartbeatBefore = client.config.heartbeatIdleSeconds
         // "限网仍在生效、但连不上服务器"这条菜单提示只在跨过阈值那一刻才需要重建菜单——
         // 之后每一次同样失败的轮询都不该白白触发一次 rebuildMenu()，那道门槛本身
         // 已经在 isWebFilterUnreachableWhileRestricting 里做了消抖。
@@ -1996,6 +2043,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             // 永远停在进入该状态的那一次上，"限制仍在生效、连不上服务器"的提示反而在
             // 最该出现的场景里永远到不了阈值。见 noteConfigRefreshSkipped 的注释。
             client.noteConfigRefreshSkipped()
+        }
+        if activeHeartbeatBefore != client.config.heartbeatActiveSeconds
+            || idleHeartbeatBefore != client.config.heartbeatIdleSeconds {
+            scheduleNextHeartbeat()
+            if !isSystemSleeping { synchronizePresence() }
         }
         await reportWebFilterStatus()
         let boundChanged = client.config.bound != boundBefore
@@ -3652,7 +3704,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         for sig in [SIGTERM, SIGINT, SIGHUP] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-            source.setEventHandler {
+            source.setEventHandler { [weak self] in
+                if self?.isSystemShuttingDown == true {
+                    BigDaddyClient.notePlannedRelaunch()
+                    exit(0)
+                }
                 BigDaddyClient.sharedForceKillPing {
                     exit(0)
                 }
