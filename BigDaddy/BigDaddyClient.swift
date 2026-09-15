@@ -112,7 +112,7 @@ struct ClientConfig: Codable, Equatable {
     /// 实时生成临时验证码（见 verifyExitPassword），这里只用于 UI 展示"是否需要验证退出"。
     var hasExitPassword: Bool = false
     var heartbeatActiveSeconds: Int = 30
-    var heartbeatIdleSeconds: Int = 30
+    var heartbeatIdleSeconds: Int = 60
     var idleThresholdSeconds: Int = 180
     var hasPendingCommand: Bool = false
     var webFilter: WebFilterConfiguration = WebFilterConfiguration()
@@ -137,7 +137,7 @@ struct ClientConfig: Codable, Equatable {
     /// 完整邮箱从不下发到这里——看这块屏幕的往往是孩子，而客户端二进制是可以被逆向的。
     /// 客户端把它显示在四处：菜单栏状态行、「关于」窗口、首启的知情披露、以及退出验证码
     /// 弹窗。前三处是给孩子的透明度（数据到底去了谁那里），最后一处同时也是给家长的——
-    /// "我当初用的哪个邮箱注册的"这个问题，孩子那台电脑上恰好有最可靠的答案。
+    /// “我当初用的哪个邮箱注册的”这个问题，孩子那台电脑上恰好有最可靠的答案。
     ///
     /// 未绑定 / 旧后端时为 nil，四处都不显示这一行。
     var boundToEmailMasked: String? = nil
@@ -158,7 +158,7 @@ struct ClientConfig: Codable, Equatable {
         allowScreenshotAiProcessing = try container.decodeIfPresent(Bool.self, forKey: .allowScreenshotAiProcessing) ?? false
         hasExitPassword = try container.decodeIfPresent(Bool.self, forKey: .hasExitPassword) ?? false
         heartbeatActiveSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatActiveSeconds) ?? 30
-        heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 30
+        heartbeatIdleSeconds = try container.decodeIfPresent(Int.self, forKey: .heartbeatIdleSeconds) ?? 60
         idleThresholdSeconds = try container.decodeIfPresent(Int.self, forKey: .idleThresholdSeconds) ?? 180
         hasPendingCommand = try container.decodeIfPresent(Bool.self, forKey: .hasPendingCommand) ?? false
         webFilter = try container.decodeIfPresent(WebFilterConfiguration.self, forKey: .webFilter) ?? WebFilterConfiguration()
@@ -632,7 +632,7 @@ final class BigDaddyClient: @unchecked Sendable {
         config.compressQuality = 0.6
         config.compressMaxWidth = 1280
         config.heartbeatActiveSeconds = 30
-        config.heartbeatIdleSeconds = 30
+        config.heartbeatIdleSeconds = 60
         config.idleThresholdSeconds = 180
         
         ConfigStore.save(config)
@@ -686,7 +686,7 @@ final class BigDaddyClient: @unchecked Sendable {
     private let activityInfoCollector = ActivityInfoCollector()
 
     @discardableResult
-    func sendHeartbeat(event: EventType, filterExtensionSurvivedGap: Bool? = nil) async -> Bool {
+    func sendHeartbeat(event: EventType, filterExtensionSurvivedGap: Bool? = nil, isPing: Bool = false) async -> Bool {
         // 墓碑刷成"此刻仍然在线"。放在函数最前面（第一个 await 之前）是刻意的：正常退出/
         // 强杀路径会在发完这条心跳后退休墓碑，刷新必须发生在退休之前，不能被下面那些
         // 可能很慢的采集调用推到退休之后（真会推过去时由退休标记兜底，见 touchRuntimeLock）。
@@ -700,12 +700,12 @@ final class BigDaddyClient: @unchecked Sendable {
         let occurredAt = Date()
         let windowTitle: String
         let activeUrl: String
-        if event.needsActivityDetails {
+        if !isPing && event.needsActivityDetails {
             (windowTitle, activeUrl) = await activityInfoCollector.capture { [self] in
                 self.activeWindowInfo()
             }
         } else {
-            // 电源、会话和空闲事件必须能在系统退出/睡眠前发送，不等待浏览器 Apple Event。
+            // 电源、会话、空闲以及存活 ping 事件必须能在系统退出/睡眠前发送，不等待浏览器 Apple Event。
             (windowTitle, activeUrl) = ("", "")
         }
         // 先取走计数并清零，即便这次心跳发送失败被塞进 PendingQueue 重试，这个区间的
@@ -724,6 +724,7 @@ final class BigDaddyClient: @unchecked Sendable {
             "switchCount": switchCount,
             "previousCrashAt": reportedCrashAt.map { BigDaddyDateFormatter.iso8601.string(from: $0) } ?? NSNull(),
             "reportedAt": BigDaddyDateFormatter.iso8601.string(from: occurredAt),
+            "ping": isPing,
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
                 "accessibilityGranted": AXIsProcessTrustedWithOptions(nil),

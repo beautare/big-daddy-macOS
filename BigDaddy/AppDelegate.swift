@@ -1960,7 +1960,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     self.isScreenLocked = true
                     self.wasIdle = true
                     self.stopIdleActivityMonitor()
-                    await self.client.sendHeartbeat(event: .screenLock)
+                    // 锁屏持续期间：仅发送轻量 ping 保活（isPing: true），不重复落库 SCREEN_LOCK 流水记录
+                    await self.client.sendHeartbeat(event: .screenLock, isPing: true)
                     self.scheduleNextHeartbeat()
                     return
                 }
