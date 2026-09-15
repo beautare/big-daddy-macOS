@@ -1760,7 +1760,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 guard let self else { return }
                 self.isSystemSleeping = false
                 if self.isScreenLockedOrLoginWindow {
-                    self.synchronizePresence()
+                    // 从睡眠中唤醒但依然处于锁屏界面：发送 ping 保活告知服务端设备已醒来，不重复落库 SCREEN_LOCK
+                    self.synchronizePresence(initialEvent: .screenLock, isPing: true)
                 } else {
                     self.handleResumeFromSystemEvent(event: .wake, auditLine: "SYSTEM_DID_WAKE")
                 }
@@ -1780,22 +1781,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         distributed.addObserver(
             forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.isScreenLocked = true
-            self.wasIdle = true
-            self.stopIdleActivityMonitor()
-            AuditLog.record("SCREEN_LOCKED")
-            self.scheduleNextHeartbeat()
-            self.synchronizePresence(initialEvent: .screenLock)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let alreadyLocked = self.isScreenLocked
+                self.isScreenLocked = true
+                self.wasIdle = true
+                self.stopIdleActivityMonitor()
+                self.scheduleNextHeartbeat()
+                if !alreadyLocked {
+                    AuditLog.record("SCREEN_LOCKED")
+                    self.synchronizePresence(initialEvent: .screenLock, isPing: false)
+                } else {
+                    // 若之前已经是锁定状态（如开盖唤醒时系统冗余广播锁定通知），仅以 ping 保活，不重复上报事件流水
+                    self.synchronizePresence(initialEvent: .screenLock, isPing: true)
+                }
+            }
         }
 
         distributed.addObserver(
             forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.isScreenLocked = false
             Task { @MainActor [weak self] in
-                self?.handleResumeFromSystemEvent(event: .screenUnlock, auditLine: "SCREEN_UNLOCKED")
+                guard let self else { return }
+                self.isScreenLocked = false
+                self.handleResumeFromSystemEvent(event: .screenUnlock, auditLine: "SCREEN_UNLOCKED")
             }
         }
     }
@@ -1819,7 +1828,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     /// 网络恢复和唤醒优先报告现在的状态。失败后短重试，每次重新取状态，避免补发旧的唤醒。
-    private func synchronizePresence(initialEvent: EventType? = nil) {
+    private func synchronizePresence(initialEvent: EventType? = nil, isPing: Bool = false) {
         guard !isSystemShuttingDown else { return }
         presenceSyncTask?.cancel()
         presenceSyncTask = Task { [weak self] in
@@ -1828,7 +1837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 catch { return }
                 guard let self, !Task.isCancelled, !self.isSystemShuttingDown else { return }
                 let event = delay == 0 ? initialEvent ?? self.currentPresenceEvent : self.currentPresenceEvent
-                if await self.client.sendHeartbeat(event: event) { return }
+                if await self.client.sendHeartbeat(event: event, isPing: isPing) { return }
                 if self.client.credentialsInvalid { return }
             }
         }
