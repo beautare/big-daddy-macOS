@@ -646,6 +646,7 @@ final class BigDaddyClient: @unchecked Sendable {
         guard config.bound, !credentialsInvalid else { return }
         var body: [String: Any] = [
             "systemExtensionState": report.systemExtensionState.rawValue,
+            "policySchemaVersion": report.policySchemaVersion,
             "enforcementState": report.enforcementState.rawValue,
             "requestedRevision": report.requestedRevision,
             "appliedRevision": report.appliedRevision,

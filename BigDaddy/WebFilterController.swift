@@ -123,7 +123,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
     /// 必须优先处理"扩展本身有问题"这一类信号，再决定要不要显示这个徽章——否则会在
     /// 防线实际失守的那一刻，图标却说"正在限制"。
     var isRestrictingWebAccess: Bool {
-        isEnforcementIntended && !currentPolicy.blockedDomains.isEmpty
+        isEnforcementIntended && (currentPolicy.mode == .allowSelected || !currentPolicy.blockedDomains.isEmpty)
     }
 
     func statusReport(requestedRevision: Int64) async -> WebFilterStatusReport {
@@ -156,6 +156,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         ) -> WebFilterStatusReport {
             WebFilterStatusReport(
                 systemExtensionState: extensionState,
+                policySchemaVersion: 0,
                 enforcementState: enforcement,
                 requestedRevision: requestedRevision,
                 appliedRevision: 0,
@@ -170,6 +171,20 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         // 跟踪），拿它当门槛会让"没开限制"的设备也走进下面的 .disabled / .unknown 分支，
         // 家长端凭空多出一行红字。
         guard isEnforcementIntended else {
+            if systemExtensionState == .approved, systemFilterEnabled == true,
+               let acknowledgement = await providerConnection.acknowledgement(),
+               acknowledgement.confirms(currentPolicy) {
+                return WebFilterStatusReport(
+                    systemExtensionState: systemExtensionState,
+                    policySchemaVersion: acknowledgement.policySchemaVersion ?? 0,
+                    enforcementState: .passThrough,
+                    requestedRevision: requestedRevision,
+                    appliedRevision: acknowledgement.appliedRevision,
+                    ruleCount: acknowledgement.ruleCount,
+                    lastAppliedAt: acknowledgement.appliedAt,
+                    error: error
+                )
+            }
             return report(systemExtensionState, .passThrough)
         }
 
@@ -197,6 +212,7 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
 
         return WebFilterStatusReport(
             systemExtensionState: systemExtensionState,
+            policySchemaVersion: acknowledgement.policySchemaVersion ?? 0,
             enforcementState: acknowledgement.enforcementEnabled ? .enforcing : .passThrough,
             requestedRevision: requestedRevision,
             appliedRevision: acknowledgement.appliedRevision,
@@ -312,7 +328,9 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
         self.isDeviceBound = isDeviceBound
         currentPolicy = WebFilterPolicySnapshot(
             configuration: configuration,
-            isDeviceBound: isDeviceBound
+            isDeviceBound: isDeviceBound,
+            managementHost: URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")?.host,
+            managementAppIdentifier: Bundle.main.bundleIdentifier
         )
 
         applyDesiredFilterState()

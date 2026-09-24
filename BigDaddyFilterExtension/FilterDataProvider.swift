@@ -3,6 +3,7 @@ import Foundation
 // 已废弃的类），isLikelyQUIC 里两个都要用到，所以那里一律写全限定名。
 import Network
 import NetworkExtension
+import Security
 
 /// 域名级内容过滤。
 ///
@@ -36,9 +37,8 @@ import NetworkExtension
 ///    QUICPacket.looksLikeQUIC，直接读 QUIC 长包头的字节特征，不问系统；isLikelyQUIC
 ///    降级成兜底信号。见 QUICPacket 和 isLikelyQUIC 各自的注释。
 ///
-/// 一条贯穿全文件的原则：**认不出来一律放行**。误拦会毫无征兆地掐断孩子电脑上任意一个
-/// 程序的网络，代价远大于漏拦一次。唯一的例外是生效期间判不出主机名的 UDP 443（QUIC），
-/// 见 handleNewFlow 里的说明。
+/// 黑名单模式认不出主机名时放行；白名单模式保持握手数据不外发，达到上限仍认不出时阻断。
+/// 两种模式都会阻断生效期间无法识别主机名的 QUIC。
 final class FilterDataProvider: NEFilterDataProvider {
 
     /// 一条正在跟踪的连接。放行之后仍然留着，好在策略变严时把它掐断。
@@ -67,8 +67,7 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// 一次向框架要多少出站字节来找 SNI。一个 ClientHello 通常 1~2 KiB（带上后量子
     /// 密钥交换会更大），4 KiB 一次基本能拿全，拿不全就再要一轮。
     private static let handshakePeekBytes = 4096
-    /// 攒到这么多还认不出来就放弃识别，按放行处理。防止一条不是 TLS/HTTP 的长连接
-    /// 让我们无限期地一直要数据。
+    /// 攒到这么多还认不出来就放弃识别：黑名单放行，白名单阻断。
     private static let maxHandshakeBytes = 16 * 1024
     /// 判定放行之后，每放过这么多字节回来打一次招呼。只是为了**保持挂载**（这样日后
     /// 还能掐断它），不做任何检查。取 4 MiB：一个 4K 视频流大概每秒一次回调，开销
@@ -159,7 +158,8 @@ final class FilterDataProvider: NEFilterDataProvider {
         // 快速路径：系统已经知道这条流要去哪儿（Safari、走 NSURLSession 的原生 App）。
         // 不用等握手，也不用解析任何东西。
         if let hostname = systemHostname(for: socketFlow) {
-            if policy.blocks(hostname: hostname) {
+            if policy.blocks(hostname: hostname)
+                && !permitsManagementConnection(socketFlow, hostname: hostname, policy: policy) {
                 return .drop()
             }
             remember(socketFlow, hostname: hostname, awaitingHostname: false)
@@ -190,7 +190,11 @@ final class FilterDataProvider: NEFilterDataProvider {
             // 早就判过了，这次回调只是"保持挂载"的例行招呼
             return passThroughVerdict()
         }
-        tracked.handshake.append(readBytes)
+        if policy.requiresKnownHostname && offset == 0 {
+            tracked.handshake = readBytes
+        } else {
+            tracked.handshake.append(readBytes)
+        }
         let handshake = tracked.handshake
         policyLock.unlock()
 
@@ -220,6 +224,10 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
 
         if handshake.count >= Self.maxHandshakeBytes {
+            if policy.requiresKnownHostname {
+                forget(key)
+                return .drop()
+            }
             // 不是 TLS 也不是 HTTP，认不出来了。放弃识别，但保持挂载——万一它的
             // 主机名以后被系统补上（remoteHostname 可能晚于 handleNewFlow 才有值），
             // reloadPolicy 还有机会重新判定。
@@ -230,20 +238,30 @@ final class FilterDataProvider: NEFilterDataProvider {
             return passThroughVerdict()
         }
 
-        // 再要一轮。这里把已经看过的字节放行而不是扣住（passBytes: 0 的语义在各版本上
-        // 表现不一致，见 Apple 论坛上那些"全部流量被丢弃"的报告）：握手包先到服务器
-        // 没关系，真判成拦截时整条流会被 drop，页面照样打不开。
+        // 白名单要在识别出域名前扣住握手数据；黑名单沿用已经验证过的边读边放行行为。
+        // passBytes: 0 的实际系统表现仍需在签名安装后的 Mac 上验证。
+        if policy.requiresKnownHostname {
+            return NEFilterDataVerdict(passBytes: 0, peekBytes: min(Self.maxHandshakeBytes, handshake.count + Self.handshakePeekBytes))
+        }
         return NEFilterDataVerdict(passBytes: readBytes.count, peekBytes: Self.handshakePeekBytes)
     }
 
     /// 框架看完一个方向的全部数据之后的收尾。必须实现并给一个明确的放行，
     /// 否则处于数据过滤模式的流会卡在这里——表现为"网页转圈转到超时"。
     override func handleOutboundDataComplete(for flow: NEFilterFlow) -> NEFilterDataVerdict {
-        .allow()
+        unresolvedFlowVerdict(for: flow)
     }
 
     override func handleInboundDataComplete(for flow: NEFilterFlow) -> NEFilterDataVerdict {
-        .allow()
+        unresolvedFlowVerdict(for: flow)
+    }
+
+    private func unresolvedFlowVerdict(for flow: NEFilterFlow) -> NEFilterDataVerdict {
+        policyLock.lock()
+        let unresolved = policy.requiresKnownHostname
+            && trackedFlows[ObjectIdentifier(flow)]?.awaitingHostname == true
+        policyLock.unlock()
+        return unresolved ? .drop() : .allow()
     }
 
     override func handle(_ report: NEFilterReport) {
@@ -282,9 +300,13 @@ final class FilterDataProvider: NEFilterDataProvider {
             let quic = tracked.sawQUIC || isLikelyQUIC(tracked.flow)
             if tracked.flow.socketProtocol == IPPROTO_UDP { udpCount += 1 }
             if quic { quicCount += 1 }
+            let isManagementFlow = hostname.map { host in
+                nextPolicy.managementHost.map { DomainName.normalize($0) == DomainName.normalize(host) } ?? false
+            } ?? false
             let shouldDrop = WebFilterFlowDisposition.shouldTerminate(
                 hostname: hostname,
                 isLikelyQUIC: quic,
+                isManagementApp: isManagementFlow && isManagementApp(tracked.flow, policy: nextPolicy),
                 under: nextPolicy
             )
             if shouldDrop {
@@ -321,6 +343,14 @@ final class FilterDataProvider: NEFilterDataProvider {
         let isStillCurrent = policy == nextPolicy
         policyLock.unlock()
         guard isStillCurrent else { return }
+        if let deadline = nextPolicy.temporaryAllowedUntilEpochMillis {
+            let delay = Double(deadline) / 1000 - Date().timeIntervalSince1970
+            if delay > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.reloadPolicy()
+                }
+            }
+        }
         ipcListener?.publish(WebFilterProviderAcknowledgement(
             policy: nextPolicy, providerStartedAt: providerStartedAt))
     }
@@ -334,6 +364,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         policy: WebFilterPolicySnapshot
     ) -> NEFilterDataVerdict {
         let blocked = policy.blocks(hostname: hostname)
+            && !permitsManagementConnection(flow, hostname: hostname, policy: policy)
         policyLock.lock()
         if blocked {
             trackedFlows.removeValue(forKey: key)
@@ -344,6 +375,31 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
         policyLock.unlock()
         return blocked ? .drop() : passThroughVerdict()
+    }
+
+    private func permitsManagementConnection(
+        _ flow: NEFilterSocketFlow, hostname: String, policy: WebFilterPolicySnapshot
+    ) -> Bool {
+        guard let managementHost = policy.managementHost,
+              DomainName.normalize(hostname) == DomainName.normalize(managementHost) else { return false }
+        return policy.permitsManagementConnection(
+            hostname: hostname, isManagementApp: isManagementApp(flow, policy: policy))
+    }
+
+    private func isManagementApp(_ flow: NEFilterSocketFlow, policy: WebFilterPolicySnapshot) -> Bool {
+        guard policy.mode == .allowSelected,
+              let identifier = policy.managementAppIdentifier,
+              let token = flow.sourceAppAuditToken,
+              let teamRequirement = WebFilterIPC.codeSigningRequirement() else { return false }
+        let requirementText = "identifier \"\(identifier)\" and \(teamRequirement)"
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
+              let requirement else { return false }
+        var code: SecCode?
+        let attributes = [kSecGuestAttributeAudit as String: token] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+              let code else { return false }
+        return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
     }
 
     private func remember(_ flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool) {

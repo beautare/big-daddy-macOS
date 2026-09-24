@@ -197,6 +197,53 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertFalse(WebFilterProviderAcknowledgement(policy: appliedPolicy).confirms(currentPolicy))
     }
 
+    func testAllowSelectedDeniesUnknownAndHonorsRulePriority() {
+        let policy = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(
+                enabled: true,
+                revision: 9,
+                blockedDomains: [
+                    WebFilterRule(domain: "bad.example", includeSubdomains: true, category: "ALWAYS_BLOCKED"),
+                    WebFilterRule(domain: "video.example", includeSubdomains: true, category: "ENTERTAINMENT")
+                ],
+                mode: .allowSelected,
+                allowedDomains: [
+                    WebFilterRule(domain: "school.edu", includeSubdomains: true),
+                    WebFilterRule(domain: "bad.example", includeSubdomains: true)
+                ],
+                temporaryAllowedUntilEpochMillis: 2_000_000
+            ),
+            isDeviceBound: true,
+            appliedAt: Date(timeIntervalSince1970: 0)
+        )
+
+        XCTAssertFalse(policy.blocks(hostname: "www.school.edu"))
+        XCTAssertTrue(policy.blocks(hostname: "other.example"))
+        XCTAssertTrue(policy.blocks(hostname: "bad.example"))
+        XCTAssertFalse(policy.blocks(hostname: "video.example", at: Date(timeIntervalSince1970: 1_000)))
+        XCTAssertTrue(policy.blocks(hostname: "video.example", at: Date(timeIntervalSince1970: 3_000)))
+        XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(hostname: nil, isLikelyQUIC: false, under: policy))
+    }
+
+    func testManagementExceptionRequiresMatchingAppAndExactHost() {
+        let policy = WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(enabled: true, mode: .allowSelected),
+            isDeviceBound: true,
+            managementHost: "api.example.com",
+            managementAppIdentifier: "mom.bigdaddy.mac"
+        )
+
+        XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(
+            hostname: "api.example.com", isLikelyQUIC: false,
+            isManagementApp: true, under: policy))
+        XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(
+            hostname: "api.example.com", isLikelyQUIC: false,
+            isManagementApp: false, under: policy))
+        XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(
+            hostname: "evil.api.example.com", isLikelyQUIC: false,
+            isManagementApp: true, under: policy))
+    }
+
     private func makePolicy(
         enabled: Bool,
         rules: [WebFilterRule]

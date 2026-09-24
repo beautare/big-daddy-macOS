@@ -3,21 +3,66 @@ import Foundation
 struct WebFilterRule: Codable, Equatable {
     let domain: String
     let includeSubdomains: Bool
+    let category: String?
+
+    init(domain: String, includeSubdomains: Bool, category: String? = nil) {
+        self.domain = domain
+        self.includeSubdomains = includeSubdomains
+        self.category = category
+    }
+}
+
+enum WebFilterMode: String, Codable {
+    case blockSelected = "BLOCK_SELECTED"
+    case allowSelected = "ALLOW_SELECTED"
 }
 
 struct WebFilterConfiguration: Codable, Equatable {
     var enabled: Bool = false
     var revision: Int64 = 0
     var blockedDomains: [WebFilterRule] = []
+    var mode: WebFilterMode = .blockSelected
+    var allowedDomains: [WebFilterRule] = []
+    var temporaryAllowedUntilEpochMillis: Int64? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled, revision, blockedDomains, mode, allowedDomains, temporaryAllowedUntilEpochMillis
+    }
+
+    init(enabled: Bool = false, revision: Int64 = 0, blockedDomains: [WebFilterRule] = [],
+         mode: WebFilterMode = .blockSelected, allowedDomains: [WebFilterRule] = [],
+         temporaryAllowedUntilEpochMillis: Int64? = nil) {
+        self.enabled = enabled
+        self.revision = revision
+        self.blockedDomains = blockedDomains
+        self.mode = mode
+        self.allowedDomains = allowedDomains
+        self.temporaryAllowedUntilEpochMillis = temporaryAllowedUntilEpochMillis
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        revision = try container.decode(Int64.self, forKey: .revision)
+        blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
+        mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
+        allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
+        temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
+    }
 }
 
 struct WebFilterPolicySnapshot: Codable, Equatable {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     let schemaVersion: Int
     let enabled: Bool
     let revision: Int64
     let blockedDomains: [WebFilterRule]
+    let mode: WebFilterMode
+    let allowedDomains: [WebFilterRule]
+    let temporaryAllowedUntilEpochMillis: Int64?
+    let managementHost: String?
+    let managementAppIdentifier: String?
     let appliedAt: Date
 
     /// blockedDomains 的预归一化索引。**不参与编码，也不参与相等判断**——它完全由
@@ -25,23 +70,35 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     /// 让线上格式凭空多出一份冗余，参与 == 则会让"同样的规则"因为索引内部顺序不同
     /// 而判成不等（那会把 reloadPolicy 末尾的 `policy == nextPolicy` 守卫弄坏）。
     /// 所以 CodingKeys 里没有它，== 也是手写的。
-    private let matcher: DomainMatcher
+    private let alwaysBlockedMatcher: DomainMatcher
+    private let entertainmentMatcher: DomainMatcher
+    private let allowedMatcher: DomainMatcher
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, enabled, revision, blockedDomains, appliedAt
+        case schemaVersion, enabled, revision, blockedDomains, mode, allowedDomains,
+             temporaryAllowedUntilEpochMillis, managementHost, managementAppIdentifier, appliedAt
     }
 
     init(
         configuration: WebFilterConfiguration,
         isDeviceBound: Bool,
+        managementHost: String? = nil,
+        managementAppIdentifier: String? = nil,
         appliedAt: Date = Date()
     ) {
         self.schemaVersion = Self.schemaVersion
         self.enabled = isDeviceBound && configuration.enabled
         self.revision = configuration.revision
         self.blockedDomains = configuration.blockedDomains
+        self.mode = configuration.mode
+        self.allowedDomains = configuration.allowedDomains
+        self.temporaryAllowedUntilEpochMillis = configuration.temporaryAllowedUntilEpochMillis
+        self.managementHost = managementHost
+        self.managementAppIdentifier = managementAppIdentifier
         self.appliedAt = appliedAt
-        self.matcher = DomainMatcher(rules: configuration.blockedDomains)
+        self.alwaysBlockedMatcher = DomainMatcher(rules: configuration.blockedDomains.filter { $0.category != "ENTERTAINMENT" })
+        self.entertainmentMatcher = DomainMatcher(rules: configuration.blockedDomains.filter { $0.category == "ENTERTAINMENT" })
+        self.allowedMatcher = DomainMatcher(rules: configuration.allowedDomains)
     }
 
     init(from decoder: Decoder) throws {
@@ -50,8 +107,15 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         enabled = try container.decode(Bool.self, forKey: .enabled)
         revision = try container.decode(Int64.self, forKey: .revision)
         blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
+        mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
+        allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
+        temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
+        managementHost = try container.decodeIfPresent(String.self, forKey: .managementHost)
+        managementAppIdentifier = try container.decodeIfPresent(String.self, forKey: .managementAppIdentifier)
         appliedAt = try container.decode(Date.self, forKey: .appliedAt)
-        matcher = DomainMatcher(rules: blockedDomains)
+        alwaysBlockedMatcher = DomainMatcher(rules: blockedDomains.filter { $0.category != "ENTERTAINMENT" })
+        entertainmentMatcher = DomainMatcher(rules: blockedDomains.filter { $0.category == "ENTERTAINMENT" })
+        allowedMatcher = DomainMatcher(rules: allowedDomains)
     }
 
     static func == (lhs: WebFilterPolicySnapshot, rhs: WebFilterPolicySnapshot) -> Bool {
@@ -59,12 +123,35 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
             && lhs.enabled == rhs.enabled
             && lhs.revision == rhs.revision
             && lhs.blockedDomains == rhs.blockedDomains
+            && lhs.mode == rhs.mode
+            && lhs.allowedDomains == rhs.allowedDomains
+            && lhs.temporaryAllowedUntilEpochMillis == rhs.temporaryAllowedUntilEpochMillis
+            && lhs.managementHost == rhs.managementHost
+            && lhs.managementAppIdentifier == rhs.managementAppIdentifier
             && lhs.appliedAt == rhs.appliedAt
     }
 
+    var requiresKnownHostname: Bool { enabled && mode == .allowSelected }
+
+    func permitsManagementConnection(hostname: String, isManagementApp: Bool) -> Bool {
+        guard enabled, mode == .allowSelected,
+              let managementHost else { return false }
+        return isManagementApp && DomainName.normalize(hostname) == DomainName.normalize(managementHost)
+    }
+
     func blocks(hostname: String) -> Bool {
+        blocks(hostname: hostname, at: Date())
+    }
+
+    func blocks(hostname: String, at now: Date) -> Bool {
         guard enabled else { return false }
-        return matcher.matches(DomainName.normalize(hostname))
+        let candidate = DomainName.normalize(hostname)
+        if alwaysBlockedMatcher.matches(candidate) { return true }
+        if entertainmentMatcher.matches(candidate) {
+            let temporaryAllowed = temporaryAllowedUntilEpochMillis.map { now.timeIntervalSince1970 * 1000 < Double($0) } ?? false
+            return !temporaryAllowed
+        }
+        return mode == .allowSelected && !allowedMatcher.matches(candidate)
     }
 }
 
@@ -121,15 +208,19 @@ enum WebFilterFlowDisposition {
     static func shouldTerminate(
         hostname: String?,
         isLikelyQUIC: Bool,
+        isManagementApp: Bool = false,
         under policy: WebFilterPolicySnapshot
     ) -> Bool {
         if let hostname {
+            if policy.permitsManagementConnection(hostname: hostname, isManagementApp: isManagementApp) {
+                return false
+            }
             return policy.blocks(hostname: hostname)
         }
         // 判不出主机名的 QUIC。这些流多半是在策略还没启用时放行的（那期间我们不掐 QUIC，
         // 见 FilterDataProvider.handleOutboundData），限制一旦启用就必须一并掐掉，否则
         // 浏览器会一直复用它们绕过限制——正是"新标签也照样能看"的那条通道。
-        return policy.enabled && isLikelyQUIC
+        return policy.requiresKnownHostname || (policy.enabled && isLikelyQUIC)
     }
 }
 
@@ -168,9 +259,13 @@ enum WebFilterPolicyTransport {
 }
 
 struct WebFilterProviderAcknowledgement: Codable, Equatable {
+    let policySchemaVersion: Int?
     let appliedRevision: Int64
     let ruleCount: Int
     let blockedDomains: [WebFilterRule]
+    let mode: WebFilterMode
+    let allowedDomains: [WebFilterRule]
+    let temporaryAllowedUntilEpochMillis: Int64?
     let enforcementEnabled: Bool
     let appliedAt: Date
     /// **provider 进程自身的启动时刻**，与 appliedAt 是两件不同的事，别混用。
@@ -188,9 +283,13 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     let providerStartedAt: Date?
 
     init(policy: WebFilterPolicySnapshot, appliedAt: Date = Date(), providerStartedAt: Date? = nil) {
+        policySchemaVersion = policy.schemaVersion
         appliedRevision = policy.revision
-        ruleCount = policy.blockedDomains.count
+        ruleCount = policy.blockedDomains.count + policy.allowedDomains.count
         blockedDomains = policy.blockedDomains
+        mode = policy.mode
+        allowedDomains = policy.allowedDomains
+        temporaryAllowedUntilEpochMillis = policy.temporaryAllowedUntilEpochMillis
         enforcementEnabled = policy.enabled
         self.appliedAt = appliedAt
         self.providerStartedAt = providerStartedAt
@@ -198,8 +297,11 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
 
     func confirms(_ policy: WebFilterPolicySnapshot) -> Bool {
         appliedRevision == policy.revision
-            && ruleCount == policy.blockedDomains.count
+            && ruleCount == policy.blockedDomains.count + policy.allowedDomains.count
             && blockedDomains == policy.blockedDomains
+            && mode == policy.mode
+            && allowedDomains == policy.allowedDomains
+            && temporaryAllowedUntilEpochMillis == policy.temporaryAllowedUntilEpochMillis
             && enforcementEnabled == policy.enabled
     }
 }
@@ -229,6 +331,7 @@ struct WebFilterStatusReport: Equatable {
     }
 
     let systemExtensionState: SystemExtensionState
+    let policySchemaVersion: Int
     let enforcementState: EnforcementState
     let requestedRevision: Int64
     let appliedRevision: Int64
