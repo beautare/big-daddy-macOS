@@ -51,6 +51,13 @@ struct WebFilterConfiguration: Codable, Equatable {
     }
 }
 
+/// 白名单拦截到的域名只作为家长的候选项：客户端绝不因此自动放行。
+struct WebFilterAccessRequest: Codable, Equatable {
+    let domain: String
+    let lastBlockedAt: Date
+    let count: Int
+}
+
 struct WebFilterPolicySnapshot: Codable, Equatable {
     static let schemaVersion = 2
 
@@ -152,6 +159,17 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
             return !temporaryAllowed
         }
         return mode == .allowSelected && !allowedMatcher.matches(candidate)
+    }
+
+    /// 只有白名单外的普通域名才值得请求家长允许。始终禁止和限时娱乐网站保留各自的规则，
+    /// 不能混进“需要允许”的列表，免得家长一键把安全例外加回白名单。
+    func needsParentApproval(hostname: String) -> Bool {
+        guard enabled, mode == .allowSelected else { return false }
+        let candidate = DomainName.normalize(hostname)
+        if alwaysBlockedMatcher.matches(candidate) || entertainmentMatcher.matches(candidate) {
+            return false
+        }
+        return !allowedMatcher.matches(candidate)
     }
 }
 
@@ -265,7 +283,9 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     let blockedDomains: [WebFilterRule]
     let mode: WebFilterMode
     let allowedDomains: [WebFilterRule]
+    let allowedRuleCount: Int
     let temporaryAllowedUntilEpochMillis: Int64?
+    let accessRequests: [WebFilterAccessRequest]
     let enforcementEnabled: Bool
     let appliedAt: Date
     /// **provider 进程自身的启动时刻**，与 appliedAt 是两件不同的事，别混用。
@@ -282,17 +302,48 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     /// 的回执没有这个字段，解码成 nil ⇒ 调用方按"问不出来"处理，而不是误判成"没存活"。
     let providerStartedAt: Date?
 
-    init(policy: WebFilterPolicySnapshot, appliedAt: Date = Date(), providerStartedAt: Date? = nil) {
+    private enum CodingKeys: String, CodingKey {
+        case policySchemaVersion, appliedRevision, ruleCount, blockedDomains, mode, allowedDomains,
+             allowedRuleCount, temporaryAllowedUntilEpochMillis, accessRequests, enforcementEnabled,
+             appliedAt, providerStartedAt
+    }
+
+    init(
+        policy: WebFilterPolicySnapshot,
+        accessRequests: [WebFilterAccessRequest] = [],
+        appliedAt: Date = Date(),
+        providerStartedAt: Date? = nil
+    ) {
         policySchemaVersion = policy.schemaVersion
         appliedRevision = policy.revision
         ruleCount = policy.blockedDomains.count + policy.allowedDomains.count
         blockedDomains = policy.blockedDomains
         mode = policy.mode
         allowedDomains = policy.allowedDomains
+        allowedRuleCount = policy.allowedDomains.count
         temporaryAllowedUntilEpochMillis = policy.temporaryAllowedUntilEpochMillis
+        self.accessRequests = accessRequests
         enforcementEnabled = policy.enabled
         self.appliedAt = appliedAt
         self.providerStartedAt = providerStartedAt
+    }
+
+    /// 主 App 和系统扩展可能在更新期间短暂错位。旧扩展没有白名单字段时，按既有黑名单
+    /// 语义补齐，保住策略回执；白名单能力仍由 policySchemaVersion=0 让服务端安全地拒绝。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        policySchemaVersion = try container.decodeIfPresent(Int.self, forKey: .policySchemaVersion)
+        appliedRevision = try container.decode(Int64.self, forKey: .appliedRevision)
+        ruleCount = try container.decode(Int.self, forKey: .ruleCount)
+        blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
+        mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
+        allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
+        allowedRuleCount = try container.decodeIfPresent(Int.self, forKey: .allowedRuleCount) ?? allowedDomains.count
+        temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
+        accessRequests = try container.decodeIfPresent([WebFilterAccessRequest].self, forKey: .accessRequests) ?? []
+        enforcementEnabled = try container.decode(Bool.self, forKey: .enforcementEnabled)
+        appliedAt = try container.decode(Date.self, forKey: .appliedAt)
+        providerStartedAt = try container.decodeIfPresent(Date.self, forKey: .providerStartedAt)
     }
 
     func confirms(_ policy: WebFilterPolicySnapshot) -> Bool {
@@ -301,6 +352,7 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
             && blockedDomains == policy.blockedDomains
             && mode == policy.mode
             && allowedDomains == policy.allowedDomains
+            && allowedRuleCount == policy.allowedDomains.count
             && temporaryAllowedUntilEpochMillis == policy.temporaryAllowedUntilEpochMillis
             && enforcementEnabled == policy.enabled
     }
@@ -336,6 +388,8 @@ struct WebFilterStatusReport: Equatable {
     let requestedRevision: Int64
     let appliedRevision: Int64
     let ruleCount: Int
+    let allowedRuleCount: Int
+    let accessRequests: [WebFilterAccessRequest]
     let lastAppliedAt: Date?
     let error: String?
 }

@@ -64,6 +64,13 @@ final class WebFilterIPCTests: XCTestCase {
         // 但值得在这里写死，免得日后有人把它当成 bug 重新查一遍。
         let acknowledgement = WebFilterProviderAcknowledgement(
             policy: policy,
+            accessRequests: [
+                WebFilterAccessRequest(
+                    domain: "docs.school.edu",
+                    lastBlockedAt: Date(timeIntervalSince1970: 1_700_000_100),
+                    count: 2
+                )
+            ],
             appliedAt: Date(timeIntervalSince1970: 1_700_000_123)
         )
 

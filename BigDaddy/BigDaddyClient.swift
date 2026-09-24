@@ -650,7 +650,15 @@ final class BigDaddyClient: @unchecked Sendable {
             "enforcementState": report.enforcementState.rawValue,
             "requestedRevision": report.requestedRevision,
             "appliedRevision": report.appliedRevision,
-            "ruleCount": report.ruleCount
+            "ruleCount": report.ruleCount,
+            "allowedRuleCount": report.allowedRuleCount,
+            "accessRequests": report.accessRequests.map { request in
+                [
+                    "domain": request.domain,
+                    "lastBlockedAt": BigDaddyDateFormatter.iso8601.string(from: request.lastBlockedAt),
+                    "count": request.count,
+                ]
+            }
         ]
         if let lastAppliedAt = report.lastAppliedAt {
             body["lastAppliedAt"] = BigDaddyDateFormatter.iso8601.string(from: lastAppliedAt)

@@ -161,6 +161,8 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                 requestedRevision: requestedRevision,
                 appliedRevision: 0,
                 ruleCount: 0,
+                allowedRuleCount: 0,
+                accessRequests: [],
                 lastAppliedAt: nil,
                 error: error
             )
@@ -181,6 +183,8 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
                     requestedRevision: requestedRevision,
                     appliedRevision: acknowledgement.appliedRevision,
                     ruleCount: acknowledgement.ruleCount,
+                    allowedRuleCount: acknowledgement.allowedRuleCount,
+                    accessRequests: acknowledgement.accessRequests,
                     lastAppliedAt: acknowledgement.appliedAt,
                     error: error
                 )
@@ -217,6 +221,8 @@ final class WebFilterController: NSObject, OSSystemExtensionRequestDelegate {
             requestedRevision: requestedRevision,
             appliedRevision: acknowledgement.appliedRevision,
             ruleCount: acknowledgement.ruleCount,
+            allowedRuleCount: acknowledgement.allowedRuleCount,
+            accessRequests: acknowledgement.accessRequests,
             lastAppliedAt: acknowledgement.appliedAt,
             error: error
         )

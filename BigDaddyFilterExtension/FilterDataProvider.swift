@@ -84,6 +84,8 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// **新**连接——所以宁可淘汰最老的：越老的流越可能其实早就关了，只是回执没到。
     private static let maxTrackedFlows = 2048
     private static let trackedFlowLowWaterMark = 1536
+    /// 白名单请求只保留最近 20 个域名。它们是给家长确认的候选项，不是审计全量日志。
+    private static let maxAccessRequests = 20
 
     /// 本 provider 进程的启动时刻，构造时取一次、此后不变。主 App 靠它回答"这个扩展在那段
     /// 空窗期里有没有重启过"（见 WebFilterController.extensionSurvivedGap）——**不能**用
@@ -101,6 +103,7 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private var policy = FilterDataProvider.emptyPolicy
     private var trackedFlows: [ObjectIdentifier: TrackedFlow] = [:]
+    private var accessRequests: [String: WebFilterAccessRequest] = [:]
     private var nextFlowSequence: UInt64 = 0
     private var configurationObservation: NSKeyValueObservation?
     /// 回执服务端。主 App 靠它知道"provider 到底应用了哪个 revision"，家长端的
@@ -133,6 +136,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         configurationObservation = nil
         policyLock.lock()
         trackedFlows.removeAll()
+        accessRequests.removeAll()
         // 策略一并清回默认值：被叫停之后就不该再留着一份"要拦什么"的记忆。provider 进程
         // 未必随过滤停止而退出，而"停掉再开"之间这台机器可能已经换了家庭（解绑会让后端删掉
         // 设备行、级联重建配置）。下次 startFilter 会走 reloadPolicy 重新读，不依赖这里留下
@@ -160,6 +164,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         if let hostname = systemHostname(for: socketFlow) {
             if policy.blocks(hostname: hostname)
                 && !permitsManagementConnection(socketFlow, hostname: hostname, policy: policy) {
+                recordAccessRequestIfNeeded(hostname)
                 return .drop()
             }
             remember(socketFlow, hostname: hostname, awaitingHostname: false)
@@ -286,6 +291,10 @@ final class FilterDataProvider: NEFilterDataProvider {
         policyLock.lock()
         policy = nextPolicy
         var flowsToDrop: [NEFilterSocketFlow] = []
+        var hostsNeedingApproval: [String] = []
+        if !nextPolicy.requiresKnownHostname {
+            accessRequests.removeAll()
+        }
         // udp / quic 这两个计数是给 isLikelyQUIC 用的体检指标，不是凑热闹：它依赖的远端
         // 端点 API 在新系统上可能拿不到值，而那会静默地让 HTTP/3 完全绕过限制。跟踪表里
         // 明明有 UDP 流、认出来的 QUIC 却是 0，就是那个故障的确诊信号。
@@ -312,6 +321,9 @@ final class FilterDataProvider: NEFilterDataProvider {
             if shouldDrop {
                 flowsToDrop.append(tracked.flow)
                 trackedFlows.removeValue(forKey: key)
+                if let hostname, nextPolicy.needsParentApproval(hostname: hostname) {
+                    hostsNeedingApproval.append(hostname)
+                }
             }
         }
         let trackedCount = trackedFlows.count
@@ -320,6 +332,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         for flow in flowsToDrop {
             update(flow, using: .drop(), for: .any)
         }
+        hostsNeedingApproval.forEach(recordAccessRequestIfNeeded)
 
         // 这一行是这个功能唯一的量尺，别当成噪音删掉——它每一个字段都是拿故障换来的：
         //   · 与家长操作的时间差 ⇒ 系统配置分发到底慢不慢（曾经靠猜，猜错过一次）；
@@ -351,8 +364,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                 }
             }
         }
-        ipcListener?.publish(WebFilterProviderAcknowledgement(
-            policy: nextPolicy, providerStartedAt: providerStartedAt))
+        publishAcknowledgement(for: nextPolicy)
     }
 
     // MARK: - 判定与记账
@@ -365,6 +377,9 @@ final class FilterDataProvider: NEFilterDataProvider {
     ) -> NEFilterDataVerdict {
         let blocked = policy.blocks(hostname: hostname)
             && !permitsManagementConnection(flow, hostname: hostname, policy: policy)
+        if blocked {
+            recordAccessRequestIfNeeded(hostname)
+        }
         policyLock.lock()
         if blocked {
             trackedFlows.removeValue(forKey: key)
@@ -375,6 +390,62 @@ final class FilterDataProvider: NEFilterDataProvider {
         }
         policyLock.unlock()
         return blocked ? .drop() : passThroughVerdict()
+    }
+
+    private func recordAccessRequestIfNeeded(_ hostname: String) {
+        let normalized = DomainName.normalize(hostname)
+        guard !normalized.isEmpty else { return }
+
+        policyLock.lock()
+        guard policy.needsParentApproval(hostname: normalized) else {
+            policyLock.unlock()
+            return
+        }
+        let now = Date()
+        if let existing = accessRequests[normalized] {
+            accessRequests[normalized] = WebFilterAccessRequest(
+                domain: normalized,
+                lastBlockedAt: now,
+                count: existing.count + 1
+            )
+        } else {
+            accessRequests[normalized] = WebFilterAccessRequest(
+                domain: normalized,
+                lastBlockedAt: now,
+                count: 1
+            )
+        }
+        if accessRequests.count > Self.maxAccessRequests,
+           let oldest = accessRequests.min(by: { $0.value.lastBlockedAt < $1.value.lastBlockedAt })?.key {
+            accessRequests.removeValue(forKey: oldest)
+        }
+        let currentPolicy = policy
+        let currentRequests = sortedAccessRequests()
+        policyLock.unlock()
+        ipcListener?.publish(WebFilterProviderAcknowledgement(
+            policy: currentPolicy,
+            accessRequests: currentRequests,
+            providerStartedAt: providerStartedAt
+        ))
+    }
+
+    private func sortedAccessRequests() -> [WebFilterAccessRequest] {
+        accessRequests.values.sorted { lhs, rhs in
+            lhs.lastBlockedAt == rhs.lastBlockedAt
+                ? lhs.domain < rhs.domain
+                : lhs.lastBlockedAt > rhs.lastBlockedAt
+        }
+    }
+
+    private func publishAcknowledgement(for policy: WebFilterPolicySnapshot) {
+        policyLock.lock()
+        let accessRequests = sortedAccessRequests()
+        policyLock.unlock()
+        ipcListener?.publish(WebFilterProviderAcknowledgement(
+            policy: policy,
+            accessRequests: accessRequests,
+            providerStartedAt: providerStartedAt
+        ))
     }
 
     private func permitsManagementConnection(

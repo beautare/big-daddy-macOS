@@ -223,6 +223,10 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertFalse(policy.blocks(hostname: "video.example", at: Date(timeIntervalSince1970: 1_000)))
         XCTAssertTrue(policy.blocks(hostname: "video.example", at: Date(timeIntervalSince1970: 3_000)))
         XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(hostname: nil, isLikelyQUIC: false, under: policy))
+        XCTAssertTrue(policy.needsParentApproval(hostname: "other.example"))
+        XCTAssertFalse(policy.needsParentApproval(hostname: "www.school.edu"))
+        XCTAssertFalse(policy.needsParentApproval(hostname: "bad.example"))
+        XCTAssertFalse(policy.needsParentApproval(hostname: "video.example"))
     }
 
     func testManagementExceptionRequiresMatchingAppAndExactHost() {
