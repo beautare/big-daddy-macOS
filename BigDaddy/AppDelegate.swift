@@ -233,10 +233,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     // 更新只会悄悄下载、等 App 下次退出时静默装上，用户全程无感。真正会被回调的是
     // SPUUpdaterDelegate 的 updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)。
     //
-    // userDriverDelegate 留 nil：用户手动点"检查更新…"照常走 Sparkle 的标准界面。
-    private lazy var updaterController = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil
-    )
+    // 仅替换升级确认界面，检查、下载和安装进度仍使用 Sparkle 标准界面。
+    private lazy var updateUserDriver = UpdateUserDriver(hostBundle: .main, delegate: nil)
+    private lazy var updaterController: SPUUpdater = {
+        let updater = SPUUpdater(hostBundle: .main, applicationBundle: .main,
+                                 userDriver: updateUserDriver, delegate: self)
+        do {
+            try updater.start()
+        } catch {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = Localization.string(zh: "无法检查更新", en: "Unable to Check For Updates")
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+            }
+        }
+        return updater
+    }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("BigDaddy: applicationDidFinishLaunching started")
@@ -693,13 +706,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 是唯一常驻可见的信号，跟"关于"窗口里那个高亮按钮是同一件事的两个入口。
         // 点击 = 明确的"现在就装"，跳过等空闲这一步。
         if let version = pendingUpdateVersion {
-            menu.addItem(NSMenuItem(
-                title: Localization.string(
-                    zh: "⬆️ 新版本 \(version) 待安装 · 点此立即安装",
-                    en: "⬆️ Update \(version) ready · Click to install now"
-                ),
-                action: #selector(installPendingUpdate), keyEquivalent: ""
-            ))
+            let currentVersion = AppVersion.current
+            let plainTitle = Localization.string(
+                zh: "⬆️ 升级版本：\(currentVersion) → \(version) · 立即安装",
+                en: "⬆️ Update: \(currentVersion) → \(version) · Install Now"
+            )
+            let updateItem = NSMenuItem(
+                title: plainTitle,
+                action: #selector(installPendingUpdate),
+                keyEquivalent: ""
+            )
+            updateItem.attributedTitle = Self.makeMenuUpdateAttributedTitle(
+                currentVersion: currentVersion,
+                newVersion: version
+            )
+            menu.addItem(updateItem)
             menu.addItem(.separator())
         }
 
@@ -793,9 +814,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 自己的窗口后，LOGO/标题/信息行/按钮全部在同一个 NSStackView 里从上到下排列，
     /// 没有任何隐藏的保留区域，居中和间距完全由 createAboutContentView 决定。
     @objc private func showAboutWindow() {
-        aboutWindow?.close()
+        rebuildAboutWindow(show: true)
+    }
 
-        var actions: [(title: String, handler: () -> Void, prominent: Bool)] = []
+    private func rebuildAboutWindow(show: Bool) {
+        if show { aboutWindow?.close() }
+
+        var actions: [(title: String, handler: () -> Void, prominent: Bool, attributedTitle: NSAttributedString?)] = []
+        func addAction(
+            _ title: String,
+            _ handler: @escaping () -> Void,
+            _ prominent: Bool = false,
+            _ attributedTitle: NSAttributedString? = nil
+        ) {
+            actions.append((title, handler, prominent, attributedTitle))
+        }
+
         // 家长已远程开启截图，但本机系统的屏幕录制权限还没给——配置了但实际不生效，
         // 跟菜单栏图标的 ⚠️ 提示是同一个判断条件。
         //
@@ -820,29 +854,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             let screenshotOn = client.config.screenshotEnabled
             if awaitingScreenRecordingGrant {
                 // 第 2 步：家长刚从系统设置回来。重启是此刻唯一该做的事，给蓝底主按钮。
-                actions.append((
+                addAction(
                     Localization.string(zh: "✅ 我已授权，立即重启生效", en: "✅ I've Granted It — Restart Now"),
                     promptRestartForScreenRecording,
                     true
-                ))
+                )
                 // 兜底：万一家长其实没在设置里打开开关（找错地方 / 找不到 BigDaddy 那一项），
                 // 给一条低调的回头路，而不是让他卡在一个只能重启的死胡同里。
-                actions.append((
+                addAction(
                     Localization.string(zh: "还没授权？再去一次设置", en: "Not Yet? Open Settings Again"),
                     openScreenRecordingSettings,
                     false
-                ))
+                )
             } else {
                 // 第 1 步：还没去过设置。此刻唯一该做的事就是去开开关。
                 // 截图没开时降级成非主按钮、措辞也不报警——那时确实什么都没坏。
-                actions.append((
+                addAction(
                     screenshotOn
                         ? Localization.string(zh: "⚠️ 前往系统设置授权", en: "⚠️ Open System Settings")
                         : Localization.string(zh: "补上屏幕录制权限（截图当前未开启）",
                                               en: "Grant Screen Recording (screenshots are off)"),
                     openScreenRecordingSettings,
                     screenshotOn
-                ))
+                )
             }
         }
         // 网站访问限制没生效：与菜单里那条同一个判据。这个窗口是本 App 事实上的权限
@@ -850,40 +884,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 扩展没有——它的唯一入口是菜单里一条只在"待批准"期间出现的瞬态菜单项，
         // 状态一变成"失败"或"被人关掉"，家长就再也找不到任何可点的东西。
         if let webFilterTitle = webFilterMenuTitle(for: webFilterAttention) {
-            actions.append((webFilterTitle, openWebFilterAuthorization, false))
+            addAction(webFilterTitle, openWebFilterAuthorization, false)
         }
         // 辅助功能缺失：与菜单里那条同一个判据（见 rebuildMenu 里的注释）。放在最前面，
         // 因为它比下面两条影响更大——没有它，连窗口标题这种最基本的记录都是空的。
         if client.config.bound && !AXIsProcessTrustedWithOptions(nil) {
-            actions.append((
+            addAction(
                 Localization.string(zh: "⚠️ 允许电脑监测软件使用（开启系统权限）", en: "⚠️ Allow App Usage Monitoring (System Permission)"),
                 promptAccessibilityPermission,
                 false
-            ))
+            )
         }
         // 浏览器自动化权限缺失：家长端会看到"有标题、没链接"的日志。只要设备已绑定、
         // 且实际撞到过被拒的浏览器就该出现（未绑定时没有任何上报，提示也就没有意义）。
         // 判据与 rebuildMenu 里那条完全一致——只认真的被拒的，不替"装了但从没打开过"的
         // 浏览器主动摆按钮（原因见 rebuildMenu 里那段注释）。
         if client.config.bound && !automationDeniedBundleIDs.isEmpty {
-            actions.append((
+            addAction(
                 Localization.string(zh: "⚠️ 允许记录访问网址（网页管理权限）",
                                     en: "⚠️ Allow Recording Web Addresses (Web Management Permission)"),
                 promptAutomationPermission,
                 false
-            ))
+            )
             // 并排给出重置入口：上面那颗按钮走的是"重新询问系统"，而系统一旦记下过
             // "不允许"就不会再问，那条路会静默地什么都不发生。这颗是唯一能把状态清回
             // "没问过"的出口，不该只藏在走投无路时才弹出的那个对话框里。
-            actions.append((
+            addAction(
                 Localization.string(zh: "重置浏览器网址授权", en: "Reset Browser URL Access"),
                 resetAutomationPermissionsWithConfirmation,
                 false
-            ))
+            )
         }
         // 注：“测试截图”按钮不再放在这里，而是挪到了“下次截屏”信息行的右侧
         // （见 createAboutContentView 的 .nextScreenshot 分支）。
-        actions.append((Localization.string(zh: "家庭守护与隐私说明", en: "Family Protection & Privacy Info"), showTransparencyInfo, false))
+        addAction(Localization.string(zh: "家庭守护与隐私说明", en: "Family Protection & Privacy Info"), showTransparencyInfo, false)
         // 注：导出记录（“看看它都记了什么”）不再单独占一个按钮——“守护说明”弹窗里
         // 已有同样的导出入口，避免重复。
         // 后台静默下载好的更新已就绪：紧挨着"检查更新…"多冒出一个高亮按钮（蓝底白字）。
@@ -892,27 +926,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 安装本身是不打扰的（等空闲了自己装，全程无弹窗），这个按钮是给不想等的人
         // 提前触发用的——点击就是"现在就装"的明确信号，跳过等空闲那一步。
         if let version = pendingUpdateVersion {
-            actions.append((
-                Localization.string(zh: "安装新版本 \(version) 并重启", en: "Install \(version) & Restart"),
-                installPendingUpdate,
-                true
-            ))
+            let currentVersion = AppVersion.current
+            let plainTitle = Localization.string(
+                zh: "升级至 \(version) 并重启（当前 \(currentVersion)）",
+                en: "Upgrade to \(version) & Restart (Current \(currentVersion))"
+            )
+            let attrTitle = Self.makeInstallButtonAttributedTitle(
+                currentVersion: currentVersion,
+                newVersion: version
+            )
+            addAction(plainTitle, installPendingUpdate, true, attrTitle)
         }
-        actions.append((Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates, false))
-        actions.append((Localization.string(zh: "关闭", en: "Close"), {}, false))
+        addAction(Localization.string(zh: "检查更新…", en: "Check for Updates…"), checkForUpdates, false)
+        addAction(Localization.string(zh: "关闭", en: "Close"), {}, false)
         aboutWindowActions = actions.map { $0.handler }
 
         let contentView = createAboutContentView(actions: actions)
-        let window = NSWindow(
+        let window = show ? NSWindow(
             contentRect: NSRect(origin: .zero, size: contentView.frame.size),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
-        )
+        ) : aboutWindow!
         window.title = "BigDaddy"
         window.isReleasedWhenClosed = false
         window.contentView = contentView
-        window.center()
+        window.setContentSize(contentView.frame.size)
+        if show { window.center() }
         window.delegate = self // windowWillClose 里停掉倒计时定时器，见下
         aboutWindow = window
 
@@ -920,8 +960,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 该行（截图已开启）时才非空，为空则 tick 里什么都不做。
         startAboutCountdownTimerIfNeeded()
 
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        if show {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+        }
     }
 
     /// NSWindowDelegate：关闭"关于"窗口时停掉每秒倒计时定时器并清掉字段引用，避免定时器
@@ -1016,7 +1058,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 顶部 LOGO/标题靠 alignment = .centerX 在整个宽度内水平居中，信息行/按钮撑满宽度、
     /// label:value 两栏纵向对齐。信息行只在对应信息"当下有意义"时才出现——截图未开启
     /// 就不提截屏间隔，没配置通知渠道就不提通知渠道，而不是展示一个此刻无意义的占位值。
-    private func createAboutContentView(actions: [(title: String, handler: () -> Void, prominent: Bool)]) -> NSView {
+    private func createAboutContentView(actions: [(title: String, handler: () -> Void, prominent: Bool, attributedTitle: NSAttributedString?)]) -> NSView {
         let width: CGFloat = Localization.isChinese ? 300 : 340
         let labelWidth: CGFloat = Localization.isChinese ? 76 : 132
         let rowHeight: CGFloat = 20
@@ -1053,6 +1095,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             switch row {
             case let .text(label, value):
                 container.addArrangedSubview(makeInfoRow(label: label, value: value, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
+            case let .attributedText(label, attributedValue):
+                container.addArrangedSubview(makeAttributedInfoRow(label: label, attributedValue: attributedValue, width: width, labelWidth: labelWidth, rowHeight: rowHeight))
             case let .nextScreenshot(initialValue):
                 container.addArrangedSubview(makeNextScreenshotRow(initialValue: initialValue, width: width, labelWidth: labelWidth))
             case let .timeSession(initialValue):
@@ -1074,13 +1118,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // 对比度不足），这里显式给白色 attributedTitle 配 systemBlue 底色，且不
                 // 随系统强调色变化（controlAccentColor 可能被用户改成浅色导致看不清）。
                 button.bezelColor = .systemBlue
-                button.attributedTitle = NSAttributedString(
-                    string: action.title,
-                    attributes: [
-                        .foregroundColor: NSColor.white,
-                        .font: button.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
-                    ]
-                )
+                if let customAttr = action.attributedTitle {
+                    button.attributedTitle = customAttr
+                } else {
+                    button.attributedTitle = NSAttributedString(
+                        string: action.title,
+                        attributes: [
+                            .foregroundColor: NSColor.white,
+                            .font: button.font ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+                        ]
+                    )
+                }
+            } else if let customAttr = action.attributedTitle {
+                button.attributedTitle = customAttr
             }
             container.addArrangedSubview(button)
         }
@@ -1103,6 +1153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 行内"测试截图"按钮），后者由 createAboutContentView 单独渲染。
     private enum AboutInfoRow {
         case text(label: String, value: String)
+        case attributedText(label: String, attributedValue: NSAttributedString)
         case nextScreenshot(initialValue: String)
         case timeSession(initialValue: String)
     }
@@ -1169,7 +1220,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             rows.append(.text(label: Localization.string(zh: "状态", en: "Status"),
                               value: Localization.string(zh: "尚未绑定家长账号", en: "Unbound")))
         }
-        rows.append(.text(label: Localization.string(zh: "版本", en: "Version"), value: AppVersion.current))
+        let versionLabel = Localization.string(zh: "版本", en: "Version")
+        if let version = pendingUpdateVersion {
+            let attr = Self.makeVersionTransitionAttributedString(currentVersion: AppVersion.current, newVersion: version)
+            rows.append(.attributedText(label: versionLabel, attributedValue: attr))
+        } else {
+            rows.append(.text(label: versionLabel, value: AppVersion.current))
+        }
         return rows
     }
 
@@ -1201,6 +1258,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         row.addArrangedSubview(labelField)
         row.addArrangedSubview(valueField)
         return row
+    }
+
+    /// 单条 label:attributedValue 信息行：value 支持自定义富文本（如粗体高亮新版本号）。
+    private func makeAttributedInfoRow(label: String, attributedValue: NSAttributedString, width: CGFloat, labelWidth: CGFloat, rowHeight: CGFloat) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: width).isActive = true
+        row.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
+
+        let labelField = NSTextField(labelWithString: label)
+        labelField.font = NSFont.systemFont(ofSize: 12)
+        labelField.textColor = .secondaryLabelColor
+        labelField.alignment = .right
+        labelField.translatesAutoresizingMaskIntoConstraints = false
+        labelField.widthAnchor.constraint(equalToConstant: labelWidth).isActive = true
+
+        let valueField = NSTextField(labelWithAttributedString: attributedValue)
+        valueField.alignment = .left
+        valueField.lineBreakMode = .byTruncatingTail
+        valueField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        row.addArrangedSubview(labelField)
+        row.addArrangedSubview(valueField)
+        return row
+    }
+
+    /// 构造“关于”窗口版本信息行的富文本：从当前版本升级至新版本（粗体高亮），并带就绪标记。
+    nonisolated static func makeVersionTransitionAttributedString(currentVersion: String, newVersion: String, ready: Bool = true) -> NSAttributedString {
+        let attr = NSMutableAttributedString()
+        let regularFont = NSFont.systemFont(ofSize: 12)
+        let boldFont = NSFont.boldSystemFont(ofSize: 12)
+
+        attr.append(NSAttributedString(
+            string: "\(currentVersion) → ",
+            attributes: [
+                .font: regularFont,
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        ))
+        attr.append(NSAttributedString(
+            string: newVersion,
+            attributes: [
+                .font: boldFont,
+                .foregroundColor: NSColor.labelColor
+            ]
+        ))
+        let statusTag = ready ? Localization.string(zh: " （待安装）", en: " (Ready)") : ""
+        attr.append(NSAttributedString(
+            string: statusTag,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.systemGreen
+            ]
+        ))
+        return attr
+    }
+
+    /// 构造菜单栏待安装更新项的富文本标题：升级版本（当前版本 → 新版本），新版本粗体凸显。
+    nonisolated static func makeMenuUpdateAttributedTitle(currentVersion: String, newVersion: String) -> NSAttributedString {
+        let baseFont = NSFont.menuFont(ofSize: 0)
+        let boldFont = NSFont.boldSystemFont(ofSize: baseFont.pointSize)
+        let prefix = Localization.string(
+            zh: "⬆️ 升级版本：\(currentVersion) → ",
+            en: "⬆️ Update: \(currentVersion) → "
+        )
+        let suffix = Localization.string(
+            zh: " · 立即安装",
+            en: " · Install Now"
+        )
+        let result = NSMutableAttributedString()
+        result.append(NSAttributedString(
+            string: prefix,
+            attributes: [.font: baseFont]
+        ))
+        result.append(NSAttributedString(
+            string: newVersion,
+            attributes: [.font: boldFont]
+        ))
+        result.append(NSAttributedString(
+            string: suffix,
+            attributes: [.font: baseFont]
+        ))
+        return result
+    }
+
+    /// 构造“关于”窗口升级按钮的富文本标题：蓝底白字，升级目标版本粗体凸显。
+    nonisolated static func makeInstallButtonAttributedTitle(currentVersion: String, newVersion: String) -> NSAttributedString {
+        let fontSize = NSFont.systemFontSize
+        let regularFont = NSFont.systemFont(ofSize: fontSize)
+        let boldFont = NSFont.boldSystemFont(ofSize: fontSize)
+        let prefix = Localization.string(
+            zh: "升级至 ",
+            en: "Upgrade to "
+        )
+        let suffix = Localization.string(
+            zh: " 并重启（当前 \(currentVersion)）",
+            en: " & Restart (Current \(currentVersion))"
+        )
+        let result = NSMutableAttributedString()
+        result.append(NSAttributedString(
+            string: prefix,
+            attributes: [.foregroundColor: NSColor.white, .font: regularFont]
+        ))
+        result.append(NSAttributedString(
+            string: newVersion,
+            attributes: [.foregroundColor: NSColor.white, .font: boldFont]
+        ))
+        result.append(NSAttributedString(
+            string: suffix,
+            attributes: [.foregroundColor: NSColor.white, .font: regularFont]
+        ))
+        return result
     }
 
     /// "下次截屏"行：与普通信息行同样是 label 右对齐 + value 左对齐，但 value 会被
@@ -2731,7 +2903,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     @objc private func checkForUpdates() {
-        updaterController.checkForUpdates(nil)
+        updaterController.checkForUpdates()
     }
 
     // MARK: - SPUUpdaterDelegate（feed 主备切换）
@@ -2847,6 +3019,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         updateInstallAttempts = 0
         AuditLog.record("UPDATE_DOWNLOADED version=\(version)")
         rebuildMenu()
+        if let window = aboutWindow, window.isVisible {
+            rebuildAboutWindow(show: false)
+        }
         scheduleIdleInstallCheck()
     }
 
