@@ -112,8 +112,8 @@ final class HandshakeHostnameTests: XCTestCase {
         let blocked = TLSFixture.clientHello(serverName: "www.youtube.com")
         let allowed = TLSFixture.clientHello(serverName: "www.khanacademy.org")
 
-        XCTAssertTrue(HandshakeHostname.host(in: blocked).map(policy.blocks(hostname:)) == true)
-        XCTAssertTrue(HandshakeHostname.host(in: allowed).map(policy.blocks(hostname:)) == false)
+        XCTAssertTrue(HandshakeHostname.host(in: blocked).map { policy.blocks(hostname: $0) } == true)
+        XCTAssertTrue(HandshakeHostname.host(in: allowed).map { policy.blocks(hostname: $0) } == false)
     }
 }
 

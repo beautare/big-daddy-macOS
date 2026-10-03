@@ -248,6 +248,124 @@ final class WebFilterPolicyTests: XCTestCase {
             isManagementApp: true, under: policy))
     }
 
+    // MARK: - 软件联网规则（app_network_rules_spec.md §2.4 / §7.1）
+
+    private let steam = AppIdentity(signingIdentifier: "com.valvesoftware.steam", teamIdentifier: "MXGJJ98X76", isPlatformBinary: false)
+    private let steamHelper = AppIdentity(signingIdentifier: "com.valvesoftware.steam.helper", teamIdentifier: "MXGJJ98X76", isPlatformBinary: false)
+    private let meeting = AppIdentity(signingIdentifier: "com.tencent.meeting", teamIdentifier: "88L2Q4487U", isPlatformBinary: false)
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func testNeverAppIsDroppedEvenWithoutHostnameAndCoversHelpers() {
+        let policy = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .never)])
+
+        XCTAssertEqual(policy.appVerdict(for: steam, at: now), .block)
+        XCTAssertEqual(policy.appVerdict(for: steamHelper, at: now), .block)
+        XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(
+            hostname: nil, isLikelyQUIC: false, identity: steam, under: policy, at: now))
+        XCTAssertTrue(policy.blocks(hostname: "store.steampowered.com", identity: steam, at: now))
+        XCTAssertFalse(policy.blocks(hostname: "store.steampowered.com", identity: meeting, at: now))
+    }
+
+    func testPrefixMatchStopsAtIdentifierBoundaryAndRequiresSameTeam() {
+        let policy = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .never)])
+
+        let lookalike = AppIdentity(signingIdentifier: "com.valvesoftware.steamfoo", teamIdentifier: "MXGJJ98X76", isPlatformBinary: false)
+        let impostor = AppIdentity(signingIdentifier: "com.valvesoftware.steam", teamIdentifier: nil, isPlatformBinary: false)
+        XCTAssertEqual(policy.appVerdict(for: lookalike, at: now), AppNetworkVerdict.none)
+        XCTAssertEqual(policy.appVerdict(for: impostor, at: now), AppNetworkVerdict.none)
+    }
+
+    func testAgreementAppOnlyGoesOnlineDuringAgreement() {
+        let during = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .agreement)],
+                                   temporaryAllowedUntil: now.addingTimeInterval(600))
+        let outside = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .agreement)],
+                                    temporaryAllowedUntil: now.addingTimeInterval(-1))
+
+        XCTAssertEqual(during.appVerdict(for: steam, at: now), .bypass)
+        XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(
+            hostname: nil, isLikelyQUIC: true, identity: steam, under: during, at: now))
+        XCTAssertEqual(outside.appVerdict(for: steam, at: now), .block)
+        XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(
+            hostname: nil, isLikelyQUIC: false, identity: steam, under: outside, at: now))
+    }
+
+    func testAlwaysAppBypassesAllowlistButNotNeverSites() {
+        let policy = makeAppPolicy(
+            mode: .allowSelected,
+            blocked: [WebFilterRule(domain: "bad.com", includeSubdomains: true, category: "ALWAYS_BLOCKED")],
+            allowed: [WebFilterRule(domain: "school.edu", includeSubdomains: true)],
+            apps: [appRule("com.tencent.meeting", "88L2Q4487U", .always)])
+
+        XCTAssertFalse(policy.blocks(hostname: "meeting.tencent.com", identity: meeting, at: now))
+        XCTAssertTrue(policy.blocks(hostname: "meeting.tencent.com", identity: steam, at: now))
+        XCTAssertTrue(policy.blocks(hostname: "bad.com", identity: meeting, at: now))
+        XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(
+            hostname: nil, isLikelyQUIC: false, identity: meeting, under: policy, at: now))
+        XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(
+            hostname: nil, isLikelyQUIC: false, identity: steam, under: policy, at: now))
+    }
+
+    func testAgreementSiteStaysBlockedForAlwaysAppOutsideAgreement() {
+        let policy = makeAppPolicy(
+            blocked: [WebFilterRule(domain: "bilibili.com", includeSubdomains: true, category: "ENTERTAINMENT")],
+            apps: [appRule("com.tencent.meeting", "88L2Q4487U", .always)])
+
+        XCTAssertTrue(policy.blocks(hostname: "www.bilibili.com", identity: meeting, at: now))
+    }
+
+    func testPlatformBinariesAndBigDaddyAreNeverRuledAndDisabledPolicyIgnoresApps() {
+        let policy = makeAppPolicy(apps: [
+            appRule("com.apple.Safari", nil, .never),
+            appRule("vip.bigdaddy.monitor", "MXGJJ98X76", .never),
+        ])
+        let safari = AppIdentity(signingIdentifier: "com.apple.Safari", teamIdentifier: nil, isPlatformBinary: true)
+        let bigDaddy = AppIdentity(signingIdentifier: "vip.bigdaddy.monitor", teamIdentifier: "MXGJJ98X76", isPlatformBinary: false)
+        XCTAssertEqual(policy.appVerdict(for: safari, at: now), AppNetworkVerdict.none)
+        XCTAssertEqual(policy.appVerdict(for: bigDaddy, at: now), AppNetworkVerdict.none)
+
+        let disabled = makeAppPolicy(enabled: false, apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .never)])
+        XCTAssertEqual(disabled.appVerdict(for: steam, at: now), AppNetworkVerdict.none)
+    }
+
+    func testAppRulesRoundTripAndAreConfirmedByAcknowledgement() throws {
+        let policy = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .never)])
+        let decoded = WebFilterPolicyTransport.policy(from: try WebFilterPolicyTransport.vendorConfiguration(for: policy))
+        XCTAssertEqual(decoded, policy)
+        XCTAssertEqual(decoded?.schemaVersion, 3)
+
+        let acknowledgement = WebFilterProviderAcknowledgement(policy: policy)
+        XCTAssertTrue(acknowledgement.confirms(policy))
+        let changed = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .agreement)])
+        XCTAssertFalse(acknowledgement.confirms(changed))
+    }
+
+    private func appRule(_ identifier: String, _ team: String?, _ access: AppNetworkAccess) -> AppNetworkRule {
+        AppNetworkRule(signingIdentifier: identifier, teamIdentifier: team, displayName: identifier, access: access)
+    }
+
+    private func makeAppPolicy(
+        enabled: Bool = true,
+        mode: WebFilterMode = .blockSelected,
+        blocked: [WebFilterRule] = [],
+        allowed: [WebFilterRule] = [],
+        apps: [AppNetworkRule],
+        temporaryAllowedUntil: Date? = nil
+    ) -> WebFilterPolicySnapshot {
+        WebFilterPolicySnapshot(
+            configuration: WebFilterConfiguration(
+                enabled: enabled,
+                revision: 9,
+                blockedDomains: blocked,
+                mode: mode,
+                allowedDomains: allowed,
+                appRules: apps,
+                temporaryAllowedUntilEpochMillis: temporaryAllowedUntil.map { Int64($0.timeIntervalSince1970 * 1000) }
+            ),
+            isDeviceBound: true,
+            appliedAt: Date(timeIntervalSince1970: 0)
+        )
+    }
+
     private func makePolicy(
         enabled: Bool,
         rules: [WebFilterRule]

@@ -642,6 +642,28 @@ final class BigDaddyClient: @unchecked Sendable {
         )
     }
 
+    /// 联网软件清单里给家长看的名字。过滤扩展只知道签名身份和程序路径，名字在这里按
+    /// 孩子这台 Mac 的系统语言从 bundle 里读；读不到就用签名标识符的最后一段。
+    private static func displayName(of bundle: Bundle?, fallback identifier: String) -> String {
+        let keys = ["CFBundleDisplayName", "CFBundleName"]
+        for key in keys {
+            if let name = (bundle?.localizedInfoDictionary?[key] ?? bundle?.infoDictionary?[key]) as? String,
+               !name.isEmpty {
+                return name
+            }
+        }
+        return identifier.split(separator: ".").last.map(String.init) ?? identifier
+    }
+
+    /// 声明能打开 http/https 链接的就算浏览器：浏览器不能设成随时可以联网，否则网站规则形同虚设。
+    private static func handlesWebURLs(_ bundle: Bundle?) -> Bool {
+        let urlTypes = bundle?.infoDictionary?["CFBundleURLTypes"] as? [[String: Any]] ?? []
+        return urlTypes.contains { type in
+            let schemes = type["CFBundleURLSchemes"] as? [String] ?? []
+            return schemes.contains { $0.lowercased() == "http" || $0.lowercased() == "https" }
+        }
+    }
+
     func reportWebFilterStatus(_ report: WebFilterStatusReport) async {
         guard config.bound, !credentialsInvalid else { return }
         var body: [String: Any] = [
@@ -660,6 +682,22 @@ final class BigDaddyClient: @unchecked Sendable {
                 ]
             }
         ]
+        body["appRuleCount"] = report.appRuleCount
+        body["appActivity"] = report.appActivity.map { activity in
+            let bundle = activity.bundlePath.flatMap(Bundle.init(path:))
+            var item: [String: Any] = [
+                "signingIdentifier": activity.signingIdentifier,
+                "displayName": Self.displayName(of: bundle, fallback: activity.signingIdentifier),
+                "browser": Self.handlesWebURLs(bundle),
+                "lastSeenAt": BigDaddyDateFormatter.iso8601.string(from: activity.lastSeenAt),
+                "connectionCount": activity.connectionCount,
+                "blockedCount": activity.blockedCount,
+            ]
+            if let team = activity.teamIdentifier {
+                item["teamIdentifier"] = team
+            }
+            return item
+        }
         if let lastAppliedAt = report.lastAppliedAt {
             body["lastAppliedAt"] = BigDaddyDateFormatter.iso8601.string(from: lastAppliedAt)
         }

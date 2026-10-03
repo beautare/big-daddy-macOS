@@ -55,12 +55,22 @@ final class FilterDataProvider: NEFilterDataProvider {
         /// 从这条流的出站字节里认出过 QUIC。必须记下来：识别只在攒握手包那一小段窗口里
         /// 发生，而"策略变严时该不该掐掉它"是日后才问的问题，那时原始字节早清掉了。
         var sawQUIC = false
+        /// 发起这条连接的程序。策略变化时要带着它重新判定——家长把正在运行的游戏设成
+        /// 不能联网，它已经建立的连接要像网站规则一样当场掐断。
+        let identity: AppIdentity?
+        /// 建立时软件规则判定为"随时可以联网"（或约定期间的 AGREEMENT 软件）：不扣住握手
+        /// 等主机名、不掐 QUIC、认不出主机名也放行。约定到点时 reloadPolicy 会重新判定，
+        /// AGREEMENT 软件的流在那时被掐断。
+        let bypassesDefault: Bool
 
-        init(flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool, sequence: UInt64) {
+        init(flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool, sequence: UInt64,
+             identity: AppIdentity?, bypassesDefault: Bool) {
             self.flow = flow
             self.hostname = hostname
             self.awaitingHostname = awaitingHostname
             self.sequence = sequence
+            self.identity = identity
+            self.bypassesDefault = bypassesDefault
         }
     }
 
@@ -86,6 +96,12 @@ final class FilterDataProvider: NEFilterDataProvider {
     private static let trackedFlowLowWaterMark = 1536
     /// 白名单请求只保留最近 20 个域名。它们是给家长确认的候选项，不是审计全量日志。
     private static let maxAccessRequests = 20
+    /// 联网软件清单的上限与统计窗口（app_network_rules_spec.md §3）
+    private static let maxAppActivity = 100
+    private static let appActivityWindow: TimeInterval = 7 * 24 * 3600
+    /// 联网软件清单变化后，最快多久把它刷进回执。回执是主 App 来拉的快照，每条连接都刷
+    /// 一次没有意义，也会把热路径变重。
+    private static let appActivityPublishInterval: TimeInterval = 60
 
     /// 本 provider 进程的启动时刻，构造时取一次、此后不变。主 App 靠它回答"这个扩展在那段
     /// 空窗期里有没有重启过"（见 WebFilterController.extensionSurvivedGap）——**不能**用
@@ -104,6 +120,10 @@ final class FilterDataProvider: NEFilterDataProvider {
     private var policy = FilterDataProvider.emptyPolicy
     private var trackedFlows: [ObjectIdentifier: TrackedFlow] = [:]
     private var accessRequests: [String: WebFilterAccessRequest] = [:]
+    /// 键为"团队 ID/签名标识符"，辅助进程按 AppNetworkRule 同样的前缀规则不单独成行
+    private var appActivity: [String: AppNetworkActivity] = [:]
+    private var lastAppActivityPublish = Date.distantPast
+    private let identityResolver = AppIdentityResolver()
     private var nextFlowSequence: UInt64 = 0
     private var configurationObservation: NSKeyValueObservation?
     /// 回执服务端。主 App 靠它知道"provider 到底应用了哪个 revision"，家长端的
@@ -137,6 +157,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         policyLock.lock()
         trackedFlows.removeAll()
         accessRequests.removeAll()
+        appActivity.removeAll()
         // 策略一并清回默认值：被叫停之后就不该再留着一份"要拦什么"的记忆。provider 进程
         // 未必随过滤停止而退出，而"停掉再开"之间这台机器可能已经换了家庭（解绑会让后端删掉
         // 设备行、级联重建配置）。下次 startFilter 会走 reloadPolicy 重新读，不依赖这里留下
@@ -159,20 +180,32 @@ final class FilterDataProvider: NEFilterDataProvider {
         let policy = self.policy
         policyLock.unlock()
 
+        // 软件规则不需要主机名，第一时间就能下结论：游戏的裸 IP、自定义 UDP 连接都在这里拦下，
+        // 不用等握手包。身份解析有缓存，同一个进程只解析一次。
+        let identity = identityResolver.identity(of: socketFlow.sourceAppAuditToken)
+        let appVerdict = policy.appVerdict(for: identity)
+        recordAppActivity(identity, blocked: appVerdict == .block)
+        if appVerdict == .block {
+            return .drop()
+        }
+        let bypassesDefault = appVerdict == .bypass
+
         // 快速路径：系统已经知道这条流要去哪儿（Safari、走 NSURLSession 的原生 App）。
         // 不用等握手，也不用解析任何东西。
         if let hostname = systemHostname(for: socketFlow) {
-            if policy.blocks(hostname: hostname)
+            if policy.blocks(hostname: hostname, identity: identity)
                 && !permitsManagementConnection(socketFlow, hostname: hostname, policy: policy) {
                 recordAccessRequestIfNeeded(hostname)
                 return .drop()
             }
-            remember(socketFlow, hostname: hostname, awaitingHostname: false)
+            remember(socketFlow, hostname: hostname, awaitingHostname: false,
+                     identity: identity, bypassesDefault: bypassesDefault)
             return stayAttachedNewFlowVerdict()
         }
 
         // 系统不知道——Chromium 系浏览器的常态。让它把握手包给我们看，从 SNI 里读。
-        remember(socketFlow, hostname: nil, awaitingHostname: true)
+        remember(socketFlow, hostname: nil, awaitingHostname: true,
+                 identity: identity, bypassesDefault: bypassesDefault)
         return inspectHandshakeVerdict()
     }
 
@@ -195,7 +228,10 @@ final class FilterDataProvider: NEFilterDataProvider {
             // 早就判过了，这次回调只是"保持挂载"的例行招呼
             return passThroughVerdict()
         }
-        if policy.requiresKnownHostname && offset == 0 {
+        // "随时可以联网"的软件不受"名单之外都打不开"约束，也就不必扣住握手等主机名；
+        // 读主机名只是为了执行「任何时候都不行」的网站。
+        let holdsForHostname = policy.requiresKnownHostname && !tracked.bypassesDefault
+        if holdsForHostname && offset == 0 {
             tracked.handshake = readBytes
         } else {
             tracked.handshake.append(readBytes)
@@ -223,13 +259,15 @@ final class FilterDataProvider: NEFilterDataProvider {
             trackedFlows[key]?.sawQUIC = true
             policyLock.unlock()
         }
-        if policy.enabled, quic {
+        // 随时可以联网的软件不掐 QUIC：家长的意思是"这个软件联网别管"。代价是它经 QUIC
+        // 访问「任何时候都不行」的网站时认不出主机名、拦不住——这类软件通常是网课工具，可以接受。
+        if policy.enabled, quic, !tracked.bypassesDefault {
             forget(key)
             return .drop()
         }
 
         if handshake.count >= Self.maxHandshakeBytes {
-            if policy.requiresKnownHostname {
+            if holdsForHostname {
                 forget(key)
                 return .drop()
             }
@@ -245,7 +283,7 @@ final class FilterDataProvider: NEFilterDataProvider {
 
         // 白名单要在识别出域名前扣住握手数据；黑名单沿用已经验证过的边读边放行行为。
         // passBytes: 0 的实际系统表现仍需在签名安装后的 Mac 上验证。
-        if policy.requiresKnownHostname {
+        if holdsForHostname {
             return NEFilterDataVerdict(passBytes: 0, peekBytes: min(Self.maxHandshakeBytes, handshake.count + Self.handshakePeekBytes))
         }
         return NEFilterDataVerdict(passBytes: readBytes.count, peekBytes: Self.handshakePeekBytes)
@@ -263,8 +301,10 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private func unresolvedFlowVerdict(for flow: NEFilterFlow) -> NEFilterDataVerdict {
         policyLock.lock()
+        let tracked = trackedFlows[ObjectIdentifier(flow)]
         let unresolved = policy.requiresKnownHostname
-            && trackedFlows[ObjectIdentifier(flow)]?.awaitingHostname == true
+            && tracked?.awaitingHostname == true
+            && tracked?.bypassesDefault == false
         policyLock.unlock()
         return unresolved ? .drop() : .allow()
     }
@@ -316,6 +356,7 @@ final class FilterDataProvider: NEFilterDataProvider {
                 hostname: hostname,
                 isLikelyQUIC: quic,
                 isManagementApp: isManagementFlow && isManagementApp(tracked.flow, policy: nextPolicy),
+                identity: tracked.identity,
                 under: nextPolicy
             )
             if shouldDrop {
@@ -345,6 +386,7 @@ final class FilterDataProvider: NEFilterDataProvider {
         NSLog("""
             BigDaddyWebFilter: applied policy revision=\(nextPolicy.revision) \
             enforcing=\(nextPolicy.enabled) rules=\(nextPolicy.blockedDomains.count) \
+            appRules=\(nextPolicy.appRules.count) \
             dropped=\(flowsToDrop.count) tracked=\(trackedCount) \
             udp=\(udpCount) quic=\(quicCount)
             """)
@@ -375,7 +417,10 @@ final class FilterDataProvider: NEFilterDataProvider {
         hostname: String,
         policy: WebFilterPolicySnapshot
     ) -> NEFilterDataVerdict {
-        let blocked = policy.blocks(hostname: hostname)
+        policyLock.lock()
+        let identity = trackedFlows[key]?.identity
+        policyLock.unlock()
+        let blocked = policy.blocks(hostname: hostname, identity: identity)
             && !permitsManagementConnection(flow, hostname: hostname, policy: policy)
         if blocked {
             recordAccessRequestIfNeeded(hostname)
@@ -420,13 +465,58 @@ final class FilterDataProvider: NEFilterDataProvider {
             accessRequests.removeValue(forKey: oldest)
         }
         let currentPolicy = policy
-        let currentRequests = sortedAccessRequests()
         policyLock.unlock()
-        ipcListener?.publish(WebFilterProviderAcknowledgement(
-            policy: currentPolicy,
-            accessRequests: currentRequests,
-            providerStartedAt: providerStartedAt
-        ))
+        publishAcknowledgement(for: currentPolicy)
+    }
+
+    /// 统计联网软件清单。系统程序不进清单（家长也不能管它们）。
+    private func recordAppActivity(_ identity: AppIdentity?, blocked: Bool) {
+        guard let identity, !identity.isPlatformBinary else { return }
+        let now = Date()
+        policyLock.lock()
+        let key = appActivityKey(for: identity)
+        var entry = appActivity[key] ?? AppNetworkActivity(
+            signingIdentifier: key.split(separator: "/", maxSplits: 1).last.map(String.init) ?? identity.signingIdentifier,
+            teamIdentifier: identity.teamIdentifier,
+            bundlePath: identityResolver.bundlePath(of: identity),
+            lastSeenAt: now,
+            connectionCount: 0,
+            blockedCount: 0
+        )
+        entry.lastSeenAt = now
+        entry.connectionCount += 1
+        if blocked { entry.blockedCount += 1 }
+        appActivity[key] = entry
+        if appActivity.count > Self.maxAppActivity,
+           let oldest = appActivity.min(by: { $0.value.lastSeenAt < $1.value.lastSeenAt })?.key {
+            appActivity.removeValue(forKey: oldest)
+        }
+        let shouldPublish = now.timeIntervalSince(lastAppActivityPublish) >= Self.appActivityPublishInterval
+        if shouldPublish { lastAppActivityPublish = now }
+        let currentPolicy = policy
+        policyLock.unlock()
+        if shouldPublish {
+            publishAcknowledgement(for: currentPolicy)
+        }
+    }
+
+    /// 辅助进程归到已经出现过的主程序名下（同团队、标识符以"主程序标识符."开头），
+    /// 与 AppNetworkRule.matches 的前缀规则一致，家长在清单里看到的就是能管住它的那一行。
+    /// 调用方必须已经持有 policyLock。
+    private func appActivityKey(for identity: AppIdentity) -> String {
+        let team = identity.teamIdentifier ?? ""
+        let parent = appActivity.values.first { entry in
+            entry.teamIdentifier == identity.teamIdentifier
+                && identity.signingIdentifier.hasPrefix(entry.signingIdentifier + ".")
+        }
+        return "\(team)/\(parent?.signingIdentifier ?? identity.signingIdentifier)"
+    }
+
+    /// 调用方必须已经持有 policyLock。
+    private func currentAppActivity() -> [AppNetworkActivity] {
+        let cutoff = Date().addingTimeInterval(-Self.appActivityWindow)
+        appActivity = appActivity.filter { $0.value.lastSeenAt >= cutoff }
+        return appActivity.values.sorted { $0.lastSeenAt > $1.lastSeenAt }
     }
 
     private func sortedAccessRequests() -> [WebFilterAccessRequest] {
@@ -440,10 +530,12 @@ final class FilterDataProvider: NEFilterDataProvider {
     private func publishAcknowledgement(for policy: WebFilterPolicySnapshot) {
         policyLock.lock()
         let accessRequests = sortedAccessRequests()
+        let activity = currentAppActivity()
         policyLock.unlock()
         ipcListener?.publish(WebFilterProviderAcknowledgement(
             policy: policy,
             accessRequests: accessRequests,
+            appActivity: activity,
             providerStartedAt: providerStartedAt
         ))
     }
@@ -473,14 +565,19 @@ final class FilterDataProvider: NEFilterDataProvider {
         return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
     }
 
-    private func remember(_ flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool) {
+    private func remember(
+        _ flow: NEFilterSocketFlow, hostname: String?, awaitingHostname: Bool,
+        identity: AppIdentity?, bypassesDefault: Bool
+    ) {
         policyLock.lock()
         nextFlowSequence += 1
         trackedFlows[ObjectIdentifier(flow)] = TrackedFlow(
             flow: flow,
             hostname: hostname,
             awaitingHostname: awaitingHostname,
-            sequence: nextFlowSequence
+            sequence: nextFlowSequence,
+            identity: identity,
+            bypassesDefault: bypassesDefault
         )
         evictOldestTrackedFlowsIfNeeded()
         policyLock.unlock()
@@ -591,5 +688,76 @@ final class FilterDataProvider: NEFilterDataProvider {
             return endpoint.port == "443"
         }
         return false
+    }
+}
+
+/// 从审计令牌解析发起连接的程序的代码签名身份。
+///
+/// 必须缓存：handleNewFlow 是全项目唯一调用频率没有上限的路径，每条连接都走一遍
+/// Security 框架（读磁盘上的签名、校验 anchor apple）不可接受。键直接用审计令牌本身——
+/// 它含 pid 与 pidversion，pid 被复用时令牌也不同，不会把新进程认成旧进程。
+private final class AppIdentityResolver {
+    private static let maxCachedProcesses = 512
+
+    private let lock = NSLock()
+    private var identities: [Data: AppIdentity?] = [:]
+    private var bundlePaths: [AppIdentity: String] = [:]
+    private let appleAnchor: SecRequirement? = {
+        var requirement: SecRequirement?
+        SecRequirementCreateWithString("anchor apple" as CFString, [], &requirement)
+        return requirement
+    }()
+
+    func identity(of auditToken: Data?) -> AppIdentity? {
+        guard let auditToken else { return nil }
+        lock.lock()
+        if let cached = identities[auditToken] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let resolved = resolve(auditToken)
+
+        lock.lock()
+        if identities.count >= Self.maxCachedProcesses {
+            identities.removeAll(keepingCapacity: true)
+        }
+        identities[auditToken] = .some(resolved?.identity)
+        if let resolved, let path = resolved.bundlePath {
+            bundlePaths[resolved.identity] = path
+        }
+        lock.unlock()
+        return resolved?.identity
+    }
+
+    func bundlePath(of identity: AppIdentity) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return bundlePaths[identity]
+    }
+
+    /// 解析失败（进程已退出、签名无效）返回 nil：软件规则不命中，按网站规则处理。
+    private func resolve(_ auditToken: Data) -> (identity: AppIdentity, bundlePath: String?)? {
+        var code: SecCode?
+        let attributes = [kSecGuestAttributeAudit as String: auditToken] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess, let code else { return nil }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any],
+              let signingIdentifier = info[kSecCodeInfoIdentifier as String] as? String else { return nil }
+        let isPlatformBinary = appleAnchor.map { SecCodeCheckValidity(code, [], $0) == errSecSuccess } ?? false
+        var url: CFURL?
+        let bundlePath = SecCodeCopyPath(staticCode, [], &url) == errSecSuccess ? (url as URL?)?.path : nil
+        return (
+            AppIdentity(
+                signingIdentifier: signingIdentifier,
+                teamIdentifier: info[kSecCodeInfoTeamIdentifier as String] as? String,
+                isPlatformBinary: isPlatformBinary
+            ),
+            bundlePath
+        )
     }
 }

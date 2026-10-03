@@ -23,20 +23,23 @@ struct WebFilterConfiguration: Codable, Equatable {
     var blockedDomains: [WebFilterRule] = []
     var mode: WebFilterMode = .blockSelected
     var allowedDomains: [WebFilterRule] = []
+    var appRules: [AppNetworkRule] = []
     var temporaryAllowedUntilEpochMillis: Int64? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, revision, blockedDomains, mode, allowedDomains, temporaryAllowedUntilEpochMillis
+        case enabled, revision, blockedDomains, mode, allowedDomains, appRules, temporaryAllowedUntilEpochMillis
     }
 
     init(enabled: Bool = false, revision: Int64 = 0, blockedDomains: [WebFilterRule] = [],
          mode: WebFilterMode = .blockSelected, allowedDomains: [WebFilterRule] = [],
+         appRules: [AppNetworkRule] = [],
          temporaryAllowedUntilEpochMillis: Int64? = nil) {
         self.enabled = enabled
         self.revision = revision
         self.blockedDomains = blockedDomains
         self.mode = mode
         self.allowedDomains = allowedDomains
+        self.appRules = appRules
         self.temporaryAllowedUntilEpochMillis = temporaryAllowedUntilEpochMillis
     }
 
@@ -47,8 +50,65 @@ struct WebFilterConfiguration: Codable, Equatable {
         blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
         mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
         allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
+        appRules = try container.decodeIfPresent([AppNetworkRule].self, forKey: .appRules) ?? []
         temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
     }
+}
+
+/// 软件联网的三档，与网站的三种待遇同一套说法。
+enum AppNetworkAccess: String, Codable {
+    case always = "ALWAYS"
+    case agreement = "AGREEMENT"
+    case never = "NEVER"
+}
+
+/// 发起一条连接的程序的代码签名身份，由过滤扩展从 sourceAppAuditToken 解析而来。
+/// sourceAppAuditToken 标识的是**负责这条连接的 App**：nsurlsessiond 代某个 App 下载，
+/// 算在那个 App 头上——这正是按软件管联网要的语义。
+struct AppIdentity: Hashable {
+    let signingIdentifier: String
+    /// 开发者团队 ID；未签名或临时签名的程序为 nil
+    let teamIdentifier: String?
+    /// Apple 自带程序（满足 `anchor apple`）。任何软件联网规则都不作用于它
+    let isPlatformBinary: Bool
+}
+
+/// 按代码签名身份管一个软件能不能联网。
+struct AppNetworkRule: Codable, Equatable {
+    let signingIdentifier: String
+    let teamIdentifier: String?
+    let displayName: String
+    let access: AppNetworkAccess
+
+    /// 团队 ID 必须一致（防止同名标识符冒充）；签名标识符相等，或以"标识符."开头——
+    /// 后者连带管住同前缀的辅助进程（com.valvesoftware.steam.helper），又不会误中
+    /// com.valvesoftware.steamfoo。
+    func matches(_ identity: AppIdentity) -> Bool {
+        identity.teamIdentifier == teamIdentifier
+            && (identity.signingIdentifier == signingIdentifier
+                || identity.signingIdentifier.hasPrefix(signingIdentifier + "."))
+    }
+}
+
+/// 最近联过网的软件，家长从这份清单里挑软件。扩展只知道签名身份和程序路径，
+/// 展示名和"是不是浏览器"由主 App 按 bundlePath 补上再上报。
+struct AppNetworkActivity: Codable, Equatable {
+    let signingIdentifier: String
+    let teamIdentifier: String?
+    let bundlePath: String?
+    var lastSeenAt: Date
+    var connectionCount: Int
+    var blockedCount: Int
+}
+
+/// 软件规则对一条连接的结论
+enum AppNetworkVerdict {
+    /// 没有规则管它（或它受保护），完全交给网站规则
+    case none
+    /// 不能联网
+    case block
+    /// 随时可以联网，或约定期间的 AGREEMENT 软件：不再看"名单之外"的默认值，也不要求认出主机名
+    case bypass
 }
 
 /// 白名单拦截到的域名只作为家长的候选项：客户端绝不因此自动放行。
@@ -59,7 +119,8 @@ struct WebFilterAccessRequest: Codable, Equatable {
 }
 
 struct WebFilterPolicySnapshot: Codable, Equatable {
-    static let schemaVersion = 2
+    /// 3：加入软件联网规则（appRules）。服务端据此判断能不能保存软件规则
+    static let schemaVersion = 3
 
     let schemaVersion: Int
     let enabled: Bool
@@ -67,6 +128,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     let blockedDomains: [WebFilterRule]
     let mode: WebFilterMode
     let allowedDomains: [WebFilterRule]
+    let appRules: [AppNetworkRule]
     let temporaryAllowedUntilEpochMillis: Int64?
     let managementHost: String?
     let managementAppIdentifier: String?
@@ -82,7 +144,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     private let allowedMatcher: DomainMatcher
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, enabled, revision, blockedDomains, mode, allowedDomains,
+        case schemaVersion, enabled, revision, blockedDomains, mode, allowedDomains, appRules,
              temporaryAllowedUntilEpochMillis, managementHost, managementAppIdentifier, appliedAt
     }
 
@@ -99,6 +161,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         self.blockedDomains = configuration.blockedDomains
         self.mode = configuration.mode
         self.allowedDomains = configuration.allowedDomains
+        self.appRules = configuration.appRules
         self.temporaryAllowedUntilEpochMillis = configuration.temporaryAllowedUntilEpochMillis
         self.managementHost = managementHost
         self.managementAppIdentifier = managementAppIdentifier
@@ -116,6 +179,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
         mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
         allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
+        appRules = try container.decodeIfPresent([AppNetworkRule].self, forKey: .appRules) ?? []
         temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
         managementHost = try container.decodeIfPresent(String.self, forKey: .managementHost)
         managementAppIdentifier = try container.decodeIfPresent(String.self, forKey: .managementAppIdentifier)
@@ -132,6 +196,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
             && lhs.blockedDomains == rhs.blockedDomains
             && lhs.mode == rhs.mode
             && lhs.allowedDomains == rhs.allowedDomains
+            && lhs.appRules == rhs.appRules
             && lhs.temporaryAllowedUntilEpochMillis == rhs.temporaryAllowedUntilEpochMillis
             && lhs.managementHost == rhs.managementHost
             && lhs.managementAppIdentifier == rhs.managementAppIdentifier
@@ -146,18 +211,36 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         return isManagementApp && DomainName.normalize(hostname) == DomainName.normalize(managementHost)
     }
 
-    func blocks(hostname: String) -> Bool {
-        blocks(hostname: hostname, at: Date())
+    /// 时间约定进行中：「约好的时间里才可以」的网站和 AGREEMENT 档的软件放行
+    func isTemporarilyAllowed(at now: Date) -> Bool {
+        temporaryAllowedUntilEpochMillis.map { now.timeIntervalSince1970 * 1000 < Double($0) } ?? false
     }
 
-    func blocks(hostname: String, at now: Date) -> Bool {
+    /// 软件规则的结论。系统程序和 BigDaddy 自己永远不受软件规则约束（服务端也会拒绝这类规则，
+    /// 这里是执行端的兜底）。
+    func appVerdict(for identity: AppIdentity?, at now: Date = Date()) -> AppNetworkVerdict {
+        guard enabled, let identity, !identity.isPlatformBinary,
+              !identity.signingIdentifier.hasPrefix("vip.bigdaddy."),
+              let rule = appRules.first(where: { $0.matches(identity) }) else { return .none }
+        switch rule.access {
+        case .never: return .block
+        case .agreement: return isTemporarilyAllowed(at: now) ? .bypass : .block
+        case .always: return .bypass
+        }
+    }
+
+    /// 判定顺序（app_network_rules_spec.md §2.4）：任何时候都不行的网站 → 软件不能联网 →
+    /// 约好的时间里才可以的网站 → 软件随时可以联网 → 随时可以的网站 → 名单之外的默认值。
+    /// 网站「任何时候都不行」排在软件规则之前：家长明确说了不行的网站，不能因为某个软件
+    /// 被设成随时可以联网就被绕过。
+    func blocks(hostname: String, identity: AppIdentity? = nil, at now: Date = Date()) -> Bool {
         guard enabled else { return false }
         let candidate = DomainName.normalize(hostname)
         if alwaysBlockedMatcher.matches(candidate) { return true }
-        if entertainmentMatcher.matches(candidate) {
-            let temporaryAllowed = temporaryAllowedUntilEpochMillis.map { now.timeIntervalSince1970 * 1000 < Double($0) } ?? false
-            return !temporaryAllowed
-        }
+        let app = appVerdict(for: identity, at: now)
+        if app == .block { return true }
+        if entertainmentMatcher.matches(candidate) { return !isTemporarilyAllowed(at: now) }
+        if app == .bypass { return false }
         return mode == .allowSelected && !allowedMatcher.matches(candidate)
     }
 
@@ -227,13 +310,21 @@ enum WebFilterFlowDisposition {
         hostname: String?,
         isLikelyQUIC: Bool,
         isManagementApp: Bool = false,
-        under policy: WebFilterPolicySnapshot
+        identity: AppIdentity? = nil,
+        under policy: WebFilterPolicySnapshot,
+        at now: Date = Date()
     ) -> Bool {
         if let hostname {
             if policy.permitsManagementConnection(hostname: hostname, isManagementApp: isManagementApp) {
                 return false
             }
-            return policy.blocks(hostname: hostname)
+            return policy.blocks(hostname: hostname, identity: identity, at: now)
+        }
+        // 判不出主机名时，软件规则仍然能下结论：游戏的裸 IP / 自定义 UDP 连接正是靠这里管住的。
+        switch policy.appVerdict(for: identity, at: now) {
+        case .block: return true
+        case .bypass: return false
+        case .none: break
         }
         // 判不出主机名的 QUIC。这些流多半是在策略还没启用时放行的（那期间我们不掐 QUIC，
         // 见 FilterDataProvider.handleOutboundData），限制一旦启用就必须一并掐掉，否则
@@ -284,8 +375,10 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     let mode: WebFilterMode
     let allowedDomains: [WebFilterRule]
     let allowedRuleCount: Int
+    let appRules: [AppNetworkRule]
     let temporaryAllowedUntilEpochMillis: Int64?
     let accessRequests: [WebFilterAccessRequest]
+    let appActivity: [AppNetworkActivity]
     let enforcementEnabled: Bool
     let appliedAt: Date
     /// **provider 进程自身的启动时刻**，与 appliedAt 是两件不同的事，别混用。
@@ -304,13 +397,14 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case policySchemaVersion, appliedRevision, ruleCount, blockedDomains, mode, allowedDomains,
-             allowedRuleCount, temporaryAllowedUntilEpochMillis, accessRequests, enforcementEnabled,
-             appliedAt, providerStartedAt
+             allowedRuleCount, appRules, temporaryAllowedUntilEpochMillis, accessRequests, appActivity,
+             enforcementEnabled, appliedAt, providerStartedAt
     }
 
     init(
         policy: WebFilterPolicySnapshot,
         accessRequests: [WebFilterAccessRequest] = [],
+        appActivity: [AppNetworkActivity] = [],
         appliedAt: Date = Date(),
         providerStartedAt: Date? = nil
     ) {
@@ -321,8 +415,10 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
         mode = policy.mode
         allowedDomains = policy.allowedDomains
         allowedRuleCount = policy.allowedDomains.count
+        appRules = policy.appRules
         temporaryAllowedUntilEpochMillis = policy.temporaryAllowedUntilEpochMillis
         self.accessRequests = accessRequests
+        self.appActivity = appActivity
         enforcementEnabled = policy.enabled
         self.appliedAt = appliedAt
         self.providerStartedAt = providerStartedAt
@@ -339,8 +435,10 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
         mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
         allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
         allowedRuleCount = try container.decodeIfPresent(Int.self, forKey: .allowedRuleCount) ?? allowedDomains.count
+        appRules = try container.decodeIfPresent([AppNetworkRule].self, forKey: .appRules) ?? []
         temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
         accessRequests = try container.decodeIfPresent([WebFilterAccessRequest].self, forKey: .accessRequests) ?? []
+        appActivity = try container.decodeIfPresent([AppNetworkActivity].self, forKey: .appActivity) ?? []
         enforcementEnabled = try container.decode(Bool.self, forKey: .enforcementEnabled)
         appliedAt = try container.decode(Date.self, forKey: .appliedAt)
         providerStartedAt = try container.decodeIfPresent(Date.self, forKey: .providerStartedAt)
@@ -353,6 +451,7 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
             && mode == policy.mode
             && allowedDomains == policy.allowedDomains
             && allowedRuleCount == policy.allowedDomains.count
+            && appRules == policy.appRules
             && temporaryAllowedUntilEpochMillis == policy.temporaryAllowedUntilEpochMillis
             && enforcementEnabled == policy.enabled
     }
@@ -390,6 +489,8 @@ struct WebFilterStatusReport: Equatable {
     let ruleCount: Int
     let allowedRuleCount: Int
     let accessRequests: [WebFilterAccessRequest]
+    let appRuleCount: Int
+    let appActivity: [AppNetworkActivity]
     let lastAppliedAt: Date?
     let error: String?
 }
