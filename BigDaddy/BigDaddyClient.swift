@@ -654,16 +654,20 @@ final class BigDaddyClient: @unchecked Sendable {
                             bundleName: (String) -> String? = bundleName(atPath:)) -> String {
         let fallbackName = identifier.split(separator: ".").last.map(String.init) ?? identifier
         guard let path else { return fallbackName }
+        guard let hostPath = hostAppPath(of: path), let hostName = bundleName(hostPath) else {
+            return bundleName(path) ?? fallbackName
+        }
+        let innerName = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        return innerName.localizedCaseInsensitiveContains(hostName) ? innerName : "\(hostName) · \(innerName)"
+    }
+
+    /// 程序所在的最外层 App（`/Applications/Vivaldi.app/Contents/Frameworks/Vivaldi Helper.app`
+    /// → `/Applications/Vivaldi.app`）。程序本身就是最外层 App 或不在任何 App 里时为 nil。
+    static func hostAppPath(of path: String) -> String? {
         let components = (path as NSString).pathComponents
-        guard let outerIndex = components.firstIndex(where: { $0.hasSuffix(".app") }) else {
-            return bundleName(path) ?? fallbackName
-        }
-        let outerPath = NSString.path(withComponents: Array(components[...outerIndex]))
-        guard outerIndex < components.count - 1, let outerName = bundleName(outerPath) else {
-            return bundleName(path) ?? fallbackName
-        }
-        let innerName = ((components.last ?? "") as NSString).deletingPathExtension
-        return innerName.localizedCaseInsensitiveContains(outerName) ? innerName : "\(outerName) · \(innerName)"
+        guard let outerIndex = components.firstIndex(where: { $0.hasSuffix(".app") }),
+              outerIndex < components.count - 1 else { return nil }
+        return NSString.path(withComponents: Array(components[...outerIndex]))
     }
 
     static func bundleName(atPath path: String) -> String? {
@@ -698,6 +702,16 @@ final class BigDaddyClient: @unchecked Sendable {
         }
     }
 
+    /// 程序本身是浏览器，或者它嵌在浏览器里，都算浏览器。Chrome、Vivaldi、Brave 的网络请求
+    /// 实际由辅助进程发出（"Vivaldi Helper"），辅助进程自己的 Info.plist 不声明能打开网页；
+    /// 只看它自己，家长就能把它设成随时可以联网，整个浏览器随之绕过网站规则。
+    static func isWebBrowser(atPath path: String?,
+                             infoDictionary: (String) -> [String: Any]? = { Bundle(path: $0)?.infoDictionary }) -> Bool {
+        guard let path else { return false }
+        return isWebBrowser(infoDictionary: infoDictionary(path))
+            || hostAppPath(of: path).map { isWebBrowser(infoDictionary: infoDictionary($0)) } == true
+    }
+
     func reportWebFilterStatus(_ report: WebFilterStatusReport) async {
         guard config.bound, !credentialsInvalid else { return }
         var body: [String: Any] = [
@@ -721,7 +735,7 @@ final class BigDaddyClient: @unchecked Sendable {
             var item: [String: Any] = [
                 "signingIdentifier": activity.signingIdentifier,
                 "displayName": Self.displayName(atPath: activity.bundlePath, fallback: activity.signingIdentifier),
-                "browser": Self.isWebBrowser(infoDictionary: activity.bundlePath.flatMap(Bundle.init(path:))?.infoDictionary),
+                "browser": Self.isWebBrowser(atPath: activity.bundlePath),
                 "lastSeenAt": BigDaddyDateFormatter.iso8601.string(from: activity.lastSeenAt),
                 "connectionCount": activity.connectionCount,
                 "blockedCount": activity.blockedCount,

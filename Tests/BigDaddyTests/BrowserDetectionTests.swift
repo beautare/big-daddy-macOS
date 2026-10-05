@@ -30,4 +30,29 @@ final class BrowserDetectionTests: XCTestCase {
         XCTAssertFalse(BigDaddyClient.isWebBrowser(infoDictionary: ["CFBundleDocumentTypes": [["LSItemContentTypes": ["public.html"]]]]))
         XCTAssertFalse(BigDaddyClient.isWebBrowser(infoDictionary: nil))
     }
+
+    /// Chrome 系浏览器的网络请求由辅助进程发出，辅助进程自己不声明能打开网页，
+    /// 必须按它所在的浏览器判定，否则设成随时可以联网就绕过了网站规则
+    func testHelperNestedInBrowserIsBrowser() {
+        let plists: [String: [String: Any]] = [
+            "/Applications/Vivaldi.app": info(["LSItemContentTypes": ["public.html"]]),
+            "/Applications/Vivaldi.app/Contents/Frameworks/Vivaldi Helper.app": [:],
+            "/Applications/ChatGPT.app": webSchemes,
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app": [:],
+        ]
+        func isBrowser(_ path: String) -> Bool {
+            BigDaddyClient.isWebBrowser(atPath: path, infoDictionary: { plists[$0] })
+        }
+        XCTAssertTrue(isBrowser("/Applications/Vivaldi.app"))
+        XCTAssertTrue(isBrowser("/Applications/Vivaldi.app/Contents/Frameworks/Vivaldi Helper.app"))
+        XCTAssertFalse(isBrowser("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app"))
+        XCTAssertFalse(BigDaddyClient.isWebBrowser(atPath: nil))
+    }
+
+    func testHostAppPathIsOutermostAppOnly() {
+        XCTAssertEqual(BigDaddyClient.hostAppPath(of: "/Applications/Vivaldi.app/Contents/Frameworks/Vivaldi Helper.app"),
+                       "/Applications/Vivaldi.app")
+        XCTAssertNil(BigDaddyClient.hostAppPath(of: "/Applications/Vivaldi.app"))
+        XCTAssertNil(BigDaddyClient.hostAppPath(of: "/usr/local/bin/tool"))
+    }
 }
