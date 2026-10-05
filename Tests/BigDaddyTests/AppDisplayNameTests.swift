@@ -40,4 +40,11 @@ final class AppDisplayNameTests: XCTestCase {
         XCTAssertEqual(name(nil, "com.example.tool"), "tool")
         XCTAssertEqual(name("/usr/local/bin/tool", "com.example.tool"), "tool")
     }
+
+    /// WhatsApp 的显示名以方向标记 U+200E 开头
+    func testInvisibleFormatCharactersAreRemoved() {
+        XCTAssertEqual(BigDaddyClient.visibleText("\u{200E}WhatsApp"), "WhatsApp")
+        XCTAssertEqual(BigDaddyClient.visibleText(" \u{FEFF}微信\u{200F} "), "微信")
+        XCTAssertEqual(BigDaddyClient.visibleText("Google Chrome"), "Google Chrome")
+    }
 }

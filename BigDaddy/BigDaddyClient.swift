@@ -673,12 +673,19 @@ final class BigDaddyClient: @unchecked Sendable {
     static func bundleName(atPath path: String) -> String? {
         let bundle = Bundle(path: path)
         for key in ["CFBundleDisplayName", "CFBundleName"] {
-            if let name = (bundle?.localizedInfoDictionary?[key] ?? bundle?.infoDictionary?[key]) as? String,
-               !name.isEmpty {
-                return name
+            if let raw = (bundle?.localizedInfoDictionary?[key] ?? bundle?.infoDictionary?[key]) as? String {
+                let name = visibleText(raw)
+                if !name.isEmpty { return name }
             }
         }
         return nil
+    }
+
+    /// 去掉不可见的格式字符（Unicode Cf 类，如方向标记 U+200E）和首尾空白。WhatsApp 的显示名
+    /// 就以 U+200E 开头：看不见，却会让家长端按名字排序、搜索时对不上。
+    static func visibleText(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter { $0.properties.generalCategory != .format }))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// 浏览器不能设成随时可以联网，否则网站规则形同虚设。
