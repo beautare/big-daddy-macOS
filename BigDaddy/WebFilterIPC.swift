@@ -17,6 +17,11 @@ import Foundation
 /// **Mach 服务名。** NetworkExtension 要求 `NEMachServiceName` 必须以 App Group id 打头，
 /// 系统才会替扩展注册这个 mach 服务；打包脚本按同一规则生成并逐字校验（见 package.sh），
 /// 两端因此拿到的一定是同一个字符串。
+///
+/// 名字里带构建号（`<App Group>.BigDaddyWebFilter.<CFBundleVersion>`）。扩展升级后，被替换的
+/// 旧版会挂在"等待重启后卸载"，实测有时新版的同名服务一直登记不上，回执就断到重启为止
+/// （家长端状态与联网软件清单全部失效）。每个版本用自己的名字，新旧两版不再争同一个服务。
+/// 主 App 与扩展同一次打包、同一个构建号，主 App 用自己的构建号推算即可。
 @objc protocol WebFilterProviderXPC {
     /// 回执用 `Data` 传而不是直接传结构体：`NSXPCInterface` 只吃 NSSecureCoding，
     /// 让两端共用同一个 Codable 模型，比再维护一份 @objc 镜像类型便宜得多。
@@ -25,18 +30,21 @@ import Foundation
 }
 
 enum WebFilterIPC {
-    /// mach 服务名 = App Group id + 这个后缀。改这里必须同步改 package.sh 里的
+    /// mach 服务名 = App Group id + 这个后缀 + "." + 构建号。改这里必须同步改 package.sh 里的
     /// FILTER_MACH_SERVICE_NAME，脚本会在打包时逐字比对，对不上直接失败。
     static let machServiceSuffix = ".BigDaddyWebFilter"
 
-    /// 主 App 侧：从自己的 Info.plist 里的 App Group id 推导。
+    /// 主 App 侧：从自己 Info.plist 里的 App Group id 与构建号推导。
     static func machServiceName(bundle: Bundle = .main) -> String? {
-        guard let group = appGroupIdentifier(bundle: bundle) else { return nil }
-        return machServiceName(appGroupIdentifier: group)
+        guard let group = appGroupIdentifier(bundle: bundle),
+              let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !build.isEmpty
+        else { return nil }
+        return machServiceName(appGroupIdentifier: group, build: build)
     }
 
-    static func machServiceName(appGroupIdentifier: String) -> String {
-        appGroupIdentifier + machServiceSuffix
+    static func machServiceName(appGroupIdentifier: String, build: String) -> String {
+        "\(appGroupIdentifier)\(machServiceSuffix).\(build)"
     }
 
     /// 扩展侧：以系统实际注册的那个名字为准（Info.plist 的 NetworkExtension.NEMachServiceName），

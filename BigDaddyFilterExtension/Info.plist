@@ -25,7 +25,7 @@
     <key>NetworkExtension</key>
     <dict>
         <key>NEMachServiceName</key>
-        <string>$(TeamIdentifierPrefix)group.vip.bigdaddy.shared.BigDaddyWebFilter</string>
+        <string>$(TeamIdentifierPrefix)group.vip.bigdaddy.shared.BigDaddyWebFilter.$(CURRENT_PROJECT_VERSION)</string>
         <key>NEProviderClasses</key>
         <dict>
             <key>com.apple.networkextension.filter-data</key>

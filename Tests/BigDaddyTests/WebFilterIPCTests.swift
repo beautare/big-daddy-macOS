@@ -14,20 +14,28 @@ final class WebFilterIPCTests: XCTestCase {
 
     func testMachServiceNameMatchesPackagingConvention() {
         XCTAssertEqual(
-            WebFilterIPC.machServiceName(appGroupIdentifier: signedGroup),
-            "L2GSNW7RA2.group.vip.bigdaddy.shared.BigDaddyWebFilter"
+            WebFilterIPC.machServiceName(appGroupIdentifier: signedGroup, build: "19003"),
+            "L2GSNW7RA2.group.vip.bigdaddy.shared.BigDaddyWebFilter.19003"
         )
         XCTAssertEqual(
-            WebFilterIPC.machServiceName(appGroupIdentifier: unsignedGroup),
-            "group.vip.bigdaddy.shared.BigDaddyWebFilter"
+            WebFilterIPC.machServiceName(appGroupIdentifier: unsignedGroup, build: "19003"),
+            "group.vip.bigdaddy.shared.BigDaddyWebFilter.19003"
         )
     }
 
     func testMachServiceNameAlwaysStartsWithTheAppGroup() {
         // NetworkExtension 的硬性要求：不满足的话系统压根不会替扩展注册这个 mach 服务
         for group in [signedGroup, unsignedGroup] {
-            XCTAssertTrue(WebFilterIPC.machServiceName(appGroupIdentifier: group).hasPrefix(group))
+            XCTAssertTrue(WebFilterIPC.machServiceName(appGroupIdentifier: group, build: "19003").hasPrefix(group))
         }
+    }
+
+    /// 升级时新旧扩展各用各的服务名：旧版挂在"等待重启后卸载"时不会挡住新版登记
+    func testEachBuildGetsItsOwnMachServiceName() {
+        XCTAssertNotEqual(
+            WebFilterIPC.machServiceName(appGroupIdentifier: signedGroup, build: "19002"),
+            WebFilterIPC.machServiceName(appGroupIdentifier: signedGroup, build: "19003")
+        )
     }
 
     func testTeamIdentifierIsExtractedOnlyFromSignedGroups() {

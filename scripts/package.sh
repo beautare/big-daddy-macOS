@@ -134,7 +134,8 @@ else
 fi
 
 APP_GROUP_IDENTIFIER="${TEAM_IDENTIFIER_PREFIX}group.vip.bigdaddy.shared"
-FILTER_MACH_SERVICE_NAME="${APP_GROUP_IDENTIFIER}.BigDaddyWebFilter"
+# 带构建号：扩展升级时新旧两版各用各的服务名，见 WebFilterIPC.swift 顶部的说明
+FILTER_MACH_SERVICE_NAME="${APP_GROUP_IDENTIFIER}.BigDaddyWebFilter.${BUILD_NUMBER}"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAppGroupIdentifier ${APP_GROUP_IDENTIFIER}" "${APP_DIR}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :BigDaddyAppGroupIdentifier ${APP_GROUP_IDENTIFIER}" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :NetworkExtension:NEMachServiceName ${FILTER_MACH_SERVICE_NAME}" "${FILTER_EXTENSION_APP_PATH}/Contents/Info.plist"
@@ -148,11 +149,11 @@ if [[ "${FILTER_EXTENSION_NAME}" != "${FILTER_BUNDLE_IDENTIFIER}.systemextension
   exit 1
 fi
 # 逐字相等，不只是前缀匹配。主 App 那侧没有 NEMachServiceName 可读，它是用
-# "App Group id + WebFilterIPC.machServiceSuffix" 现推出来的（见 WebFilterIPC.swift）——
+# "App Group id + WebFilterIPC.machServiceSuffix + 构建号" 现推出来的（见 WebFilterIPC.swift）——
 # 两边一旦漂开，XPC 静默连不上，表现为家长端"实际版本"恒为 0、永远停在"策略同步中"，
 # 而过滤本身照常工作，没有任何报错会提示你去看这里。所以这条校验必须是等号。
 if [[ "${FILTER_RESOLVED_MACH_SERVICE_NAME}" != "${FILTER_MACH_SERVICE_NAME}" ]]; then
-  echo "ERROR: NEMachServiceName must equal <app-group>.BigDaddyWebFilter" >&2
+  echo "ERROR: NEMachServiceName must equal <app-group>.BigDaddyWebFilter.<build>" >&2
   echo "       mach-service=${FILTER_RESOLVED_MACH_SERVICE_NAME}, expected=${FILTER_MACH_SERVICE_NAME}" >&2
   echo "       (the host app derives the same name in WebFilterIPC.machServiceName)" >&2
   exit 1
