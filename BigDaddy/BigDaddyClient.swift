@@ -644,15 +644,37 @@ final class BigDaddyClient: @unchecked Sendable {
 
     /// 联网软件清单里给家长看的名字。过滤扩展只知道签名身份和程序路径，名字在这里按
     /// 孩子这台 Mac 的系统语言从 bundle 里读；读不到就用签名标识符的最后一段。
-    private static func displayName(of bundle: Bundle?, fallback identifier: String) -> String {
-        let keys = ["CFBundleDisplayName", "CFBundleName"]
-        for key in keys {
+    ///
+    /// 嵌在别的 App 里的程序（辅助进程、内置命令行工具）写成"外层 App · 内层文件名"：
+    /// 只看它自己的 Info.plist 会出现两种误导——ChatGPT 内置的 CodexCLI.app 也自称"ChatGPT"，
+    /// Cursor 的辅助进程在 Info.plist 里只叫"Electron Helper (Plugin)"，家长看不出它属于谁。内层用文件名
+    /// 而不是 Info.plist 里的名字，正是因为后者可能就是外层 App 的名字。内层名字已经带着外层
+    /// 名字的（"Google Chrome Helper"）保持原样。
+    static func displayName(atPath path: String?, fallback identifier: String,
+                            bundleName: (String) -> String? = bundleName(atPath:)) -> String {
+        let fallbackName = identifier.split(separator: ".").last.map(String.init) ?? identifier
+        guard let path else { return fallbackName }
+        let components = (path as NSString).pathComponents
+        guard let outerIndex = components.firstIndex(where: { $0.hasSuffix(".app") }) else {
+            return bundleName(path) ?? fallbackName
+        }
+        let outerPath = NSString.path(withComponents: Array(components[...outerIndex]))
+        guard outerIndex < components.count - 1, let outerName = bundleName(outerPath) else {
+            return bundleName(path) ?? fallbackName
+        }
+        let innerName = ((components.last ?? "") as NSString).deletingPathExtension
+        return innerName.localizedCaseInsensitiveContains(outerName) ? innerName : "\(outerName) · \(innerName)"
+    }
+
+    static func bundleName(atPath path: String) -> String? {
+        let bundle = Bundle(path: path)
+        for key in ["CFBundleDisplayName", "CFBundleName"] {
             if let name = (bundle?.localizedInfoDictionary?[key] ?? bundle?.infoDictionary?[key]) as? String,
                !name.isEmpty {
                 return name
             }
         }
-        return identifier.split(separator: ".").last.map(String.init) ?? identifier
+        return nil
     }
 
     /// 浏览器不能设成随时可以联网，否则网站规则形同虚设。
@@ -696,11 +718,10 @@ final class BigDaddyClient: @unchecked Sendable {
         ]
         body["appRuleCount"] = report.appRuleCount
         body["appActivity"] = report.appActivity.map { activity in
-            let bundle = activity.bundlePath.flatMap(Bundle.init(path:))
             var item: [String: Any] = [
                 "signingIdentifier": activity.signingIdentifier,
-                "displayName": Self.displayName(of: bundle, fallback: activity.signingIdentifier),
-                "browser": Self.isWebBrowser(infoDictionary: bundle?.infoDictionary),
+                "displayName": Self.displayName(atPath: activity.bundlePath, fallback: activity.signingIdentifier),
+                "browser": Self.isWebBrowser(infoDictionary: activity.bundlePath.flatMap(Bundle.init(path:))?.infoDictionary),
                 "lastSeenAt": BigDaddyDateFormatter.iso8601.string(from: activity.lastSeenAt),
                 "connectionCount": activity.connectionCount,
                 "blockedCount": activity.blockedCount,
