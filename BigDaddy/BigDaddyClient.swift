@@ -655,12 +655,24 @@ final class BigDaddyClient: @unchecked Sendable {
         return identifier.split(separator: ".").last.map(String.init) ?? identifier
     }
 
-    /// 声明能打开 http/https 链接的就算浏览器：浏览器不能设成随时可以联网，否则网站规则形同虚设。
-    private static func handlesWebURLs(_ bundle: Bundle?) -> Bool {
-        let urlTypes = bundle?.infoDictionary?["CFBundleURLTypes"] as? [[String: Any]] ?? []
-        return urlTypes.contains { type in
-            let schemes = type["CFBundleURLSchemes"] as? [String] ?? []
-            return schemes.contains { $0.lowercased() == "http" || $0.lowercased() == "https" }
+    /// 浏览器不能设成随时可以联网，否则网站规则形同虚设。
+    ///
+    /// 判据与系统设置里「默认网页浏览器」的候选条件一致：既声明能打开 http 和 https 链接，
+    /// 又声明能打开 HTML 文档。只看链接不够——ChatGPT 这类软件为了接住网页跳转也会登记
+    /// http/https，但它不是拿来上网的。HTML 有三种写法：UTI（Chrome 系）、扩展名或 MIME（Safari）。
+    static func isWebBrowser(infoDictionary info: [String: Any]?) -> Bool {
+        let urlTypes = info?["CFBundleURLTypes"] as? [[String: Any]] ?? []
+        let schemes = Set(urlTypes.flatMap { ($0["CFBundleURLSchemes"] as? [String] ?? []).map { $0.lowercased() } })
+        guard schemes.isSuperset(of: ["http", "https"]) else { return false }
+
+        let documentTypes = info?["CFBundleDocumentTypes"] as? [[String: Any]] ?? []
+        return documentTypes.contains { type in
+            let contentTypes = type["LSItemContentTypes"] as? [String] ?? []
+            let extensions = (type["CFBundleTypeExtensions"] as? [String] ?? []).map { $0.lowercased() }
+            let mimeTypes = (type["CFBundleTypeMIMETypes"] as? [String] ?? []).map { $0.lowercased() }
+            return contentTypes.contains("public.html")
+                || extensions.contains("html") || extensions.contains("htm")
+                || mimeTypes.contains("text/html")
         }
     }
 
@@ -688,7 +700,7 @@ final class BigDaddyClient: @unchecked Sendable {
             var item: [String: Any] = [
                 "signingIdentifier": activity.signingIdentifier,
                 "displayName": Self.displayName(of: bundle, fallback: activity.signingIdentifier),
-                "browser": Self.handlesWebURLs(bundle),
+                "browser": Self.isWebBrowser(infoDictionary: bundle?.infoDictionary),
                 "lastSeenAt": BigDaddyDateFormatter.iso8601.string(from: activity.lastSeenAt),
                 "connectionCount": activity.connectionCount,
                 "blockedCount": activity.blockedCount,
