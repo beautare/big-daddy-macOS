@@ -578,6 +578,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             timeSessionMenuItem = nil
         }
 
+        let filter = client.config.webFilter
+        let assignedPlans = Set(filter.blockedDomains.filter { $0.category == "ENTERTAINMENT" }.compactMap(\.weeklyPlanId)
+            + filter.appRules.filter { $0.access == .agreement }.compactMap(\.weeklyPlanId))
+        let plans = filter.weeklyPlans.filter { assignedPlans.contains($0.id) }
+        if client.config.bound && !plans.isEmpty {
+            let submenu = NSMenu()
+            let now = Date()
+            let blocked = filter.weeklyPlansBlockedUntilEpochMillis.map { $0 == -1 || Int64(now.timeIntervalSince1970 * 1000) < $0 } ?? false
+            for plan in plans {
+                let status = !filter.enabled ? Localization.string(zh: "规则未开启", en: "Rules are off")
+                    : blocked ? Localization.string(zh: "临时拦截中", en: "Temporarily blocked")
+                    : !plan.enabled ? Localization.string(zh: "计划已暂停", en: "Schedule paused")
+                    : plan.isOpen(at: now) ? Localization.string(zh: "按计划开放中", en: "Scheduled access open")
+                    : Localization.string(zh: "等待开放时段", en: "Waiting for scheduled access")
+                let item = NSMenuItem(title: "\(plan.name) · \(status)", action: nil, keyEquivalent: "")
+                item.isEnabled = false
+                submenu.addItem(item)
+                if filter.enabled && !blocked, let boundary = plan.nextBoundary(after: now) {
+                    let formatter = DateFormatter()
+                    formatter.timeZone = TimeZone(identifier: plan.timeZone)
+                    formatter.dateFormat = "EEE HH:mm"
+                    let label = plan.isOpen(at: now)
+                        ? Localization.string(zh: "当前时段结束", en: "Current window ends")
+                        : Localization.string(zh: "下次开放", en: "Next opening")
+                    let zone = plan.timeZone == "Asia/Shanghai" ? Localization.string(zh: "北京时间", en: "Beijing time") : plan.timeZone
+                    let timing = NSMenuItem(title: "\(label)：\(formatter.string(from: boundary)) · \(zone)", action: nil, keyEquivalent: "")
+                    timing.isEnabled = false
+                    submenu.addItem(timing)
+                }
+            }
+            let item = NSMenuItem(title: Localization.string(zh: "每周时间安排", en: "Weekly access schedules"), action: nil, keyEquivalent: "")
+            item.submenu = submenu
+            menu.addItem(item)
+            menu.addItem(.separator())
+        }
+
         if let webFilterTitle = webFilterMenuTitle(for: webFilterAttention) {
             menu.addItem(NSMenuItem(
                 title: webFilterTitle,

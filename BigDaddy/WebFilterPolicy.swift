@@ -4,11 +4,65 @@ struct WebFilterRule: Codable, Equatable {
     let domain: String
     let includeSubdomains: Bool
     let category: String?
+    let weeklyPlanId: String?
 
-    init(domain: String, includeSubdomains: Bool, category: String? = nil) {
+    init(domain: String, includeSubdomains: Bool, category: String? = nil, weeklyPlanId: String? = nil) {
         self.domain = domain
         self.includeSubdomains = includeSubdomains
         self.category = category
+        self.weeklyPlanId = weeklyPlanId
+    }
+}
+
+struct WeeklyAccessWindow: Codable, Equatable {
+    let daysOfWeek: [Int] // ISO weekday: Monday = 1
+    let startMinute: Int
+    let endMinute: Int
+}
+
+struct WeeklyAccessPlan: Codable, Equatable {
+    let id: String
+    let name: String
+    let enabled: Bool
+    let timeZone: String
+    let windows: [WeeklyAccessWindow]
+
+    private var calendar: Calendar? {
+        guard let zone = TimeZone(identifier: timeZone) else { return nil }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        return calendar
+    }
+
+    func isOpen(at now: Date) -> Bool {
+        guard enabled, let calendar else { return false }
+        let parts = calendar.dateComponents([.weekday, .hour, .minute], from: now)
+        let day = ((parts.weekday! + 5) % 7) + 1
+        let minute = parts.hour! * 60 + parts.minute!
+        return windows.contains { $0.daysOfWeek.contains(day) && minute >= $0.startMinute && minute < $0.endMinute }
+    }
+
+    func nextBoundary(after now: Date) -> Date? {
+        guard enabled, let calendar else { return nil }
+        var dates: [Date] = []
+        let today = calendar.startOfDay(for: now)
+        for offset in 0...7 {
+            let date = calendar.date(byAdding: .day, value: offset, to: today)!
+            let day = ((calendar.component(.weekday, from: date) + 5) % 7) + 1
+            for window in windows where window.daysOfWeek.contains(day) {
+                for minute in [window.startMinute, window.endMinute] {
+                    let boundary: Date?
+                    if minute == 1440 {
+                        boundary = calendar.date(byAdding: .day, value: 1, to: date)
+                    } else {
+                        boundary = calendar.date(bySettingHour: minute / 60, minute: minute % 60,
+                                                 second: 0, of: date)
+                    }
+                    if let boundary, boundary > now { dates.append(boundary) }
+                }
+            }
+        }
+        return dates.min()
     }
 }
 
@@ -24,15 +78,19 @@ struct WebFilterConfiguration: Codable, Equatable {
     var mode: WebFilterMode = .blockSelected
     var allowedDomains: [WebFilterRule] = []
     var appRules: [AppNetworkRule] = []
+    var weeklyPlans: [WeeklyAccessPlan] = []
+    var weeklyPlansBlockedUntilEpochMillis: Int64? = nil // -1: paused until parent resumes
     var temporaryAllowedUntilEpochMillis: Int64? = nil
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, revision, blockedDomains, mode, allowedDomains, appRules, temporaryAllowedUntilEpochMillis
+        case enabled, revision, blockedDomains, mode, allowedDomains, appRules, weeklyPlans,
+             weeklyPlansBlockedUntilEpochMillis, temporaryAllowedUntilEpochMillis
     }
 
     init(enabled: Bool = false, revision: Int64 = 0, blockedDomains: [WebFilterRule] = [],
          mode: WebFilterMode = .blockSelected, allowedDomains: [WebFilterRule] = [],
          appRules: [AppNetworkRule] = [],
+         weeklyPlans: [WeeklyAccessPlan] = [], weeklyPlansBlockedUntilEpochMillis: Int64? = nil,
          temporaryAllowedUntilEpochMillis: Int64? = nil) {
         self.enabled = enabled
         self.revision = revision
@@ -40,6 +98,8 @@ struct WebFilterConfiguration: Codable, Equatable {
         self.mode = mode
         self.allowedDomains = allowedDomains
         self.appRules = appRules
+        self.weeklyPlans = weeklyPlans
+        self.weeklyPlansBlockedUntilEpochMillis = weeklyPlansBlockedUntilEpochMillis
         self.temporaryAllowedUntilEpochMillis = temporaryAllowedUntilEpochMillis
     }
 
@@ -51,6 +111,8 @@ struct WebFilterConfiguration: Codable, Equatable {
         mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
         allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
         appRules = try container.decodeIfPresent([AppNetworkRule].self, forKey: .appRules) ?? []
+        weeklyPlans = try container.decodeIfPresent([WeeklyAccessPlan].self, forKey: .weeklyPlans) ?? []
+        weeklyPlansBlockedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .weeklyPlansBlockedUntilEpochMillis)
         temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
     }
 }
@@ -79,6 +141,7 @@ struct AppNetworkRule: Codable, Equatable {
     let teamIdentifier: String?
     let displayName: String
     let access: AppNetworkAccess
+    var weeklyPlanId: String? = nil
 
     /// 团队 ID 必须一致（防止同名标识符冒充）；签名标识符相等，或以"标识符."开头——
     /// 后者连带管住同前缀的辅助进程（com.valvesoftware.steam.helper），又不会误中
@@ -119,8 +182,8 @@ struct WebFilterAccessRequest: Codable, Equatable {
 }
 
 struct WebFilterPolicySnapshot: Codable, Equatable {
-    /// 3：加入软件联网规则（appRules）。服务端据此判断能不能保存软件规则
-    static let schemaVersion = 3
+    /// 4：加入按对象关联的每周开放计划。
+    static let schemaVersion = 4
 
     let schemaVersion: Int
     let enabled: Bool
@@ -129,6 +192,8 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
     let mode: WebFilterMode
     let allowedDomains: [WebFilterRule]
     let appRules: [AppNetworkRule]
+    let weeklyPlans: [WeeklyAccessPlan]
+    let weeklyPlansBlockedUntilEpochMillis: Int64?
     let temporaryAllowedUntilEpochMillis: Int64?
     let managementHost: String?
     let managementAppIdentifier: String?
@@ -145,7 +210,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, enabled, revision, blockedDomains, mode, allowedDomains, appRules,
-             temporaryAllowedUntilEpochMillis, managementHost, managementAppIdentifier, appliedAt
+             weeklyPlans, weeklyPlansBlockedUntilEpochMillis, temporaryAllowedUntilEpochMillis, managementHost, managementAppIdentifier, appliedAt
     }
 
     init(
@@ -162,6 +227,8 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         self.mode = configuration.mode
         self.allowedDomains = configuration.allowedDomains
         self.appRules = configuration.appRules
+        self.weeklyPlans = configuration.weeklyPlans
+        self.weeklyPlansBlockedUntilEpochMillis = configuration.weeklyPlansBlockedUntilEpochMillis
         self.temporaryAllowedUntilEpochMillis = configuration.temporaryAllowedUntilEpochMillis
         self.managementHost = managementHost
         self.managementAppIdentifier = managementAppIdentifier
@@ -180,6 +247,8 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         mode = try container.decodeIfPresent(WebFilterMode.self, forKey: .mode) ?? .blockSelected
         allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
         appRules = try container.decodeIfPresent([AppNetworkRule].self, forKey: .appRules) ?? []
+        weeklyPlans = try container.decodeIfPresent([WeeklyAccessPlan].self, forKey: .weeklyPlans) ?? []
+        weeklyPlansBlockedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .weeklyPlansBlockedUntilEpochMillis)
         temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
         managementHost = try container.decodeIfPresent(String.self, forKey: .managementHost)
         managementAppIdentifier = try container.decodeIfPresent(String.self, forKey: .managementAppIdentifier)
@@ -197,6 +266,8 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
             && lhs.mode == rhs.mode
             && lhs.allowedDomains == rhs.allowedDomains
             && lhs.appRules == rhs.appRules
+            && lhs.weeklyPlans == rhs.weeklyPlans
+            && lhs.weeklyPlansBlockedUntilEpochMillis == rhs.weeklyPlansBlockedUntilEpochMillis
             && lhs.temporaryAllowedUntilEpochMillis == rhs.temporaryAllowedUntilEpochMillis
             && lhs.managementHost == rhs.managementHost
             && lhs.managementAppIdentifier == rhs.managementAppIdentifier
@@ -216,6 +287,23 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         temporaryAllowedUntilEpochMillis.map { now.timeIntervalSince1970 * 1000 < Double($0) } ?? false
     }
 
+    func isAllowed(planId: String?, at now: Date) -> Bool {
+        if let blockedUntil = weeklyPlansBlockedUntilEpochMillis,
+           blockedUntil == -1 || now.timeIntervalSince1970 * 1000 < Double(blockedUntil) { return false }
+        if isTemporarilyAllowed(at: now) { return true }
+        return weeklyPlans.first { $0.id == planId }?.isOpen(at: now) ?? false
+    }
+
+    func nextReevaluation(after now: Date) -> Date? {
+        guard enabled else { return nil }
+        var dates = weeklyPlans.compactMap { $0.nextBoundary(after: now) }
+        for deadline in [temporaryAllowedUntilEpochMillis, weeklyPlansBlockedUntilEpochMillis].compactMap({ $0 }) {
+            let date = Date(timeIntervalSince1970: Double(deadline) / 1000)
+            if date > now { dates.append(date) }
+        }
+        return dates.min()
+    }
+
     /// 软件规则的结论。系统程序和 BigDaddy 自己永远不受软件规则约束（服务端也会拒绝这类规则，
     /// 这里是执行端的兜底）。
     func appVerdict(for identity: AppIdentity?, at now: Date = Date()) -> AppNetworkVerdict {
@@ -224,7 +312,7 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
               let rule = appRules.first(where: { $0.matches(identity) }) else { return .none }
         switch rule.access {
         case .never: return .block
-        case .agreement: return isTemporarilyAllowed(at: now) ? .bypass : .block
+        case .agreement: return isAllowed(planId: rule.weeklyPlanId, at: now) ? .bypass : .block
         case .always: return .bypass
         }
     }
@@ -239,7 +327,12 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
         if alwaysBlockedMatcher.matches(candidate) { return true }
         let app = appVerdict(for: identity, at: now)
         if app == .block { return true }
-        if entertainmentMatcher.matches(candidate) { return !isTemporarilyAllowed(at: now) }
+        if entertainmentMatcher.matches(candidate) {
+            let matching = blockedDomains.first { rule in
+                rule.category == "ENTERTAINMENT" && DomainMatcher(rules: [rule]).matches(candidate)
+            }
+            return !isAllowed(planId: matching?.weeklyPlanId, at: now)
+        }
         if app == .bypass { return false }
         return mode == .allowSelected && !allowedMatcher.matches(candidate)
     }
@@ -376,6 +469,8 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     let allowedDomains: [WebFilterRule]
     let allowedRuleCount: Int
     let appRules: [AppNetworkRule]
+    let weeklyPlans: [WeeklyAccessPlan]
+    let weeklyPlansBlockedUntilEpochMillis: Int64?
     let temporaryAllowedUntilEpochMillis: Int64?
     let accessRequests: [WebFilterAccessRequest]
     let appActivity: [AppNetworkActivity]
@@ -397,7 +492,8 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case policySchemaVersion, appliedRevision, ruleCount, blockedDomains, mode, allowedDomains,
-             allowedRuleCount, appRules, temporaryAllowedUntilEpochMillis, accessRequests, appActivity,
+             allowedRuleCount, appRules, weeklyPlans, weeklyPlansBlockedUntilEpochMillis,
+             temporaryAllowedUntilEpochMillis, accessRequests, appActivity,
              enforcementEnabled, appliedAt, providerStartedAt
     }
 
@@ -416,6 +512,8 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
         allowedDomains = policy.allowedDomains
         allowedRuleCount = policy.allowedDomains.count
         appRules = policy.appRules
+        weeklyPlans = policy.weeklyPlans
+        weeklyPlansBlockedUntilEpochMillis = policy.weeklyPlansBlockedUntilEpochMillis
         temporaryAllowedUntilEpochMillis = policy.temporaryAllowedUntilEpochMillis
         self.accessRequests = accessRequests
         self.appActivity = appActivity
@@ -428,7 +526,9 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     /// 语义补齐，保住策略回执；白名单能力仍由 policySchemaVersion=0 让服务端安全地拒绝。
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        policySchemaVersion = try container.decodeIfPresent(Int.self, forKey: .policySchemaVersion)
+        let reportedSchema = try container.decodeIfPresent(Int.self, forKey: .policySchemaVersion)
+        // Older extensions echo the incoming schema number even when they cannot read weekly plans.
+        policySchemaVersion = (reportedSchema ?? 0) >= 4 && !container.contains(.weeklyPlans) ? 3 : reportedSchema
         appliedRevision = try container.decode(Int64.self, forKey: .appliedRevision)
         ruleCount = try container.decode(Int.self, forKey: .ruleCount)
         blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)
@@ -436,6 +536,8 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
         allowedDomains = try container.decodeIfPresent([WebFilterRule].self, forKey: .allowedDomains) ?? []
         allowedRuleCount = try container.decodeIfPresent(Int.self, forKey: .allowedRuleCount) ?? allowedDomains.count
         appRules = try container.decodeIfPresent([AppNetworkRule].self, forKey: .appRules) ?? []
+        weeklyPlans = try container.decodeIfPresent([WeeklyAccessPlan].self, forKey: .weeklyPlans) ?? []
+        weeklyPlansBlockedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .weeklyPlansBlockedUntilEpochMillis)
         temporaryAllowedUntilEpochMillis = try container.decodeIfPresent(Int64.self, forKey: .temporaryAllowedUntilEpochMillis)
         accessRequests = try container.decodeIfPresent([WebFilterAccessRequest].self, forKey: .accessRequests) ?? []
         appActivity = try container.decodeIfPresent([AppNetworkActivity].self, forKey: .appActivity) ?? []
@@ -452,6 +554,8 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
             && allowedDomains == policy.allowedDomains
             && allowedRuleCount == policy.allowedDomains.count
             && appRules == policy.appRules
+            && weeklyPlans == policy.weeklyPlans
+            && weeklyPlansBlockedUntilEpochMillis == policy.weeklyPlansBlockedUntilEpochMillis
             && temporaryAllowedUntilEpochMillis == policy.temporaryAllowedUntilEpochMillis
             && enforcementEnabled == policy.enabled
     }

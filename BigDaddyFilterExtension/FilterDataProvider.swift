@@ -125,6 +125,7 @@ final class FilterDataProvider: NEFilterDataProvider {
     private var lastAppActivityPublish = Date.distantPast
     private let identityResolver = AppIdentityResolver()
     private var nextFlowSequence: UInt64 = 0
+    private var boundaryWork: DispatchWorkItem?
     private var configurationObservation: NSKeyValueObservation?
     /// 回执服务端。主 App 靠它知道"provider 到底应用了哪个 revision"，家长端的
     /// "实际版本 / 已生效"整列信息都来自这里。取不到 mach 服务名（Info.plist 没写
@@ -154,6 +155,8 @@ final class FilterDataProvider: NEFilterDataProvider {
         completionHandler: @escaping () -> Void
     ) {
         configurationObservation = nil
+        boundaryWork?.cancel()
+        boundaryWork = nil
         policyLock.lock()
         trackedFlows.removeAll()
         accessRequests.removeAll()
@@ -398,12 +401,19 @@ final class FilterDataProvider: NEFilterDataProvider {
         let isStillCurrent = policy == nextPolicy
         policyLock.unlock()
         guard isStillCurrent else { return }
-        if let deadline = nextPolicy.temporaryAllowedUntilEpochMillis {
-            let delay = Double(deadline) / 1000 - Date().timeIntervalSince1970
-            if delay > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    self?.reloadPolicy()
-                }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.policyLock.lock()
+            let current = self.policy == nextPolicy
+            self.policyLock.unlock()
+            guard current else { return }
+            self.boundaryWork?.cancel()
+            self.boundaryWork = nil
+            let now = Date()
+            if let boundary = nextPolicy.nextReevaluation(after: now) {
+                let work = DispatchWorkItem { [weak self] in self?.reloadPolicy() }
+                self.boundaryWork = work
+                DispatchQueue.main.asyncAfter(wallDeadline: .now() + boundary.timeIntervalSince(now), execute: work)
             }
         }
         publishAcknowledgement(for: nextPolicy)

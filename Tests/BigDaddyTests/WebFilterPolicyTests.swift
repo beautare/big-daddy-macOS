@@ -331,7 +331,7 @@ final class WebFilterPolicyTests: XCTestCase {
         let policy = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .never)])
         let decoded = WebFilterPolicyTransport.policy(from: try WebFilterPolicyTransport.vendorConfiguration(for: policy))
         XCTAssertEqual(decoded, policy)
-        XCTAssertEqual(decoded?.schemaVersion, 3)
+        XCTAssertEqual(decoded?.schemaVersion, 4)
 
         let acknowledgement = WebFilterProviderAcknowledgement(policy: policy)
         XCTAssertTrue(acknowledgement.confirms(policy))
