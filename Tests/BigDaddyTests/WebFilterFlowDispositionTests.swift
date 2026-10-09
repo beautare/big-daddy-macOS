@@ -84,6 +84,33 @@ final class WebFilterFlowDispositionTests: XCTestCase {
         )
     }
 
+    func testAllowedAppsCannotBypassWebsiteRestrictionsThroughUnidentifiedQUIC() {
+        let now = Date(timeIntervalSince1970: 1791194400) // Monday 18:00 Asia/Shanghai
+        let identity = AppIdentity(signingIdentifier: "com.example.app", teamIdentifier: "ABCDEFGHIJ", isPlatformBinary: false)
+        for access in [AppNetworkAccess.always, .agreement] {
+            let plan = WeeklyAccessPlan(id: "weekly", name: "Weekly", enabled: true, timeZone: "Asia/Shanghai",
+                windows: [WeeklyAccessWindow(daysOfWeek: [1], startMinute: 1080, endMinute: 1200)])
+            var config = WebFilterConfiguration(enabled: true, blockedDomains: [
+                WebFilterRule(domain: "blocked.example", includeSubdomains: true)
+            ], appRules: [AppNetworkRule(signingIdentifier: identity.signingIdentifier,
+                teamIdentifier: identity.teamIdentifier, displayName: "App", access: access, weeklyPlanId: plan.id)], weeklyPlans: [plan])
+            var policy = WebFilterPolicySnapshot(configuration: config, isDeviceBound: true, appliedAt: now)
+            XCTAssertEqual(policy.appVerdict(for: identity, at: now), .bypass)
+            XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(hostname: nil, isLikelyQUIC: true,
+                identity: identity, under: policy, at: now))
+            XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(hostname: nil, isLikelyQUIC: false,
+                identity: identity, under: policy, at: now))
+            XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(hostname: "blocked.example", isLikelyQUIC: true,
+                identity: identity, under: policy, at: now))
+            XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(hostname: "allowed.example", isLikelyQUIC: true,
+                identity: identity, under: policy, at: now))
+            config.enabled = false
+            policy = WebFilterPolicySnapshot(configuration: config, isDeviceBound: true, appliedAt: now)
+            XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(hostname: nil, isLikelyQUIC: true,
+                identity: identity, under: policy, at: now))
+        }
+    }
+
     private func makePolicy(enabled: Bool, rules: [WebFilterRule]) -> WebFilterPolicySnapshot {
         WebFilterPolicySnapshot(
             configuration: WebFilterConfiguration(

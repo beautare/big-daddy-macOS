@@ -416,7 +416,8 @@ enum WebFilterFlowDisposition {
         // 判不出主机名时，软件规则仍然能下结论：游戏的裸 IP / 自定义 UDP 连接正是靠这里管住的。
         switch policy.appVerdict(for: identity, at: now) {
         case .block: return true
-        case .bypass: return false
+        // 软件放行仍须遵守已列出的网站限制；没有网站限制时保留其 QUIC 联网能力。
+        case .bypass: return isLikelyQUIC && !policy.blockedDomains.isEmpty
         case .none: break
         }
         // 判不出主机名的 QUIC。这些流多半是在策略还没启用时放行的（那期间我们不掐 QUIC，

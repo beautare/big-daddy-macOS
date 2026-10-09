@@ -262,9 +262,10 @@ final class FilterDataProvider: NEFilterDataProvider {
             trackedFlows[key]?.sawQUIC = true
             policyLock.unlock()
         }
-        // 随时可以联网的软件不掐 QUIC：家长的意思是"这个软件联网别管"。代价是它经 QUIC
-        // 访问「任何时候都不行」的网站时认不出主机名、拦不住——这类软件通常是网课工具，可以接受。
-        if policy.enabled, quic, !tracked.bypassesDefault {
+        // 新连接和已建立连接使用相同判定；软件放行不能绕过网站规则。
+        if quic && WebFilterFlowDisposition.shouldTerminate(
+            hostname: nil, isLikelyQUIC: true, identity: tracked.identity, under: policy
+        ) {
             forget(key)
             return .drop()
         }
