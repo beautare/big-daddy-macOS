@@ -189,6 +189,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// 下拉旗帜管理器，懒加载（首次需要展示时才按显示器创建 NSPanel）。
     private var timeFlag: TimeAgreementFlag?
+    /// 家长与孩子的短消息（旗帜、对话窗口、拉取时机）。
+    private lazy var messageCenter = MessageCenter(client: client)
     /// 驱动倒计时/里程碑检查的 1 秒定时器，仅在有进行中的约定时存活。
     private var timeSessionTimer: Timer?
     /// 当前正在跟踪的会话 id，用于识别"变了"（新开/被替换/被中断/到点清空）。
@@ -336,6 +338,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             forName: BigDaddyClient.timeSessionSyncedNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in self?.syncTimeSessionState() }
+        }
+        // 短消息：SYNC_MESSAGES 门铃或配置里的 revision 变了，就去拉一次对话。
+        messageCenter.anchorProvider = { [weak self] in self?.statusItem }
+        messageCenter.timeFlagProvider = { [weak self] in self?.timeFlag }
+        messageCenter.onChange = { [weak self] in self?.rebuildMenu() }
+        NotificationCenter.default.addObserver(
+            forName: BigDaddyClient.messagesChangedNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.messageCenter.refresh() }
         }
         // 监听凭据失效（401）通知：解绑或服务端凭据失效时立即触发 pollConfigForChildVisibility()，
         // 将解绑感知从最长 60 秒轮询压到秒级
@@ -576,6 +587,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             timeSessionMenuItem = item
         } else {
             timeSessionMenuItem = nil
+        }
+
+        // 家长消息 / 申请时间：家长把通信和申请都关掉时整项不出现，不放一个灰掉的入口
+        // 让孩子干着急。
+        if let messagesTitle = messageCenter.menuTitle {
+            menu.addItem(NSMenuItem(title: messagesTitle, action: #selector(openMessages), keyEquivalent: ""))
+            menu.addItem(.separator())
         }
 
         let filter = client.config.webFilter
@@ -2301,6 +2319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if boundChanged && !client.config.bound {
                 // 1. 重置本地配置中的敏感业务数据（家长通知渠道、网页过滤黑名单等）
                 client.resetConfigOnUnbind()
+                messageCenter.reset()
                 // 2. 清空本地积压的离线心跳/补发队列
                 PendingQueue.clear()
                 // 3. 清空本地时间约定锚点
@@ -2461,6 +2480,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             flag.presentTimeUp(anchor: statusItem, note: session.note, duration: 5 * 60)
         }
         rebuildMenu()
+    }
+
+    @objc private func openMessages() {
+        messageCenter.openWindow()
+        messageCenter.refresh()
     }
 
     /// 把「我知道了」接到"收回提醒 + 上报回执"上。

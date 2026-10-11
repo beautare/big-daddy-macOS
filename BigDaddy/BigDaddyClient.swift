@@ -141,6 +141,9 @@ struct ClientConfig: Codable, Equatable {
     ///
     /// 未绑定 / 旧后端时为 nil，四处都不显示这一行。
     var boundToEmailMasked: String? = nil
+    /// 家长与孩子短消息的摘要（模式、申请开关、revision）。旧后端不下发时为 nil，
+    /// 菜单里不出现消息入口，也不去拉对话。
+    var messaging: ClientMessagingSummary? = nil
 
     init() {
     }
@@ -166,6 +169,7 @@ struct ClientConfig: Codable, Equatable {
         continuityMode = try container.decodeIfPresent(Bool.self, forKey: .continuityMode) ?? false
         continuityModeUpdatedAt = try container.decodeIfPresent(String.self, forKey: .continuityModeUpdatedAt)
         boundToEmailMasked = try container.decodeIfPresent(String.self, forKey: .boundToEmailMasked)
+        messaging = try container.decodeIfPresent(ClientMessagingSummary.self, forKey: .messaging)
     }
 }
 
@@ -220,6 +224,9 @@ final class BigDaddyClient: @unchecked Sendable {
     static var lastSharedInstance: BigDaddyClient?
     static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
     static let credentialsInvalidNotification = Notification.Name("BigDaddyCredentialsInvalid")
+    /// 短消息可能有变化（SYNC_MESSAGES 门铃，或配置里的 revision 与上次拉到的不同）。
+    /// 收到后由 MessageCenter 去拉一次对话；通知本身不带任何内容。
+    static let messagesChangedNotification = Notification.Name("BigDaddyMessagesChanged")
 
     let baseURL = URL(string: Bundle.main.object(forInfoDictionaryKey: "BigDaddyAPIBaseURL") as? String ?? "http://localhost:8009/api/v1")!
     /// 家长家长中心地址：正式 .app 由打包脚本写入 Info.plist（BigDaddyDashboardBaseURL），
@@ -242,6 +249,9 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 倒计时却毫无提示。任何一次成功的 refreshConfig() 都会把它翻回 false——不论那次
     /// 响应里到底还有没有 timeSession，都算是一次权威确认。
     var timeSessionAnchorIsFromDisk = false
+    /// 最近一次成功拉取对话时服务端给的 revision。只在内存里：重启后为 nil，第一次
+    /// 配置刷新必然触发一次拉取——这同时也让服务端知道"这台 Mac 的版本支持消息"。
+    var lastFetchedMessagesRevision: String?
     /// 连续拿不到配置的轮询次数，成功一次就清零。存在的理由只有一个：限网
     /// 生效期间，如果这台 Mac 长时间连不上后端，孩子没法知道"限制会不会自动解除"——
     /// 答案是不会（也不该会，见 AppDelegate 里那条提示的注释），但沉默本身会诱使孩子
@@ -609,6 +619,9 @@ final class BigDaddyClient: @unchecked Sendable {
             ContinuityModePreference.overrideBaseline = nil
         }
         ContinuityModeController.sync(enabled: config.continuityMode && ContinuityModePreference.isEnabled)
+        if remote.bound, let messaging = remote.messaging, messaging.revision != lastFetchedMessagesRevision {
+            NotificationCenter.default.post(name: Self.messagesChangedNotification, object: self)
+        }
         return config != previous ? .successChanged : .successUnchanged
     }
 
@@ -623,6 +636,8 @@ final class BigDaddyClient: @unchecked Sendable {
         config.continuityMode = false
         config.continuityModeUpdatedAt = nil
         config.boundToEmailMasked = nil
+        config.messaging = nil
+        lastFetchedMessagesRevision = nil
         
         // newly added fields
         config.aiEnabled = false
@@ -2516,6 +2531,11 @@ final class BigDaddyClient: @unchecked Sendable {
         // 逐条 ack 但只需要刷新一次配置，不必每条各刷一次。
         let timeSessionCommands = response.data.filter { $0.type == "SYNC_TIME_SESSION" }
         let configCommands = response.data.filter { $0.type == "SYNC_CONFIG" }
+        // 短消息门铃：payload 为空，不需要刷新配置——模式和申请开关会跟着对话一起回来。
+        let messageCommands = response.data.filter { $0.type == "SYNC_MESSAGES" }
+        if !messageCommands.isEmpty {
+            NotificationCenter.default.post(name: Self.messagesChangedNotification, object: self)
+        }
         // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在家长中心改完压缩质量/
         // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
         // 可能落后 60 秒配置轮询）的旧配置，家长对比时就会觉得"改了质量没区别/压缩没生效"。
@@ -2548,6 +2568,9 @@ final class BigDaddyClient: @unchecked Sendable {
                 NotificationCenter.default.post(name: Self.timeSessionSyncedNotification, object: nil)
             }
         }
+        for command in messageCommands {
+            await ack(commandId: command.commandId, status: "SUCCEEDED", message: "Messages sync requested")
+        }
         let configSynced = refreshResult?.succeeded == true
         for command in configCommands {
             await ack(
@@ -2577,6 +2600,44 @@ final class BigDaddyClient: @unchecked Sendable {
     func reportTimeSessionAcknowledged(_ sessionId: String) async {
         let body: [String: Any] = ["sessionId": sessionId]
         _ = try? await request(path: "/bigdaddy/client/time-session/acknowledged", method: "POST", body: body, signed: true)
+    }
+
+    // MARK: - 家长与孩子的短消息
+
+    /// 拉一次对话。服务端顺带把家长消息标成"已送达"。失败返回 nil，由下一次门铃或
+    /// 配置轮询再试——消息不是实时性到秒的东西，不值得为它做重试循环。
+    func fetchMessages() async -> ChatConversation? {
+        guard config.bound, !credentialsInvalid else { return nil }
+        guard let data = try? await request(path: "/bigdaddy/client/messages", method: "GET", body: nil, signed: true),
+              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ChatConversation>.self, from: data) else {
+            return nil
+        }
+        lastFetchedMessagesRevision = response.data.revision
+        return response.data
+    }
+
+    /// 发一条文字或一次时间申请。失败时抛出的错误里 serverMessage 是服务端的错误码
+    /// （NO_PARENT_MESSAGE、RATE_LIMITED……），由 ChatText 翻译给孩子看。
+    func sendChildMessage(kind: String, text: String?, minutes: Int?) async throws -> ChatConversation {
+        var body: [String: Any] = ["kind": kind]
+        if let text { body["text"] = text }
+        if let minutes { body["minutes"] = minutes }
+        let data = try await request(path: "/bigdaddy/client/messages", method: "POST", body: body, signed: true)
+        let response = try JSONDecoder.bigDaddy.decode(ApiResponse<ChatConversation>.self, from: data)
+        lastFetchedMessagesRevision = response.data.revision
+        return response.data
+    }
+
+    /// 孩子点了「知道了」「回复」或打开了对话窗口。fire-and-forget 的语义同
+    /// reportTimeSessionAcknowledged：界面已经收起，回执丢了也不该打扰孩子。
+    func markMessagesRead(_ ids: [String]) async -> ChatConversation? {
+        guard !ids.isEmpty else { return nil }
+        guard let data = try? await request(path: "/bigdaddy/client/messages/read", method: "POST", body: ["ids": ids], signed: true),
+              let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ChatConversation>.self, from: data) else {
+            return nil
+        }
+        lastFetchedMessagesRevision = response.data.revision
+        return response.data
     }
 
     func verifyExitPassword(_ value: String) async -> Bool {

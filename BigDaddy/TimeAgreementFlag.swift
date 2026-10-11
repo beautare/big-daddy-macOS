@@ -58,6 +58,13 @@ final class TimeAgreementFlag {
 
     // MARK: - 公开接口
 
+    /// 某块屏幕上当前可见的旗帜 frame。消息旗帜（MessageFlag）据此排到它下面，
+    /// 两块面板不会叠在一起。
+    func visiblePanelFrame(on screen: NSScreen) -> NSRect? {
+        guard let panel = screenPanels[Self.screenID(screen)]?.panel, panel.isVisible else { return nil }
+        return panel.frame
+    }
+
     /// 每次可见期间调用，只刷新文案，不改变可见性/位置。
     func update(remainingSeconds: Int, note: String?) {
         for screenPanel in screenPanels.values {
@@ -266,7 +273,7 @@ final class TimeAgreementFlag {
     ///
     /// `NSImage(size:flipped:drawingHandler:)` 的绘制块在每次需要该图时按当时尺寸重新
     /// 执行，因此这里画的是"当前请求的 rect"而不是写死的常量。
-    private static func roundedMaskImage(cornerRadius radius: CGFloat) -> NSImage {
+    static func roundedMaskImage(cornerRadius radius: CGFloat) -> NSImage {
         let side = radius * 2 + 1
         let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
             NSColor.black.setFill()
@@ -280,7 +287,7 @@ final class TimeAgreementFlag {
 
     // MARK: - 面板构建与定位
 
-    private static func screenID(_ screen: NSScreen) -> CGDirectDisplayID {
+    static func screenID(_ screen: NSScreen) -> CGDirectDisplayID {
         let key = NSDeviceDescriptionKey("NSScreenNumber")
         return (screen.deviceDescription[key] as! NSNumber).uint32Value
     }
@@ -510,7 +517,7 @@ final class TimeAgreementFlag {
     ///
     /// AppKit 只暴露状态项的一个 button.window。对其他显示器，保留图标相对屏幕右上角
     /// 的偏移量，使旗帜仍从各自菜单栏的同一水平位置下拉。
-    private static func anchorButtonFrame(anchor: NSStatusItem, on targetScreen: NSScreen) -> NSRect? {
+    static func anchorButtonFrame(anchor: NSStatusItem, on targetScreen: NSScreen) -> NSRect? {
         let menuBarHidden = NSApp.currentSystemPresentationOptions.contains(.autoHideMenuBar)
             || NSApp.currentSystemPresentationOptions.contains(.hideMenuBar)
         guard !menuBarHidden,
