@@ -135,10 +135,15 @@ final class MessageCenter {
             if message.requestStatus == "DECLINED" {
                 flag.presentNotice(
                     title: Localization.string(zh: "时间申请", en: "Time request"),
-                    body: Localization.string(
-                        zh: "这次家长没有同意你申请的 \(message.minutes ?? 0) 分钟",
-                        en: "Your parent said no to \(message.minutes ?? 0) more minutes this time"
-                    ),
+                    body: message.isExtension
+                        ? Localization.string(
+                            zh: "这次家长没有同意延长 \(message.minutes ?? 0) 分钟",
+                            en: "Your parent said no to extending by \(message.minutes ?? 0) min this time"
+                        )
+                        : Localization.string(
+                            zh: "这次家长没有同意你申请的 \(message.minutes ?? 0) 分钟",
+                            en: "Your parent said no to \(message.minutes ?? 0) more minutes this time"
+                        ),
                     symbol: "hourglass", tint: .secondaryLabelColor,
                     anchor: anchor, avoiding: timeFlagProvider?()
                 )

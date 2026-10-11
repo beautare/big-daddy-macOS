@@ -118,7 +118,9 @@ struct ChatHistoryView: View {
     @ViewBuilder
     private var timeRequest: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(Localization.string(zh: "想多用一会儿电脑？向家长申请", en: "Need more time? Ask your parent"))
+            Text(conversation.requestWillExtend
+                 ? Localization.string(zh: "时间快到了？向家长申请延长", en: "Almost out of time? Ask for more")
+                 : Localization.string(zh: "想多用一会儿电脑？向家长申请", en: "Need more time? Ask your parent"))
                 .font(.subheadline.weight(.semibold))
             if conversation.canRequestTime {
                 Picker("", selection: $minutes) {
@@ -133,7 +135,9 @@ struct ChatHistoryView: View {
                     // 孩子赶时间也能一键发出，想多说两句就改掉它。
                     TextField(Localization.string(zh: "理由（必填）", en: "Reason (required)"), text: $reason)
                         .textFieldStyle(.roundedBorder)
-                    Button(Localization.string(zh: "发送申请", en: "Ask")) {
+                    Button(conversation.requestWillExtend
+                           ? Localization.string(zh: "申请延长", en: "Ask to extend")
+                           : Localization.string(zh: "发送申请", en: "Ask")) {
                         let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
                         Task {
                             if await model.request(minutes: minutes, reason: trimmed) {
@@ -200,13 +204,15 @@ private struct ChatRow: View {
 
     private var requestCard: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(Localization.string(zh: "申请 \(message.minutes ?? 0) 分钟", en: "Asked for \(message.minutes ?? 0) min"),
+            Label(message.isExtension
+                  ? Localization.string(zh: "申请延长 \(message.minutes ?? 0) 分钟", en: "Asked for \(message.minutes ?? 0) more min")
+                  : Localization.string(zh: "申请 \(message.minutes ?? 0) 分钟", en: "Asked for \(message.minutes ?? 0) min"),
                   systemImage: "hourglass")
                 .font(.callout.weight(.semibold))
             if let text = message.text, !text.isEmpty {
                 Text(text).font(.callout)
             }
-            Text(ChatText.requestStatus(message.requestStatus))
+            Text(ChatText.requestStatus(message.requestStatus, extension: message.isExtension))
                 .font(.caption)
                 .foregroundColor(statusColor)
         }

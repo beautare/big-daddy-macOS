@@ -33,9 +33,12 @@ struct ChatMessage: Codable, Equatable, Identifiable {
     let deliveredAt: Int64?
     let readAt: Int64?
     let decidedAt: Int64?
+    /// 仅 TIME_REQUEST：START = 新开一段；EXTEND = 在进行中的约定上延长
+    let requestMode: String?
 
     var isFromParent: Bool { sender == "PARENT" }
     var isTimeRequest: Bool { kind == "TIME_REQUEST" }
+    var isExtension: Bool { requestMode == "EXTEND" }
     var sentDate: Date { Date(timeIntervalSince1970: TimeInterval(sentAt) / 1000) }
     var expiresDate: Date { Date(timeIntervalSince1970: TimeInterval(expiresAt) / 1000) }
 }
@@ -51,6 +54,8 @@ struct ChatConversation: Codable, Equatable {
     var replyWindowEndsAt: Int64?
     var repliesLeft: Int?
     var canRequestTime: Bool = false
+    /// 此刻有进行中的约定：这次申请的是"延长"
+    var requestWillExtend: Bool = false
     var timeRequestBlockedReason: String?
     var timeRequestRetryAt: Int64?
     var requestMinuteOptions: [Int] = [5, 10, 15, 20, 30]
@@ -70,6 +75,7 @@ struct ChatConversation: Codable, Equatable {
         replyWindowEndsAt = try c.decodeIfPresent(Int64.self, forKey: .replyWindowEndsAt)
         repliesLeft = try c.decodeIfPresent(Int.self, forKey: .repliesLeft)
         canRequestTime = try c.decodeIfPresent(Bool.self, forKey: .canRequestTime) ?? false
+        requestWillExtend = try c.decodeIfPresent(Bool.self, forKey: .requestWillExtend) ?? false
         timeRequestBlockedReason = try c.decodeIfPresent(String.self, forKey: .timeRequestBlockedReason)
         timeRequestRetryAt = try c.decodeIfPresent(Int64.self, forKey: .timeRequestRetryAt)
         requestMinuteOptions = try c.decodeIfPresent([Int].self, forKey: .requestMinuteOptions) ?? [5, 10, 15, 20, 30]
@@ -113,6 +119,16 @@ enum ChatText {
                 return Localization.string(zh: "\(minutes) 分钟后可以再申请", en: "You can ask again in \(minutes) min")
             }
             return Localization.string(zh: "稍后可以再申请", en: "You can ask again later")
+        case "SESSION_TOO_EARLY":
+            // 约定还剩不少时间：最后 10 分钟才能申请延长
+            if let retryAt = conversation.timeRequestRetryAt {
+                let minutes = max(1, Int(ceil((Double(retryAt) / 1000 - Date().timeIntervalSince1970) / 60)))
+                return Localization.string(
+                    zh: "约定还没到最后 10 分钟，\(minutes) 分钟后可以申请延长",
+                    en: "You can ask for more time in the last 10 minutes — in \(minutes) min"
+                )
+            }
+            return Localization.string(zh: "约定的最后 10 分钟可以申请延长", en: "You can ask for more time in the last 10 minutes")
         case "TIME_REQUEST_DISABLED":
             return Localization.string(zh: "家长没有开启时间申请", en: "Time requests are turned off")
         case "MESSAGE_TOO_LONG":
@@ -126,8 +142,9 @@ enum ChatText {
         }
     }
 
-    static func requestStatus(_ status: String?) -> String {
+    static func requestStatus(_ status: String?, extension isExtension: Bool = false) -> String {
         switch status {
+        case "APPROVED" where isExtension: return Localization.string(zh: "家长同意了，约定已延长", en: "Approved — time extended")
         case "APPROVED": return Localization.string(zh: "家长同意了", en: "Approved")
         case "DECLINED": return Localization.string(zh: "这次没有同意", en: "Not this time")
         case "EXPIRED": return Localization.string(zh: "没等到回复，已失效", en: "No answer — expired")
