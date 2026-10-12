@@ -79,13 +79,13 @@ final class MessageFlag: NSObject, NSTextFieldDelegate {
 
         iconView.image = NSImage(systemSymbolName: "bubble.left.fill", accessibilityDescription: nil)
         iconView.contentTintColor = Self.accentColor
-        captionLabel.stringValue = Localization.string(zh: "家长发来消息", en: "From your parent")
+        captionLabel.stringValue = Localization.string(zh: "家长留言", en: "Note from your parent")
             + " · " + ChatText.clock(message.sentDate)
         captionLabel.textColor = .secondaryLabelColor
         bodyLabel.stringValue = message.text ?? ""
         moreButton.title = moreUnread > 0
             ? Localization.string(zh: "还有 \(moreUnread) 条未读 · 查看全部", en: "\(moreUnread) more unread · View all")
-            : Localization.string(zh: "查看全部消息", en: "View all messages")
+            : Localization.string(zh: "查看全部留言", en: "View all notes")
         moreButton.isHidden = false
         self.canReply = canReply
         replyButton.isHidden = !canReply
@@ -203,7 +203,7 @@ final class MessageFlag: NSObject, NSTextFieldDelegate {
                 return
             }
             self.replyField.stringValue = ""
-            self.captionLabel.stringValue = Localization.string(zh: "已发送 ✓", en: "Sent ✓")
+            self.captionLabel.stringValue = Localization.string(zh: "已留言，家长看到后会回复 ✓", en: "Sent — your parent will reply when they see it ✓")
             self.captionLabel.textColor = .systemGreen
             self.setReplying(false)
             self.replyButton.isHidden = true
@@ -406,7 +406,7 @@ final class MessageFlag: NSObject, NSTextFieldDelegate {
         cancelButton = NSButton(title: Localization.string(zh: "取消", en: "Cancel"), target: self, action: #selector(cancelTapped))
         cancelButton.bezelStyle = .rounded
         cancelButton.isHidden = true
-        sendButton = NSButton(title: Localization.string(zh: "发送", en: "Send"), target: self, action: #selector(sendTapped))
+        sendButton = NSButton(title: Localization.string(zh: "留言", en: "Leave note"), target: self, action: #selector(sendTapped))
         sendButton.bezelStyle = .rounded
         sendButton.isHidden = true
         let spacer = NSView()

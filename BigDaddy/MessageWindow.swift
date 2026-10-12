@@ -42,7 +42,7 @@ struct ChatHistoryView: View {
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(Localization.string(zh: "和家长的消息", en: "Messages with your parent"))
+                Text(Localization.string(zh: "家长留言", en: "Notes from your parent"))
                     .font(.headline)
                 Label(ChatText.lifecycleNotice(hours: conversation.retentionHours), systemImage: "clock.arrow.circlepath")
                     .font(.caption)
@@ -57,7 +57,7 @@ struct ChatHistoryView: View {
                 ScrollView {
                     VStack(spacing: 10) {
                         if conversation.messages.isEmpty {
-                            Text(Localization.string(zh: "还没有消息", en: "No messages yet"))
+                            Text(Localization.string(zh: "还没有留言", en: "No notes yet"))
                                 .font(.callout)
                                 .foregroundColor(.secondary)
                                 .padding(.top, 40)
@@ -96,10 +96,10 @@ struct ChatHistoryView: View {
                     }
                 }
                 HStack {
-                    TextField(Localization.string(zh: "写点什么…", en: "Write something…"), text: $draft)
+                    TextField(Localization.string(zh: "给家长留言…", en: "Leave a note…"), text: $draft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(sendDraft)
-                    Button(Localization.string(zh: "发送", en: "Send"), action: sendDraft)
+                    Button(Localization.string(zh: "留言", en: "Leave note"), action: sendDraft)
                         .disabled(model.isSending || draft.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
                 if let hint = replyHint {
@@ -251,7 +251,7 @@ final class MessageWindowController: NSObject, NSWindowDelegate {
                 backing: .buffered,
                 defer: false
             )
-            window.title = Localization.string(zh: "消息", en: "Messages")
+            window.title = Localization.string(zh: "留言", en: "Notes")
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: ChatHistoryView(model: model))
             window.delegate = self

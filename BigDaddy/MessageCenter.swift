@@ -44,9 +44,9 @@ final class MessageCenter {
         let visible = summary.mode != "OFF" || summary.timeRequestEnabled || conversation?.messages.isEmpty == false
         guard visible else { return nil }
         if unread > 0 {
-            return Localization.string(zh: "💬 消息（\(unread) 条未读）…", en: "💬 Messages (\(unread) unread)…")
+            return Localization.string(zh: "💬 家长留言（\(unread) 条未读）…", en: "💬 Notes from parent (\(unread) unread)…")
         }
-        return Localization.string(zh: "💬 消息 / 申请时间…", en: "💬 Messages / Ask for time…")
+        return Localization.string(zh: "💬 家长留言 / 申请时间…", en: "💬 Parent notes / Ask for time…")
     }
 
     /// 门铃或 revision 变化时调用。并发进来的请求合并成"做完这次再做一次"。
@@ -130,7 +130,7 @@ final class MessageCenter {
         guard isNew || flag.shownMessageId == newest.id else { return }
         presentedMessageIds.formUnion(unread.map(\.id))
         if isNew {
-            AuditLog.record("MESSAGE_RECEIVED 收到家长的一条消息")
+            AuditLog.record("MESSAGE_RECEIVED 收到家长的一条留言")
         }
         flag.presentParentMessage(
             newest,
@@ -190,7 +190,7 @@ final class MessageCenter {
     private func send(text: String) async -> String? {
         do {
             let latest = try await client.sendChildMessage(kind: "TEXT", text: text, minutes: nil)
-            AuditLog.record("MESSAGE_SENT 给家长发了一条消息")
+            AuditLog.record("MESSAGE_SENT 给家长留了一条言")
             // 回复了 = 也看到了家长的消息
             presentedMessageIds.formUnion(latest.unreadParentMessages.map(\.id))
             conversation = latest

@@ -101,18 +101,18 @@ enum ChatText {
     static func blockedReason(_ code: String?, conversation: ChatConversation) -> String {
         switch code {
         case "MESSAGING_OFF":
-            return Localization.string(zh: "家长关闭了消息功能", en: "Your parent turned messages off")
+            return Localization.string(zh: "家长关闭了留言功能", en: "Your parent turned notes off")
         case "NO_PARENT_MESSAGE", "REPLY_WINDOW_CLOSED":
             return Localization.string(
-                zh: "家长发来消息后的 30 分钟内可以回复",
+                zh: "家长留言后的 30 分钟内可以回复",
                 en: "You can reply within 30 minutes after your parent writes"
             )
         case "REPLY_LIMIT_REACHED":
-            return Localization.string(zh: "这条消息的回复次数用完了", en: "No replies left for this message")
+            return Localization.string(zh: "这条留言的回复次数用完了", en: "No replies left for this note")
         case "RATE_LIMITED":
             return Localization.string(zh: "发得太快了，稍后再试", en: "Too fast — try again in a moment")
         case "REQUEST_PENDING":
-            return Localization.string(zh: "已发出申请，等家长回复…", en: "Request sent — waiting for your parent…")
+            return Localization.string(zh: "已发给家长，家长看到通知后才会处理，可能要几分钟…", en: "Sent — your parent will see it when notified, which may take a few minutes…")
         case "COOLDOWN":
             if let retryAt = conversation.timeRequestRetryAt {
                 let minutes = max(1, Int(ceil((Double(retryAt) / 1000 - Date().timeIntervalSince1970) / 60)))
@@ -148,13 +148,13 @@ enum ChatText {
         case "APPROVED": return Localization.string(zh: "家长同意了", en: "Approved")
         case "DECLINED": return Localization.string(zh: "这次没有同意", en: "Not this time")
         case "EXPIRED": return Localization.string(zh: "没等到回复，已失效", en: "No answer — expired")
-        default: return Localization.string(zh: "等待家长回复…", en: "Waiting for your parent…")
+        default: return Localization.string(zh: "已发给家长，等家长看到后处理…", en: "Sent — waiting for your parent to see it…")
         }
     }
 
     static func lifecycleNotice(hours: Int) -> String {
         Localization.string(
-            zh: "消息发出 \(hours) 小时后自动消失，消失后找不回来",
+            zh: "留言发出 \(hours) 小时后自动消失，消失后找不回来",
             en: "Messages disappear \(hours) hours after they're sent and can't be recovered"
         )
     }
