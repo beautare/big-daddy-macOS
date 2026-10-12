@@ -337,7 +337,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         NotificationCenter.default.addObserver(
             forName: BigDaddyClient.timeSessionSyncedNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.syncTimeSessionState() }
+            Task { @MainActor [weak self] in
+                self?.syncTimeSessionState()
+                // 约定开始/结束/延长都会改变孩子能不能申请、申请的是"延长"还是"新开"，
+                // 而这些变化不会让消息的 revision 变，得在这里顺带拉一次
+                self?.messageCenter.refresh()
+            }
         }
         // 短消息：SYNC_MESSAGES 门铃或配置里的 revision 变了，就去拉一次对话。
         messageCenter.anchorProvider = { [weak self] in self?.statusItem }
@@ -2469,6 +2474,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let expiredSessionId = trackedTimeSessionId
         locallyExpiredSessionId = expiredSessionId
         AuditLog.record("TIME_SESSION_EXPIRED")
+        // 到点之后再申请就是"新开一段"而不是"延长"，申请区的说法要跟着变
+        messageCenter.refresh()
         // 到点提醒。此前这里只是让已经在屏幕上的旗帜开始闪烁，读数停留在最后一次 tick
         // 算出的 "0:01"（`.rounded(.up)` 让任何不足一秒的余量都进位成 1）——孩子看到的
         // 是一个"还剩一秒"却再也不动的读数。presentTimeUp 显式写 0:00，并且在面板已被

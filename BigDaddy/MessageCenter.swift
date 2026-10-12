@@ -16,6 +16,9 @@ final class MessageCenter {
     private var fetchAgain = false
     /// 已经弹过旗帜的家长消息。只在内存里；重启后仍未读的会再弹一次，这正是想要的。
     private var presentedMessageIds = Set<String>()
+    /// "X 分钟后可以申请"到点时自动再拉一次。服务端的判定只在拉取时算一次，不重拉的话
+    /// 孩子开着窗口等，时间到了界面也不会自己变成可申请。
+    private var retryTimer: Timer?
 
     /// 拿状态栏图标和时间约定旗帜做定位参照，由 AppDelegate 注入
     var anchorProvider: (() -> NSStatusItem?)?
@@ -79,6 +82,8 @@ final class MessageCenter {
     func reset() {
         conversation = nil
         presentedMessageIds.removeAll()
+        retryTimer?.invalidate()
+        retryTimer = nil
         model.conversation = ChatConversation()
         flag.dismiss()
         window.close()
@@ -91,9 +96,22 @@ final class MessageCenter {
         let previous = conversation
         conversation = latest
         model.conversation = latest
+        scheduleRetryRefresh(latest)
         announceDecisions(previous: previous, latest: latest)
         presentNewestUnreadIfNeeded(latest)
         onChange?()
+    }
+
+    private func scheduleRetryRefresh(_ conversation: ChatConversation) {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        guard let retryAt = conversation.timeRequestRetryAt else { return }
+        let delay = max(1, TimeInterval(retryAt) / 1000 - Date().timeIntervalSince1970 + 1)
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.refresh() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        retryTimer = timer
     }
 
     /// 有没看过的家长消息就弹旗帜（窗口开着时不弹——孩子已经在看了）。
