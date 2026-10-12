@@ -178,8 +178,11 @@ final class MessageFlag: NSObject, NSTextFieldDelegate {
         send(replyField.stringValue)
     }
 
+    /// 预设文字只是填进输入框并把光标放进去：发出去的消息撤不回、也不留档，孩子常想改两个字
     @objc private func quickReplyTapped(_ sender: NSButton) {
-        send(sender.title)
+        replyField.stringValue = sender.title
+        panel?.makeFirstResponder(replyField)
+        replyField.currentEditor()?.selectedRange = NSRange(location: sender.title.utf16.count, length: 0)
     }
 
     private func send(_ raw: String) {

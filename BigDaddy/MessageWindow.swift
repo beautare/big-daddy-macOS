@@ -89,7 +89,8 @@ struct ChatHistoryView: View {
             if conversation.canSendText {
                 HStack(spacing: 6) {
                     ForEach(ChatText.quickReplies, id: \.self) { phrase in
-                        Button(phrase) { Task { _ = await model.send(phrase) } }
+                        // 预设文字只是填进输入框：发出去的消息撤不回，也不留档，孩子常想改两个字
+                        Button(phrase) { draft = phrase }
                             .controlSize(.small)
                             .disabled(model.isSending)
                     }

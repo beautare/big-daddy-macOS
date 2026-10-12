@@ -120,15 +120,15 @@ enum ChatText {
             }
             return Localization.string(zh: "稍后可以再申请", en: "You can ask again later")
         case "SESSION_TOO_EARLY":
-            // 约定还剩不少时间：最后 10 分钟才能申请延长
+            // 约定还剩不少时间：最后 5 分钟才能申请延长
             if let retryAt = conversation.timeRequestRetryAt {
                 let minutes = max(1, Int(ceil((Double(retryAt) / 1000 - Date().timeIntervalSince1970) / 60)))
                 return Localization.string(
-                    zh: "约定还没到最后 10 分钟，\(minutes) 分钟后可以申请延长",
-                    en: "You can ask for more time in the last 10 minutes — in \(minutes) min"
+                    zh: "约定还没到最后 5 分钟，\(minutes) 分钟后可以申请延长",
+                    en: "You can ask for more time in the last 5 minutes — in \(minutes) min"
                 )
             }
-            return Localization.string(zh: "约定的最后 10 分钟可以申请延长", en: "You can ask for more time in the last 10 minutes")
+            return Localization.string(zh: "约定的最后 5 分钟可以申请延长", en: "You can ask for more time in the last 5 minutes")
         case "TIME_REQUEST_DISABLED":
             return Localization.string(zh: "家长没有开启时间申请", en: "Time requests are turned off")
         case "MESSAGE_TOO_LONG":
