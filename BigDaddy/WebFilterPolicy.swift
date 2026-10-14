@@ -133,6 +133,19 @@ struct AppIdentity: Hashable {
     let teamIdentifier: String?
     /// Apple 自带程序（满足 `anchor apple`）。任何软件联网规则都不作用于它
     let isPlatformBinary: Bool
+    /// BigDaddy 自己：主程序、过滤扩展、Sparkle 的更新辅助进程。由扩展用"同一开发者团队签名"
+    /// 的 code requirement 校验得出，不认签名标识符——标识符谁都能起，团队签名冒充不了。
+    var isBigDaddy = false
+
+    /// Apple 自带的浏览器入口：Safari 全家（技术预览版、它的辅助进程都以此开头）、WebKit 的
+    /// 网络进程（万一连接被归到它名下而不是宿主 App）、模拟器里的 Safari。
+    private static let appleBrowserPrefixes = ["com.apple.Safari", "com.apple.WebKit", "com.apple.mobilesafari"]
+
+    /// 系统服务：除浏览器之外的 Apple 自带程序。Apple 自带的浏览器虽然也是系统程序，却是孩子
+    /// 浏览网页的地方，必须照常执行网站规则。
+    var isSystemService: Bool {
+        isPlatformBinary && !Self.appleBrowserPrefixes.contains { signingIdentifier.hasPrefix($0) }
+    }
 }
 
 /// 按代码签名身份管一个软件能不能联网。
@@ -170,7 +183,8 @@ enum AppNetworkVerdict {
     case none
     /// 不能联网
     case block
-    /// 随时可以联网，或约定期间的 AGREEMENT 软件：不再看"名单之外"的默认值，也不要求认出主机名
+    /// 随时可以联网，或约定期间的 AGREEMENT 软件，以及系统服务和 BigDaddy 自己：
+    /// 不再看"名单之外"的默认值，也不要求认出主机名
     case bypass
 }
 
@@ -183,7 +197,8 @@ struct WebFilterAccessRequest: Codable, Equatable {
 
 struct WebFilterPolicySnapshot: Codable, Equatable {
     /// 4：加入按对象关联的每周开放计划。
-    static let schemaVersion = 4
+    /// 5："只放名单里的"不再挡系统服务和 BigDaddy 自己（服务端只对 5 及以上开放这个模式）。
+    static let schemaVersion = 5
 
     let schemaVersion: Int
     let enabled: Bool
@@ -306,8 +321,15 @@ struct WebFilterPolicySnapshot: Codable, Equatable {
 
     /// 软件规则的结论。系统程序和 BigDaddy 自己永远不受软件规则约束（服务端也会拒绝这类规则，
     /// 这里是执行端的兜底）。
+    ///
+    /// 系统服务和 BigDaddy 自己还按"随时可以联网"对待：不受"名单之外都打不开"约束，家长
+    /// 明确列出的「任何时候都不行」「约好的时间里才可以」照样拦。少了这一条，一开"只放名单
+    /// 里的"，DNS、iCloud、系统更新、推送、时间同步连同 BigDaddy 自己的更新全被挡掉——名单里
+    /// 的网站也因为解析不了域名而打不开。Safari 不在此列，见 AppIdentity.isSystemService。
     func appVerdict(for identity: AppIdentity?, at now: Date = Date()) -> AppNetworkVerdict {
-        guard enabled, let identity, !identity.isPlatformBinary,
+        guard enabled, let identity else { return .none }
+        if identity.isSystemService || identity.isBigDaddy { return .bypass }
+        guard !identity.isPlatformBinary,
               !identity.signingIdentifier.hasPrefix("vip.bigdaddy."),
               let rule = appRules.first(where: { $0.matches(identity) }) else { return .none }
         switch rule.access {
@@ -490,12 +512,15 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
     /// 可选是为了容忍版本错位：主 App 与系统扩展在更新期间可能短暂不同版本，旧 provider 发来
     /// 的回执没有这个字段，解码成 nil ⇒ 调用方按"问不出来"处理，而不是误判成"没存活"。
     let providerStartedAt: Date?
+    /// 本扩展在"只放名单里的"时放过系统服务和 BigDaddy 自己。新扩展恒为 true；它存在的意义
+    /// 是让旧扩展露馅——旧扩展会照抄主 App 送来的 schema 号，却写不出这个字段。
+    let exemptsSystemServices: Bool
 
     private enum CodingKeys: String, CodingKey {
         case policySchemaVersion, appliedRevision, ruleCount, blockedDomains, mode, allowedDomains,
              allowedRuleCount, appRules, weeklyPlans, weeklyPlansBlockedUntilEpochMillis,
              temporaryAllowedUntilEpochMillis, accessRequests, appActivity,
-             enforcementEnabled, appliedAt, providerStartedAt
+             enforcementEnabled, appliedAt, providerStartedAt, exemptsSystemServices
     }
 
     init(
@@ -521,15 +546,20 @@ struct WebFilterProviderAcknowledgement: Codable, Equatable {
         enforcementEnabled = policy.enabled
         self.appliedAt = appliedAt
         self.providerStartedAt = providerStartedAt
+        exemptsSystemServices = true
     }
 
     /// 主 App 和系统扩展可能在更新期间短暂错位。旧扩展没有白名单字段时，按既有黑名单
     /// 语义补齐，保住策略回执；白名单能力仍由 policySchemaVersion=0 让服务端安全地拒绝。
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let reportedSchema = try container.decodeIfPresent(Int.self, forKey: .policySchemaVersion)
-        // Older extensions echo the incoming schema number even when they cannot read weekly plans.
-        policySchemaVersion = (reportedSchema ?? 0) >= 4 && !container.contains(.weeklyPlans) ? 3 : reportedSchema
+        var reportedSchema = try container.decodeIfPresent(Int.self, forKey: .policySchemaVersion)
+        // 旧扩展会照抄主 App 送来的 schema 号，按它写不出的字段把能力降回去：
+        // 白名单仍会挡系统服务的报 4，读不懂每周计划的报 3。
+        exemptsSystemServices = try container.decodeIfPresent(Bool.self, forKey: .exemptsSystemServices) ?? false
+        if (reportedSchema ?? 0) >= 5 && !exemptsSystemServices { reportedSchema = 4 }
+        if (reportedSchema ?? 0) >= 4 && !container.contains(.weeklyPlans) { reportedSchema = 3 }
+        policySchemaVersion = reportedSchema
         appliedRevision = try container.decode(Int64.self, forKey: .appliedRevision)
         ruleCount = try container.decode(Int.self, forKey: .ruleCount)
         blockedDomains = try container.decode([WebFilterRule].self, forKey: .blockedDomains)

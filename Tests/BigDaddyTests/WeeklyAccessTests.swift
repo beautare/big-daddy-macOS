@@ -84,7 +84,7 @@ final class WeeklyAccessTests: XCTestCase {
         XCTAssertEqual(decoded, original)
         XCTAssertFalse(decoded.blocks(hostname: "bilibili.com", at: monday))
         XCTAssertTrue(WebFilterProviderAcknowledgement(policy: decoded).confirms(original))
-        XCTAssertEqual(decoded.schemaVersion, 4)
+        XCTAssertEqual(decoded.schemaVersion, 5)
     }
 
     func testOlderExtensionCannotClaimWeeklySupportByEchoingSchemaNumber() throws {
@@ -96,5 +96,18 @@ final class WeeklyAccessTests: XCTestCase {
         XCTAssertEqual(older.policySchemaVersion, 3)
         XCTAssertTrue(older.confirms(empty))
         XCTAssertFalse(older.confirms(policy()))
+    }
+
+    /// 服务端只对 schema 5 开放"只放名单里的"。还会挡系统服务的旧扩展照抄 5 也冒充不了。
+    func testExtensionThatStillBlocksSystemServicesCannotClaimSchemaFive() throws {
+        let empty = WebFilterPolicySnapshot(configuration: WebFilterConfiguration(enabled: true), isDeviceBound: true, appliedAt: monday)
+        let encoded = try JSONEncoder().encode(WebFilterProviderAcknowledgement(policy: empty))
+        XCTAssertEqual(try JSONDecoder().decode(WebFilterProviderAcknowledgement.self, from: encoded).policySchemaVersion, 5)
+
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        payload.removeValue(forKey: "exemptsSystemServices")
+        let older = try JSONDecoder().decode(WebFilterProviderAcknowledgement.self, from: JSONSerialization.data(withJSONObject: payload))
+        XCTAssertEqual(older.policySchemaVersion, 4)
+        XCTAssertTrue(older.confirms(empty))
     }
 }

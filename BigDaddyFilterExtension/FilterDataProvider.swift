@@ -38,7 +38,8 @@ import Security
 ///    降级成兜底信号。见 QUICPacket 和 isLikelyQUIC 各自的注释。
 ///
 /// 黑名单模式认不出主机名时放行；白名单模式保持握手数据不外发，达到上限仍认不出时阻断。
-/// 两种模式都会阻断生效期间无法识别主机名的 QUIC。
+/// 两种模式都会阻断生效期间无法识别主机名的 QUIC。系统服务（DNS、iCloud、系统更新……）和
+/// BigDaddy 自己不受白名单默认值约束，见 WebFilterPolicySnapshot.appVerdict。
 final class FilterDataProvider: NEFilterDataProvider {
 
     /// 一条正在跟踪的连接。放行之后仍然留着，好在策略变严时把它掐断。
@@ -713,11 +714,15 @@ private final class AppIdentityResolver {
     private let lock = NSLock()
     private var identities: [Data: AppIdentity?] = [:]
     private var bundlePaths: [AppIdentity: String] = [:]
-    private let appleAnchor: SecRequirement? = {
+    private let appleAnchor = AppIdentityResolver.requirement("anchor apple")
+    /// 与本扩展同一开发者团队签名 = BigDaddy 自己。和主 App 连回执服务时用的是同一条要求。
+    private let ownTeam = WebFilterIPC.codeSigningRequirement().flatMap(AppIdentityResolver.requirement)
+
+    private static func requirement(_ text: String) -> SecRequirement? {
         var requirement: SecRequirement?
-        SecRequirementCreateWithString("anchor apple" as CFString, [], &requirement)
+        SecRequirementCreateWithString(text as CFString, [], &requirement)
         return requirement
-    }()
+    }
 
     func identity(of auditToken: Data?) -> AppIdentity? {
         guard let auditToken else { return nil }
@@ -759,14 +764,17 @@ private final class AppIdentityResolver {
         guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
               let info = information as? [String: Any],
               let signingIdentifier = info[kSecCodeInfoIdentifier as String] as? String else { return nil }
-        let isPlatformBinary = appleAnchor.map { SecCodeCheckValidity(code, [], $0) == errSecSuccess } ?? false
+        let satisfies = { (requirement: SecRequirement?) in
+            requirement.map { SecCodeCheckValidity(code, [], $0) == errSecSuccess } ?? false
+        }
         var url: CFURL?
         let bundlePath = SecCodeCopyPath(staticCode, [], &url) == errSecSuccess ? (url as URL?)?.path : nil
         return (
             AppIdentity(
                 signingIdentifier: signingIdentifier,
                 teamIdentifier: info[kSecCodeInfoTeamIdentifier as String] as? String,
-                isPlatformBinary: isPlatformBinary
+                isPlatformBinary: satisfies(appleAnchor),
+                isBigDaddy: satisfies(ownTeam)
             ),
             bundlePath
         )

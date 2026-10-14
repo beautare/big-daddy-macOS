@@ -327,11 +327,64 @@ final class WebFilterPolicyTests: XCTestCase {
         XCTAssertEqual(disabled.appVerdict(for: steam, at: now), AppNetworkVerdict.none)
     }
 
+    /// "只放名单里的"不能把整台 Mac 断网：DNS、iCloud、系统更新这些系统服务和 BigDaddy 自己
+    /// 不受名单之外的默认值约束，认不出主机名的 DNS 包也不会被扣住；但家长明确列出的网站照样拦。
+    func testAllowlistModeLeavesSystemServicesAndBigDaddyOnline() {
+        let policy = makeAppPolicy(
+            mode: .allowSelected,
+            blocked: [
+                WebFilterRule(domain: "bad.com", includeSubdomains: true),
+                WebFilterRule(domain: "bilibili.com", includeSubdomains: true, category: "ENTERTAINMENT"),
+            ],
+            allowed: [WebFilterRule(domain: "khanacademy.org", includeSubdomains: true)],
+            apps: [])
+        let dns = AppIdentity(signingIdentifier: "com.apple.mDNSResponder", teamIdentifier: nil, isPlatformBinary: true)
+        let cloud = AppIdentity(signingIdentifier: "com.apple.cloudd", teamIdentifier: nil, isPlatformBinary: true)
+        let updater = AppIdentity(signingIdentifier: "vip.bigdaddy.monitor", teamIdentifier: "MXGJJ98X76",
+                                  isPlatformBinary: false, isBigDaddy: true)
+
+        for service in [dns, cloud, updater] {
+            XCTAssertEqual(policy.appVerdict(for: service, at: now), .bypass)
+            XCTAssertFalse(policy.blocks(hostname: "gateway.icloud.com", identity: service, at: now))
+            XCTAssertFalse(policy.blocks(hostname: "bigdaddy.mom", identity: service, at: now))
+            XCTAssertTrue(policy.blocks(hostname: "www.bad.com", identity: service, at: now))
+            XCTAssertTrue(policy.blocks(hostname: "www.bilibili.com", identity: service, at: now))
+            XCTAssertFalse(WebFilterFlowDisposition.shouldTerminate(
+                hostname: nil, isLikelyQUIC: false, identity: service, under: policy, at: now))
+        }
+        XCTAssertFalse(policy.needsParentApproval(hostname: "khanacademy.org"))
+    }
+
+    /// Safari 也是 Apple 自带程序，但它是孩子浏览网页的地方：名单之外照样打不开。WebKit 的网络
+    /// 进程、模拟器里的 Safari、只是签名标识符像 BigDaddy 的程序同理。
+    func testAllowlistModeStillAppliesToAppleBrowsersAndLookalikes() {
+        let policy = makeAppPolicy(
+            mode: .allowSelected,
+            allowed: [WebFilterRule(domain: "khanacademy.org", includeSubdomains: true)],
+            apps: [])
+        let browsers = [
+            AppIdentity(signingIdentifier: "com.apple.Safari", teamIdentifier: nil, isPlatformBinary: true),
+            AppIdentity(signingIdentifier: "com.apple.SafariTechnologyPreview", teamIdentifier: nil, isPlatformBinary: true),
+            AppIdentity(signingIdentifier: "com.apple.WebKit.Networking", teamIdentifier: nil, isPlatformBinary: true),
+            AppIdentity(signingIdentifier: "com.apple.mobilesafari", teamIdentifier: nil, isPlatformBinary: true),
+            AppIdentity(signingIdentifier: "vip.bigdaddy.fake", teamIdentifier: nil, isPlatformBinary: false),
+        ]
+        for browser in browsers {
+            XCTAssertFalse(browser.isSystemService)
+            XCTAssertEqual(policy.appVerdict(for: browser, at: now), AppNetworkVerdict.none)
+            XCTAssertTrue(policy.blocks(hostname: "www.youtube.com", identity: browser, at: now))
+            XCTAssertFalse(policy.blocks(hostname: "www.khanacademy.org", identity: browser, at: now))
+            XCTAssertTrue(WebFilterFlowDisposition.shouldTerminate(
+                hostname: nil, isLikelyQUIC: false, identity: browser, under: policy, at: now))
+        }
+        XCTAssertTrue(policy.needsParentApproval(hostname: "www.youtube.com"))
+    }
+
     func testAppRulesRoundTripAndAreConfirmedByAcknowledgement() throws {
         let policy = makeAppPolicy(apps: [appRule("com.valvesoftware.steam", "MXGJJ98X76", .never)])
         let decoded = WebFilterPolicyTransport.policy(from: try WebFilterPolicyTransport.vendorConfiguration(for: policy))
         XCTAssertEqual(decoded, policy)
-        XCTAssertEqual(decoded?.schemaVersion, 4)
+        XCTAssertEqual(decoded?.schemaVersion, 5)
 
         let acknowledgement = WebFilterProviderAcknowledgement(policy: policy)
         XCTAssertTrue(acknowledgement.confirms(policy))
