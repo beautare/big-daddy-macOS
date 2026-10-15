@@ -188,11 +188,105 @@ enum AppNetworkVerdict {
     case bypass
 }
 
-/// 白名单拦截到的域名只作为家长的候选项：客户端绝不因此自动放行。
+/// 白名单拦截到的网站只作为家长的候选项：客户端绝不因此自动放行。
+/// 一个网站（主域名）一条；hosts 是这个网站下最近被挡的具体网址，最近的在前。
 struct WebFilterAccessRequest: Codable, Equatable {
     let domain: String
     let lastBlockedAt: Date
+    /// 尝试次数：同一网站 1 分钟内被挡多次只算一次，见 BlockedSiteLog
     let count: Int
+    let hosts: [String]
+
+    init(domain: String, lastBlockedAt: Date, count: Int, hosts: [String] = []) {
+        self.domain = domain
+        self.lastBlockedAt = lastBlockedAt
+        self.count = count
+        self.hosts = hosts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        domain = try container.decode(String.self, forKey: .domain)
+        lastBlockedAt = try container.decode(Date.self, forKey: .lastBlockedAt)
+        count = try container.decode(Int.self, forKey: .count)
+        // 升级空窗里旧版扩展发来的回执没有这个字段
+        hosts = try container.decodeIfPresent([String].self, forKey: .hosts) ?? []
+    }
+}
+
+/// "名单之外都打不开"时被挡下、等家长决定的网站。
+///
+/// 按主域名记：一个网页往往连着十几个 CDN、统计、字体网址，按具体网址记的话一个网页就能把
+/// 名额占满，孩子真正想看的那个网站反而被挤掉；家长处理时也是按主域名放行的。次数记"尝试"
+/// 而不是"连接"：同一网站 1 分钟内被挡多次只算一次，家长看到"试过 5 次"才大致等于孩子在
+/// 5 个时间点想打开它。名额和保留时长与服务端 BigDaddyDtos 的同名常量一致。
+struct BlockedSiteLog {
+    static let maxSites = 50
+    static let maxHostsPerSite = 5
+    static let attemptInterval: TimeInterval = 60
+    static let retention: TimeInterval = 7 * 24 * 3600
+
+    private struct Entry {
+        var hosts: [String]
+        var count: Int
+        var lastBlockedAt: Date
+        var lastCountedAt: Date
+    }
+
+    private var entries: [String: Entry] = [:]
+
+    var isEmpty: Bool { entries.isEmpty }
+
+    mutating func record(_ hostname: String, at now: Date) {
+        let host = DomainName.normalize(hostname)
+        guard !host.isEmpty else { return }
+        let site = DomainName.site(of: host)
+        if var entry = entries[site] {
+            if now.timeIntervalSince(entry.lastCountedAt) >= Self.attemptInterval {
+                entry.count += 1
+                entry.lastCountedAt = now
+            }
+            entry.lastBlockedAt = now
+            entry.hosts = Array(([host] + entry.hosts.filter { $0 != host }).prefix(Self.maxHostsPerSite))
+            entries[site] = entry
+        } else {
+            entries[site] = Entry(hosts: [host], count: 1, lastBlockedAt: now, lastCountedAt: now)
+        }
+        dropExpired(now: now)
+        while entries.count > Self.maxSites,
+              let oldest = entries.min(by: { $0.value.lastBlockedAt < $1.value.lastBlockedAt })?.key {
+            entries.removeValue(forKey: oldest)
+        }
+    }
+
+    /// 新策略到达时调用：家长已经处理过的网址（放行、设成约定时间或任何时候都不行）立刻让出
+    /// 名额；一个网站下的网址都处理完了，整条移除。
+    mutating func prune(keeping needsApproval: (String) -> Bool, now: Date) {
+        for (site, entry) in entries {
+            let pending = entry.hosts.filter(needsApproval)
+            if pending.isEmpty {
+                entries.removeValue(forKey: site)
+            } else if pending != entry.hosts {
+                entries[site]?.hosts = pending
+            }
+        }
+        dropExpired(now: now)
+    }
+
+    mutating func removeAll() {
+        entries.removeAll()
+    }
+
+    /// 最近被挡的在前，上报给服务端
+    var requests: [WebFilterAccessRequest] {
+        entries
+            .map { WebFilterAccessRequest(domain: $0.key, lastBlockedAt: $0.value.lastBlockedAt, count: $0.value.count, hosts: $0.value.hosts) }
+            .sorted { $0.lastBlockedAt == $1.lastBlockedAt ? $0.domain < $1.domain : $0.lastBlockedAt > $1.lastBlockedAt }
+    }
+
+    private mutating func dropExpired(now: Date) {
+        entries = entries.filter { now.timeIntervalSince($0.value.lastBlockedAt) < Self.retention }
+    }
 }
 
 struct WebFilterPolicySnapshot: Codable, Equatable {
@@ -450,6 +544,27 @@ enum WebFilterFlowDisposition {
 }
 
 enum DomainName {
+    /// 主域名要多取一级的后缀：国家二级域，以及谁都能在下面开站的托管平台。
+    /// 与 dashboard 的 blockedSites.ts、iPhone 的 WebsiteAccess 是同一份清单，三端一起改。
+    static let multiLabelSuffixes: Set<String> = [
+        "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+        "com.hk", "com.tw", "org.tw", "edu.tw", "co.jp", "ne.jp", "or.jp", "co.kr", "or.kr",
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "edu.au", "com.sg", "edu.sg",
+        "github.io", "gitlab.io", "vercel.app", "netlify.app", "pages.dev", "web.app", "firebaseapp.com",
+        "herokuapp.com", "blogspot.com", "wordpress.com",
+    ]
+
+    /// 具体网址归到哪个网站（主域名）。IP 地址没有主域名可言，原样返回。
+    static func site(of value: String) -> String {
+        let host = normalize(value)
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        if host.contains(":") || (labels.count == 4 && labels.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }) {
+            return host
+        }
+        let lastTwo = labels.suffix(2).joined(separator: ".")
+        return labels.suffix(multiLabelSuffixes.contains(lastTwo) ? 3 : 2).joined(separator: ".")
+    }
+
     static func normalize(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let withoutTrailingDot = trimmed.last == "." ? String(trimmed.dropLast()) : trimmed

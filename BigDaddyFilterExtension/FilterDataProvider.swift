@@ -95,8 +95,6 @@ final class FilterDataProvider: NEFilterDataProvider {
     /// **新**连接——所以宁可淘汰最老的：越老的流越可能其实早就关了，只是回执没到。
     private static let maxTrackedFlows = 2048
     private static let trackedFlowLowWaterMark = 1536
-    /// 白名单请求只保留最近 20 个域名。它们是给家长确认的候选项，不是审计全量日志。
-    private static let maxAccessRequests = 20
     /// 联网软件清单的上限与统计窗口（app_network_rules_spec.md §3）
     private static let maxAppActivity = 100
     private static let appActivityWindow: TimeInterval = 7 * 24 * 3600
@@ -120,7 +118,8 @@ final class FilterDataProvider: NEFilterDataProvider {
 
     private var policy = FilterDataProvider.emptyPolicy
     private var trackedFlows: [ObjectIdentifier: TrackedFlow] = [:]
-    private var accessRequests: [String: WebFilterAccessRequest] = [:]
+    /// 等家长决定的网站。它们是给家长确认的候选项，不是审计全量日志，名额与规则见 BlockedSiteLog
+    private var accessRequests = BlockedSiteLog()
     /// 键为"团队 ID/签名标识符"，辅助进程按 AppNetworkRule 同样的前缀规则不单独成行
     private var appActivity: [String: AppNetworkActivity] = [:]
     private var lastAppActivityPublish = Date.distantPast
@@ -337,7 +336,9 @@ final class FilterDataProvider: NEFilterDataProvider {
         policy = nextPolicy
         var flowsToDrop: [NEFilterSocketFlow] = []
         var hostsNeedingApproval: [String] = []
-        if !nextPolicy.requiresKnownHostname {
+        if nextPolicy.requiresKnownHostname {
+            accessRequests.prune(keeping: { nextPolicy.needsParentApproval(hostname: $0) }, now: Date())
+        } else {
             accessRequests.removeAll()
         }
         // udp / quic 这两个计数是给 isLikelyQUIC 用的体检指标，不是凑热闹：它依赖的远端
@@ -458,24 +459,7 @@ final class FilterDataProvider: NEFilterDataProvider {
             policyLock.unlock()
             return
         }
-        let now = Date()
-        if let existing = accessRequests[normalized] {
-            accessRequests[normalized] = WebFilterAccessRequest(
-                domain: normalized,
-                lastBlockedAt: now,
-                count: existing.count + 1
-            )
-        } else {
-            accessRequests[normalized] = WebFilterAccessRequest(
-                domain: normalized,
-                lastBlockedAt: now,
-                count: 1
-            )
-        }
-        if accessRequests.count > Self.maxAccessRequests,
-           let oldest = accessRequests.min(by: { $0.value.lastBlockedAt < $1.value.lastBlockedAt })?.key {
-            accessRequests.removeValue(forKey: oldest)
-        }
+        accessRequests.record(normalized, at: Date())
         let currentPolicy = policy
         policyLock.unlock()
         publishAcknowledgement(for: currentPolicy)
@@ -531,17 +515,9 @@ final class FilterDataProvider: NEFilterDataProvider {
         return appActivity.values.sorted { $0.lastSeenAt > $1.lastSeenAt }
     }
 
-    private func sortedAccessRequests() -> [WebFilterAccessRequest] {
-        accessRequests.values.sorted { lhs, rhs in
-            lhs.lastBlockedAt == rhs.lastBlockedAt
-                ? lhs.domain < rhs.domain
-                : lhs.lastBlockedAt > rhs.lastBlockedAt
-        }
-    }
-
     private func publishAcknowledgement(for policy: WebFilterPolicySnapshot) {
         policyLock.lock()
-        let accessRequests = sortedAccessRequests()
+        let accessRequests = self.accessRequests.requests
         let activity = currentAppActivity()
         policyLock.unlock()
         ipcListener?.publish(WebFilterProviderAcknowledgement(

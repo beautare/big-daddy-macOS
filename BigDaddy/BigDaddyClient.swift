@@ -749,6 +749,7 @@ final class BigDaddyClient: @unchecked Sendable {
                     "domain": request.domain,
                     "lastBlockedAt": BigDaddyDateFormatter.iso8601.string(from: request.lastBlockedAt),
                     "count": request.count,
+                    "hosts": request.hosts,
                 ]
             }
         ]
