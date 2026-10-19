@@ -1522,7 +1522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             zh: "在本机显示绑定码，让家长输入", en: "Show a code here for my parent to enter"
         ))
         alert.addButton(withTitle: Localization.string(
-            zh: "输入家长已经给我的绑定码", en: "Enter a code my parent already gave me"
+            zh: "输入家长给我的绑定码", en: "Enter a code my parent gave me"
         ))
         alert.addButton(withTitle: Localization.string(zh: "取消", en: "Cancel"))
 
