@@ -2829,6 +2829,15 @@ final class BigDaddyClient: @unchecked Sendable {
     static func notePlannedRelaunch() {
         retireRuntimeLock()
     }
+
+    /// 本次运行是否已经如实交代过自己的结束：验证码退出（sendShutdownSync）、Sparkle
+    /// 更新重启、计划内重启/交接、系统关机都会先退休墓碑。applicationShouldTerminate
+    /// 拿它区分"我们自己促成的退出"和外部发来的 quit，信号处理器拿它跳过 FORCE_KILL 误报。
+    static var isRuntimeRetired: Bool {
+        runtimeLockGuard.lock()
+        defer { runtimeLockGuard.unlock() }
+        return runtimeLockRetired
+    }
 }
 
 /// 本机守护记录（知情透明）：把每一次实际发生的采集/上报动作追加到本地明文日志，
@@ -3424,6 +3433,28 @@ enum Launchctl {
         return pid_t(digits)
     }
 
+    /// 已加载 job 实际要拉起的可执行文件。App 被挪过位置后，launchd 手里的旧定义
+    /// 仍指向旧路径，kickstart 会拉一个不存在的程序。
+    static func jobProgram() -> String? {
+        let result = run(["print", serviceTarget])
+        guard result.status == 0,
+              let line = result.output.split(separator: "\n").first(where: {
+                  $0.trimmingCharacters(in: .whitespaces).hasPrefix("program = ")
+              }) else {
+            return nil
+        }
+        return String(line.trimmingCharacters(in: .whitespaces).dropFirst("program = ".count))
+    }
+
+    /// 系统设置「允许在后台」关掉，或 `launchctl disable` 过：job 无法加载，
+    /// bootstrap 会失败，下次登录也不会启动。
+    static func isDisabled() -> Bool {
+        let output = run(["print-disabled", domain]).output
+        return output.split(separator: "\n").contains {
+            $0.contains("\"\(LaunchAgentPlist.label)\"") && ($0.contains("=> disabled") || $0.contains("=> true"))
+        }
+    }
+
     // 下面三条会改变 job 的加载状态，跑完必须作废 OSLevelStatusCache——否则家长端要等
     // 最多一个 TTL 才看得到我们自己刚做的改动。只读的 print（isLoaded/jobPid）不用管。
     static func bootout() {
@@ -3602,6 +3633,7 @@ enum ContinuityModeController {
               LaunchAgentPlist.crashRelaunch(from: plist) else {
             return "off"
         }
+        if Launchctl.isDisabled() { return "keepAliveDisabled" }
         guard Launchctl.isLoaded() else { return "keepAlivePlistNotLoaded" }
         return isLaunchdManaged ? "keepAliveLoaded" : "keepAliveLoadedUnmanaged"
     }
@@ -3628,6 +3660,8 @@ enum ContinuityModeController {
     static func restartViaLaunchdIfManaged() -> Bool {
         guard isLaunchdManaged, Launchctl.isLoaded() else { return false }
         AuditLog.record("CONTINUITY_KEEPALIVE_KICKSTART")
+        // kickstart -k 发的是 SIGTERM，先退休墓碑，信号处理器据此不报 FORCE_KILL。
+        BigDaddyClient.notePlannedRelaunch()
         Launchctl.kickstart()
         return true
     }
@@ -3676,22 +3710,50 @@ enum ContinuityModeController {
         }
 
         if Launchctl.isLoaded() {
-            if Launchctl.jobPid() == nil {
-                _ = Launchctl.run(["kickstart", Launchctl.serviceTarget])
+            // 只有 launchd 手里的定义就是本份可执行文件时才直接 kickstart；App 挪过位置后
+            // 旧定义指向不存在的路径，必须 bootout + bootstrap 换成磁盘上的新 plist。
+            if Launchctl.jobPid() == nil && Launchctl.jobProgram() == Bundle.main.executablePath {
+                let kicked = Launchctl.run(["kickstart", Launchctl.serviceTarget]).status == 0
                 OSLevelStatusCache.invalidate()
-                AuditLog.record("CONTINUITY_MODE_ENABLED via=kickstart-idle")
-                if !isLaunchdManaged {
+                AuditLog.record("CONTINUITY_MODE_ENABLED via=kickstart-idle success=\(kicked)")
+                if isLaunchdManaged { return }
+                if kicked && launchdStartedSuccessor() {
                     handoverExit()
                 }
-                return
             }
             Launchctl.bootout()
         }
         let bootstrapped = Launchctl.bootstrap(plistURL: LaunchAgentInstaller.launchAgentURL)
         AuditLog.record("CONTINUITY_MODE_ENABLED via=bootstrap success=\(bootstrapped)")
-        if bootstrapped && !isLaunchdManaged {
+        if bootstrapped && !isLaunchdManaged && launchdStartedSuccessor() {
             handoverExit()
         }
+    }
+
+    /// 交接前确认 launchd 真的拉起了一份新进程。拉不起来就不退出，守护留在本进程，
+    /// 下一轮 sync 再试；否则新旧两份都没了。新进程会在 shouldExitAsDuplicate 里等本进程
+    /// 最多 5 秒，这里的等待必须远短于它。
+    private static func launchdStartedSuccessor() -> Bool {
+        let own = ProcessInfo.processInfo.processIdentifier
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            if let pid = Launchctl.jobPid(), pid != own { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date() < deadline
+        AuditLog.record("CONTINUITY_HANDOVER_ABORTED reason=successor-not-started")
+        return false
+    }
+
+    /// 放行系统注销 / 关机时调用。注销可能被别的 App 取消，而本进程已经以 exit 0 退出，
+    /// KeepAlive 不会拉。留一个脱离本进程的 kickstart：注销真的完成，它随会话一起没了
+    /// 或找不到 job 静默失败；被取消，就在 60 秒后把守护拉回来。job 已在运行时不带 -k 的
+    /// kickstart 什么也不做。
+    static func scheduleKickstartIfSessionSurvives() {
+        guard isActive else { return }
+        spawnDetachedShell("""
+        sleep 60
+        /bin/launchctl kickstart \(Launchctl.serviceTarget)
+        """)
     }
 
     private static func disableKeepAlive() {
@@ -3705,6 +3767,8 @@ enum ContinuityModeController {
         if isLaunchdManaged && Launchctl.isLoaded() {
             restorePlistForLaunchAtLoginWithoutKeepAlive()
             spawnUnmanagedSuccessor()
+            // bootout 本进程自己的 job 会收到 SIGTERM，这是计划内交接，不报 FORCE_KILL。
+            BigDaddyClient.notePlannedRelaunch()
             Launchctl.bootout()
             return
         }

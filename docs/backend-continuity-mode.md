@@ -36,13 +36,14 @@
 | `keepAliveLoaded` | KeepAlive plist 已加载，且当前进程就是 launchd 拉起的那一份。 |
 | `keepAliveLoadedUnmanaged` | job 已加载，但当前进程不是 launchd 拉起的（交接中 / Sparkle 刚 relaunch）。 |
 | `keepAlivePlistNotLoaded` | 磁盘上已是 KeepAlive plist，但用户域 job 未加载——当前会话崩了不会拉，下次登录才会。 |
+| `keepAliveDisabled` | KeepAlive plist 在，但 job 被禁用（系统设置「允许在后台」关掉，或 `launchctl disable`）——崩了不会拉，下次登录也不会启动。 |
 
 ### 为什么两个字段都要留
 
 与开机自启同一套哲学：`continuityModeEnabled` 是意图，`continuityModeOsStatus` 是系统实际状态，二者可能分叉。
 
 - `true` + `keepAliveLoaded`：正常。
-- `true` + `off` / `keepAlivePlistNotLoaded`：家长以为开着，本机没盯上。常见原因：孩子用验证码在本机关闭、或在 `~/Library/LaunchAgents` 里删了 plist。**建议 Dashboard 告警**。
+- `true` + `off` / `keepAlivePlistNotLoaded` / `keepAliveDisabled`：家长以为开着，本机没盯上。常见原因：孩子用验证码在本机关闭、在 `~/Library/LaunchAgents` 里删了 plist，或在系统设置里关掉了「允许在后台」。**建议 Dashboard 告警**。
 - `false` + 非 `off`：关闭尚未落到 OS，通常是交接瞬间，不必当故障。
 
 ### 建议的 Dashboard 展示
@@ -54,6 +55,8 @@ if continuityModeEnabled and osStatus == keepAliveLoaded:
     显示"已开启"
 elif continuityModeEnabled and osStatus == keepAlivePlistNotLoaded:
     显示"已配置，当前会话未生效"
+elif continuityModeEnabled and osStatus == keepAliveDisabled:
+    显示"⚠️ 已在系统设置中被禁止后台运行"
 elif continuityModeEnabled and osStatus == off:
     显示"⚠️ 已被本机关闭或卸载"
 else:

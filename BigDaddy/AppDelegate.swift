@@ -427,6 +427,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         alert.runModal()
     }
 
+    /// 活动监视器「退出」、AppleScript quit、清理工具发来的都是 Apple Event quit，不走信号；
+    /// 放行的话进程以 exit 0 结束，连续性模式的 KeepAlive 不会拉起。已绑定时只放行：
+    /// - 我们自己促成的退出：验证码退出、Sparkle 更新重启、计划内重启都会先退休墓碑；
+    /// - 系统注销 / 重启 / 关机：此时拒绝会卡住孩子关机。注销可能被别的 App 取消，
+    ///   所以放行前留一个延迟 kickstart 兜底。
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if !client.config.bound || BigDaddyClient.isRuntimeRetired {
+            return .terminateNow
+        }
+        if isSystemShuttingDown || isSystemSessionQuit {
+            BigDaddyClient.notePlannedRelaunch()
+            ContinuityModeController.scheduleKickstartIfSessionSurvives()
+            return .terminateNow
+        }
+        AuditLog.record("QUIT_REQUEST_DENIED")
+        return .terminateCancel
+    }
+
+    /// 当前 quit 事件是否由系统注销 / 重启 / 关机发出（带 kAEQuitReason 参数）。
+    private var isSystemSessionQuit: Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent,
+              event.eventClass == kCoreEventClass,
+              event.eventID == kAEQuitApplication else {
+            return false
+        }
+        return event.paramDescriptor(forKeyword: kAEQuitReason) != nil
+            || event.attributeDescriptor(forKeyword: kAEQuitReason) != nil
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if isSystemShuttingDown { BigDaddyClient.notePlannedRelaunch() }
         // SHUTDOWN 心跳只在 quitWithPassword 里校验通过后同步发送一次；这里不再重复
@@ -3951,19 +3980,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// 死锁/崩溃风险；而且从未调用 exit()，一旦自定义处理器接管了默认终止行为，
     /// SIGTERM/SIGINT/SIGHUP 可能根本杀不死进程，只能靠 kill -9 兜底。
     /// 这里改用 DispatchSourceSignal：先用 SIG_IGN 屏蔽默认终止动作，再在正常
-    /// GCD 队列上异步处理信号（可以安全地做网络上报），处理完成后显式 exit(0)。
+    /// GCD 队列上异步处理信号（可以安全地做网络上报）。
+    ///
+    /// 处理完后恢复默认动作、把同一个信号重新发给自己，而不是 exit(0)：连续性模式的
+    /// KeepAlive 是 `{ SuccessfulExit: false }`，exit 0 在 launchd 眼里是"正常结束"，
+    /// 被 kill / 活动监视器结束后不会再拉起。死于信号才会被拉起；launchd 自己因为
+    /// bootout、注销、关机发的 SIGTERM 是在停 job，不会重启，不受影响。
     private func installSignalHandlers() {
         for sig in [SIGTERM, SIGINT, SIGHUP] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler { [weak self] in
+                let terminate = {
+                    signal(sig, SIG_DFL)
+                    kill(getpid(), sig)
+                }
                 if self?.isSystemShuttingDown == true {
                     BigDaddyClient.notePlannedRelaunch()
-                    exit(0)
                 }
-                BigDaddyClient.sharedForceKillPing {
-                    exit(0)
+                // 计划内重启 / 交接（kickstart -k、bootout 自己的 job）已退休墓碑，不是被强杀。
+                if BigDaddyClient.isRuntimeRetired {
+                    terminate()
+                    return
                 }
+                BigDaddyClient.sharedForceKillPing(completion: terminate)
             }
             source.resume()
             signalSources.append(source)
@@ -4391,6 +4431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 一次本该是"重启"的操作变成整个 App 消失。
         process.environment = ContinuityModeController.successorEnvironment()
         try? process.run()
+        BigDaddyClient.notePlannedRelaunch()
         NSApp.terminate(nil)
     }
 
