@@ -865,8 +865,9 @@ final class BigDaddyClient: @unchecked Sendable {
                 // launchAtLoginEnabled 是本机"意图"（客户端偏好），launchAtLoginOsStatus 是
                 // OS 层"实际"状态：两者不一致（如 enabled + notRegistered）即意味着有人在
                 // 系统设置的登录项里手动关掉了自启——这是 App 内验证码开关拦不住的绕过，
-                // 家长端应据此告警。
-                "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled,
+                // 家长端应据此告警。连续性模式打开期间 KeepAlive agent 强制 RunAtLoad，
+                // 本地偏好管不到，此时意图按"开启"上报，免得与 OS 状态 enabled 凭空分叉。
+                "launchAtLoginEnabled": LaunchAtLoginPreference.isEnabled || ContinuityModeController.isActive,
                 "launchAtLoginOsStatus": LaunchAtLoginController.osLevelStatusDescription,
                 // 连续性模式：continuityModeEnabled 是家长配置的意图（config.continuityMode），
                 // continuityModeOsStatus 是本机 launchd KeepAlive 的实际状态。孩子用验证码

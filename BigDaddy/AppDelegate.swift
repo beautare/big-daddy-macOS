@@ -819,17 +819,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             action: #selector(showAboutWindow), keyEquivalent: ""
         ))
 
+        let continuityOn = client.config.continuityMode && ContinuityModePreference.isEnabled
+
         // 默认开启，孩子可自行开启（无需验证）；关闭是敏感操作，需要家长验证码才能
         // 生效，见 toggleLaunchAtLogin/disableLaunchAtLoginWithVerification。
+        // 崩溃后自动恢复开启期间，KeepAlive agent 强制 RunAtLoad（见 enableKeepAlive），
+        // 这里的开关改不了登录时是否启动，所以锁定为打勾、不可点，免得孩子白花一个验证码。
         let launchAtLoginItem = NSMenuItem(
-            title: Localization.string(zh: "开机时自动运行守护程序", en: "Start Automatically at System Login"),
-            action: #selector(toggleLaunchAtLogin), keyEquivalent: ""
+            title: Localization.string(
+                zh: continuityOn ? "开机时自动运行守护程序（崩溃后自动恢复开启时始终运行）" : "开机时自动运行守护程序",
+                en: continuityOn ? "Start Automatically at System Login (Always On With Relaunch After Crash)" : "Start Automatically at System Login"
+            ),
+            action: continuityOn ? nil : #selector(toggleLaunchAtLogin), keyEquivalent: ""
         )
-        launchAtLoginItem.state = LaunchAtLoginPreference.isEnabled ? .on : .off
+        launchAtLoginItem.state = continuityOn || LaunchAtLoginPreference.isEnabled ? .on : .off
         menu.addItem(launchAtLoginItem)
 
         // 家长在 Dashboard 打开；菜单不能本地打开。已开启时可点，走与关闭开机自启相同的验证码。
-        let continuityOn = client.config.continuityMode && ContinuityModePreference.isEnabled
         let continuityItem = NSMenuItem(
             title: Localization.string(
                 zh: continuityOn ? "崩溃后自动恢复（家长已开启）" : "崩溃后自动恢复（由家长在家长中心开启）",
