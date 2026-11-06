@@ -8,6 +8,8 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
     private var updateAlert: NSAlert?
     private var updateReply: ((SPUUserUpdateChoice) -> Void)?
     private var releaseNotesView: WKWebView?
+    private var releaseNotesHeight: NSLayoutConstraint?
+    private weak var releaseNotesAlert: NSAlert?
 
     override func showUpdateFound(with appcastItem: SUAppcastItem, state: SPUUserUpdateState,
                                   reply: @escaping (SPUUserUpdateChoice) -> Void) {
@@ -33,10 +35,9 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
         if let description = appcastItem.itemDescription, !description.isEmpty {
             let notes = addReleaseNotes(to: alert)
             if appcastItem.itemDescriptionFormat == "plain-text" || appcastItem.itemDescriptionFormat == "markdown" {
-                notes.load(Data(description.utf8), mimeType: "text/plain", characterEncodingName: "utf-8",
-                           baseURL: appcastItem.releaseNotesURL ?? URL(fileURLWithPath: "/"))
+                notes.loadHTMLString(Self.styledHTML(Self.preformatted(description)), baseURL: appcastItem.releaseNotesURL)
             } else {
-                notes.loadHTMLString(description, baseURL: appcastItem.releaseNotesURL)
+                notes.loadHTMLString(Self.styledHTML(description), baseURL: appcastItem.releaseNotesURL)
             }
         } else if appcastItem.releaseNotesURL != nil {
             _ = addReleaseNotes(to: alert)
@@ -45,14 +46,14 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
     }
 
     override func showUpdateReleaseNotes(with downloadData: SPUDownloadData) {
-        releaseNotesView?.load(downloadData.data, mimeType: downloadData.mimeType ?? "text/html",
-                               characterEncodingName: downloadData.textEncodingName ?? "utf-8",
-                               baseURL: downloadData.url)
+        let text = String(decoding: downloadData.data, as: UTF8.self)
+        let body = (downloadData.mimeType ?? "text/html").contains("html") ? text : Self.preformatted(text)
+        releaseNotesView?.loadHTMLString(Self.styledHTML(body), baseURL: downloadData.url)
     }
 
     override func showUpdateReleaseNotesFailedToDownloadWithError(_ error: Error) {
-        releaseNotesView?.load(Data(error.localizedDescription.utf8), mimeType: "text/plain",
-                               characterEncodingName: "utf-8", baseURL: URL(fileURLWithPath: "/"))
+        releaseNotesView?.loadHTMLString(Self.styledHTML(Self.preformatted(error.localizedDescription)),
+                                         baseURL: URL(fileURLWithPath: "/"))
     }
 
     override func showReady(toInstallAndRelaunch reply: @escaping (SPUUserUpdateChoice) -> Void) {
@@ -74,8 +75,8 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
         let content = NSStackView(views: [versions])
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 12
-        content.setFrameSize(NSSize(width: max(360, versions.fittingSize.width), height: versions.fittingSize.height))
+        content.spacing = 14
+        content.setFrameSize(NSSize(width: max(400, versions.fittingSize.width), height: versions.fittingSize.height))
         alert.accessoryView = content
         alert.addButton(withTitle: ready
             ? Localization.string(zh: "安装并重启", en: "Install & Restart")
@@ -89,14 +90,73 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
 
     private func addReleaseNotes(to alert: NSAlert) -> WKWebView {
         let content = alert.accessoryView as! NSStackView
-        let notes = WKWebView(frame: NSRect(x: 0, y: 0, width: content.frame.width, height: 180))
+        let width = content.frame.width
+        let initialHeight: CGFloat = 120
+
+        let notes = WKWebView(frame: .zero)
         notes.navigationDelegate = self
-        content.addArrangedSubview(notes)
-        notes.widthAnchor.constraint(equalToConstant: content.frame.width).isActive = true
-        notes.heightAnchor.constraint(equalToConstant: 180).isActive = true
-        content.setFrameSize(NSSize(width: content.frame.width, height: content.frame.height + 192))
+        notes.setValue(false, forKey: "drawsBackground")
+        notes.translatesAutoresizingMaskIntoConstraints = false
+
+        let card = ReleaseNotesCardView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(notes)
+        NSLayoutConstraint.activate([
+            notes.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            notes.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            notes.topAnchor.constraint(equalTo: card.topAnchor),
+            notes.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            card.widthAnchor.constraint(equalToConstant: width)
+        ])
+        let height = card.heightAnchor.constraint(equalToConstant: initialHeight)
+        height.isActive = true
+        content.addArrangedSubview(card)
+        content.setFrameSize(NSSize(width: width, height: content.frame.height + initialHeight + content.spacing))
+
         releaseNotesView = notes
+        releaseNotesHeight = height
+        releaseNotesAlert = alert
         return notes
+    }
+
+    private static func preformatted(_ text: String) -> String {
+        let escaped = text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        return "<pre>\(escaped)</pre>"
+    }
+
+    private static func styledHTML(_ body: String) -> String {
+        """
+        <!doctype html><html><head><meta charset="utf-8">
+        <meta name="color-scheme" content="light dark">
+        <style>
+        :root { color-scheme: light dark; }
+        html, body { background: transparent; }
+        body { margin: 0; padding: 12px 14px; font: 13px/1.55 -apple-system, "PingFang SC", sans-serif;
+               color: CanvasText; word-wrap: break-word; }
+        h1, h2, h3 { font-size: 14px; margin: 0 0 6px; }
+        p, ul, ol { margin: 0 0 8px; } ul, ol { padding-left: 20px; }
+        a { color: LinkText; text-decoration: none; font-weight: 500; }
+        a:hover { text-decoration: underline; }
+        pre { margin: 0; white-space: pre-wrap; font: inherit; }
+        </style></head><body>\(body)</body></html>
+        """
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        webView.evaluateJavaScript("document.body.scrollHeight") { [weak self] result, _ in
+            guard let self, let measured = result as? CGFloat, let constraint = self.releaseNotesHeight,
+                  let alert = self.releaseNotesAlert, let content = alert.accessoryView as? NSStackView else { return }
+            let target = min(max(measured, 44), 220)
+            let delta = target - constraint.constant
+            guard delta != 0 else { return }
+            constraint.constant = target
+            content.setFrameSize(NSSize(width: content.frame.width, height: content.frame.height + delta))
+            alert.layout()
+            alert.window.center()
+        }
     }
 
     private func present(_ alert: NSAlert, reply: @escaping (SPUUserUpdateChoice) -> Void) {
@@ -133,6 +193,7 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
         updateAlert?.window.close()
         updateAlert = nil
         releaseNotesView = nil
+        releaseNotesHeight = nil
         reply?(choice)
     }
 
@@ -168,6 +229,27 @@ final class UpdateUserDriver: SPUStandardUserDriver, NSWindowDelegate, WKNavigat
             decisionHandler(.cancel)
         } else {
             decisionHandler(.allow)
+        }
+    }
+}
+
+private final class ReleaseNotesCardView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            layer?.borderColor = NSColor.separatorColor.cgColor
         }
     }
 }
