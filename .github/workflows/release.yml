@@ -57,6 +57,13 @@ jobs:
             exit 1
           fi
 
+      # 测试红了就不发版。只在 universal 这一格跑：三格编的是同一份源码，跑三遍没有新信息；
+      # release job 依赖整个矩阵，这一格失败就不会有 GitHub Release 和 appcast 更新。
+      # 放在导入证书之前，失败时签名材料根本不会落到 runner 上。
+      - name: Run unit tests
+        if: matrix.arch == 'universal'
+        run: swift test
+
       - name: Derive version from tag
         id: version
         run: |
