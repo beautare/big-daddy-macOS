@@ -18,6 +18,14 @@ final class ScreenshotUploadBodyTests: XCTestCase {
         return s
     }
 
+    /// 这个值要和服务端对同一批文件算出来的逐字节相等，否则每一张截图都会被拒。
+    /// 期望值是 "abc" 的标准 SHA-256 测试向量：分成两张图上传，拼接后仍是 "abc"。
+    func testContentHashIsSha256OfImagesConcatenatedInOrder() {
+        let hash = BigDaddyClient.screenshotContentHash(images: [Data("a".utf8), Data("bc".utf8)])
+        XCTAssertEqual(hash, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        XCTAssertNotEqual(hash, BigDaddyClient.screenshotContentHash(images: [Data("bc".utf8), Data("a".utf8)]))
+    }
+
     func testSingleScreenKeepsOriginalFilename() {
         let body = BigDaddyClient.multipartBody(boundary: boundary, images: [Data([0x41])])
         let s = text(body)

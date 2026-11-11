@@ -844,6 +844,9 @@ final class BigDaddyClient: @unchecked Sendable {
             "previousCrashAt": reportedCrashAt.map { BigDaddyDateFormatter.iso8601.string(from: $0) } ?? NSNull(),
             "reportedAt": BigDaddyDateFormatter.iso8601.string(from: occurredAt),
             "ping": isPing,
+            // 本机时区（IANA 名）。家长中心的日报按它划"昨天"、每日简报按它对钟点；
+            // 每次心跳都带，孩子带着电脑出国、改了系统时区，下一次心跳就跟上。
+            "timeZone": TimeZone.current.identifier,
             "metadata": [
                 "screenRecordingGranted": hasScreenRecordingAccess(),
                 "accessibilityGranted": AXIsProcessTrustedWithOptions(nil),
@@ -1975,6 +1978,14 @@ final class BigDaddyClient: @unchecked Sendable {
     /// `--boundary`，最后一条是 `--boundary--`。错一个字节，服务端要么少收一个部分、
     /// 要么整个请求解析失败——而这类错误只在真机上传时才暴露，所以单独拆出来做纯函数
     /// 并加了测试。
+    /// 各张图片的字节按顺序拼接后的 SHA-256（十六进制）。与服务端
+    /// BigDaddyDeviceAuthService.requireFingerprintForUpload 的算法逐字节对应。
+    static func screenshotContentHash(images: [Data]) -> String {
+        var hasher = SHA256()
+        for image in images { hasher.update(data: image) }
+        return hasher.finalize().hex
+    }
+
     static func multipartBody(boundary: String, images: [Data]) -> Data {
         var body = Data()
         for (index, imageData) in images.enumerated() {
@@ -2048,8 +2059,13 @@ final class BigDaddyClient: @unchecked Sendable {
         let timestamp = String(Int(Date().timeIntervalSince1970))
         let nonce = UUID().uuidString
         let pathWithQuery = url.path + (url.query.map { "?\($0)" } ?? "")
-        let emptyHash = SHA256.hash(data: Data()).hex
-        let canonical = "\(method)\n\(pathWithQuery)\n\(emptyHash)\n\(timestamp)\n\(nonce)"
+        // 图片字节也要进签名：multipart 正文整体不参与规范串，所以单独对"各张图片按顺序
+        // 拼接"算一个 SHA-256，放进请求头并顶替规范串里的正文哈希。服务端先按它验签，
+        // 再核对它与实际收到的图片一致。**要求后端已支持这个请求头**——旧后端会按空正文
+        // 哈希验签，结果是 401。
+        let contentHash = Self.screenshotContentHash(images: images)
+        request.setValue(contentHash, forHTTPHeaderField: "X-Device-Content-SHA256")
+        let canonical = "\(method)\n\(pathWithQuery)\n\(contentHash)\n\(timestamp)\n\(nonce)"
         
         let key = SymmetricKey(data: identity.secretHash.data(using: .utf8)!)
         let signature = HMAC<SHA256>.authenticationCode(for: canonical.data(using: .utf8)!, using: key).data.base64URLEncodedString()

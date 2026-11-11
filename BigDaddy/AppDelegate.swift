@@ -708,12 +708,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         //
         // 改成只要绑定了就常驻。代价是"权限缺着、功能没开"这段时间菜单里多一行——但那一行
         // 是可点即修的，不是报警（措辞跟着分开，见下），比一个找不到的入口划算得多。
+        // 三条权限待办先收集起来，最后统一决定怎么摆：只有一条时照旧放在一级菜单；
+        // 两条以上合成一项"有 N 项权限需要处理"、点开再逐条修。否则几条 ⚠️ 连着排在
+        // 菜单顶部，孩子和家长都分不清先点哪条，菜单也被挤得很长。
+        var permissionItems: [NSMenuItem] = []
         if client.config.bound && !checkScreenRecordingPermission() {
             // 截图没开时不用"⚠️ 未授权"的口吻：此刻确实什么都没坏、也没有任何东西不生效，
             // 报警等于骗人。同一颗按钮，两种措辞。
             let screenshotOn = client.config.screenshotEnabled
             if awaitingScreenRecordingGrant {
-                menu.addItem(NSMenuItem(
+                permissionItems.append(NSMenuItem(
                     title: Localization.string(
                         zh: "✅ 已在设置里授权？点此重启生效",
                         en: "✅ Granted in Settings? Restart to Apply"
@@ -726,7 +730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 // awaitingScreenRecordingGrant 就一直是 false，于是截图开着、权限缺着，
                 // 菜单里却一条相关的都没有——图标上的警示徽章没有任何可点的落点，
                 // 和辅助功能/浏览器网址那两条待办的待遇不一致。
-                menu.addItem(NSMenuItem(
+                permissionItems.append(NSMenuItem(
                     title: screenshotOn
                         ? Localization.string(
                             zh: "⚠️ 屏幕录制未授权 · 点此修复",
@@ -739,7 +743,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     action: #selector(openScreenRecordingSettings), keyEquivalent: ""
                 ))
             }
-            menu.addItem(.separator())
         }
 
         // 辅助功能未授权：和下面那条网址授权一样是"可点即修"的待办，但后果更重——
@@ -753,14 +756,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 任何一个入口**能把它重新打开：菜单里没有、「关于」窗口里也没有，只有重新
         // 绑定一次才会再弹那道闸。这正是"Firefox 一直显示无网址、却无从下手"的成因。
         if client.config.bound && !AXIsProcessTrustedWithOptions(nil) {
-            menu.addItem(NSMenuItem(
+            permissionItems.append(NSMenuItem(
                 title: Localization.string(
                     zh: "⚠️ 辅助功能未授权 · 点此修复",
                     en: "⚠️ Accessibility access off · Fix it"
                 ),
                 action: #selector(promptAccessibilityPermission), keyEquivalent: ""
             ))
-            menu.addItem(.separator())
         }
 
         // 浏览器网址未授权：这是一条**可点即修**的待办，必须留在一级菜单。
@@ -778,13 +780,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // 孩子第一次打开它们，onBrowserAutomationBlocked 会在那一刻发起真实的系统询问，
         // 该修的时候 automationDeniedBundleIDs 会自然把它们带进来。
         if client.config.bound && !automationDeniedBundleIDs.isEmpty {
-            menu.addItem(NSMenuItem(
+            permissionItems.append(NSMenuItem(
                 title: Localization.string(
                     zh: "⚠️ 浏览器网址未授权 · 点此修复",
                     en: "⚠️ Browser URL access off · Fix it"
                 ),
                 action: #selector(promptAutomationPermission), keyEquivalent: ""
             ))
+        }
+
+        if permissionItems.count == 1 {
+            menu.addItem(permissionItems[0])
+            menu.addItem(.separator())
+        } else if permissionItems.count > 1 {
+            let submenu = NSMenu()
+            permissionItems.forEach { submenu.addItem($0) }
+            let item = NSMenuItem(
+                title: Localization.string(
+                    zh: "⚠️ 有 \(permissionItems.count) 项权限需要处理",
+                    en: "⚠️ \(permissionItems.count) permissions need attention"
+                ),
+                action: nil, keyEquivalent: ""
+            )
+            item.submenu = submenu
+            menu.addItem(item)
             menu.addItem(.separator())
         }
 
