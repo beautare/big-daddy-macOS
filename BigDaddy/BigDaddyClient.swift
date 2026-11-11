@@ -286,8 +286,10 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 切换 App 后"即时上报"的防抖任务：把快速连切合并成一次发送
     private var switchHeartbeatWork: DispatchWorkItem?
 
-    init() {
-        self.identity = IdentityStore.load()
+    /// identity 可注入：单元测试传一个固定值，就不会去读写本机真实的
+    /// ~/Library/Application Support/BigDaddy/device-secret，也不会调 ioreg 取硬件 UUID。
+    init(identity: DeviceIdentity = IdentityStore.load()) {
+        self.identity = identity
         var restored = ConfigStore.load() ?? ClientConfig()
         // 磁盘上存下来的（完整 ClientConfig 里那份）timeSession 一律作废。
         //

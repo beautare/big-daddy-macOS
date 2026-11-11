@@ -31,7 +31,7 @@ final class ScreenshotBlockwiseDedupTests: XCTestCase {
     }
 
     private func makeClient() -> BigDaddyClient {
-        BigDaddyClient()
+        BigDaddyClient(identity: DeviceIdentity(fingerprint: "test-fingerprint", secretHash: "test-secret-hash"))
     }
 
     /// 这是本次改动**唯一的存在理由**，也是最该被钉死的一条。
