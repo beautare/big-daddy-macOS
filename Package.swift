@@ -23,7 +23,9 @@ let package = Package(
         ),
         .testTarget(
             name: "BigDaddyTests",
-            dependencies: ["BigDaddy"]
+            dependencies: ["BigDaddy"],
+            // 判例文件按源码路径读取（dashboard、iPhone 的测试也读同一份），不打进测试包
+            exclude: ["Fixtures"]
         )
     ]
 )

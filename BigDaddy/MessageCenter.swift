@@ -49,7 +49,7 @@ final class MessageCenter {
         return Localization.string(zh: "💬 家长留言 / 申请时间…", en: "💬 Parent notes / Ask for time…")
     }
 
-    /// 门铃或 revision 变化时调用。并发进来的请求合并成"做完这次再做一次"。
+    /// 对话 revision 或约定变化时调用。并发进来的请求合并成"做完这次再做一次"。
     func refresh() {
         guard client.config.bound else { return }
         if fetchInFlight {

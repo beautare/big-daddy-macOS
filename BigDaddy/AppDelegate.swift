@@ -65,7 +65,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private let webFilterController = WebFilterController()
     private var screenshotTimer: Timer?
     private var heartbeatTimer: Timer?
-    private var commandTimer: Timer?
     private var idleActivityTimer: Timer?
     private let idleActivityPollInterval: TimeInterval = 5
     private var configTimer: Timer?
@@ -331,20 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self, selector: #selector(onBrowserAutomationBlocked),
             name: BigDaddyClient.browserAutomationBlockedNotification, object: nil
         )
-        // 时间约定的门铃：命令轮询里一旦发现 SYNC_TIME_SESSION 就已经 refreshConfig 过，
-        // 这里只需要把最新状态同步进旗帜/菜单/计时器，把感知延迟从 60 秒配置轮询压到
-        // 命令轮询的 0~30 秒。
-        NotificationCenter.default.addObserver(
-            forName: BigDaddyClient.timeSessionSyncedNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.syncTimeSessionState()
-                // 约定开始/结束/延长都会改变孩子能不能申请、申请的是"延长"还是"新开"，
-                // 而这些变化不会让消息的 revision 变，得在这里顺带拉一次
-                self?.messageCenter.refresh()
-            }
-        }
-        // 短消息：SYNC_MESSAGES 门铃或配置里的 revision 变了，就去拉一次对话。
+        // 短消息：配置里的 revision 变了（或约定变了），就去拉一次对话。
         messageCenter.anchorProvider = { [weak self] in self?.statusItem }
         messageCenter.timeFlagProvider = { [weak self] in self?.timeFlag }
         messageCenter.onChange = { [weak self] in self?.rebuildMenu() }
@@ -354,7 +340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             Task { @MainActor [weak self] in self?.messageCenter.refresh() }
         }
         // 监听凭据失效（401）通知：解绑或服务端凭据失效时立即触发 pollConfigForChildVisibility()，
-        // 将解绑感知从最长 60 秒轮询压到秒级
+        // 将解绑感知压到秒级
         NotificationCenter.default.addObserver(
             forName: BigDaddyClient.credentialsInvalidNotification, object: client, queue: .main
         ) { [weak self] _ in
@@ -1322,7 +1308,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             if !(channels.telegramChatId ?? "").isEmpty && channels.telegramEnabled != false {
                 channelNames.append("Telegram")
             }
-            if !(channels.whatsappPhone ?? "").isEmpty { channelNames.append("WhatsApp") }
             if !channelNames.isEmpty {
                 rows.append(.text(
                     label: Localization.string(zh: "通知渠道", en: "Notify via"),
@@ -2170,7 +2155,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         wasIdle = false
         stopIdleActivityMonitor()
         scheduleNextHeartbeat()
-        scheduleNextCommandPoll()
         synchronizePresence(initialEvent: event)
         Task {
             let intervalBeforeResume = client.config.screenshotIntervalMins
@@ -2220,12 +2204,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         scheduleScreenshotTimer()
 
         scheduleNextHeartbeat()
-        scheduleNextCommandPoll()
         scheduleIdleActivityMonitor()
 
-        // 定期拉取配置，使家长在后端的开启/撤销近实时生效，并让状态变化对孩子端可见
+        // 家长那边的变化靠心跳带回的同步令牌及时发现（见 syncAfterHeartbeat）；这里只是
+        // 低频对账：令牌比对漏掉什么、凭据失效后重新登记、补发队列滞留，都在这一轮追上。
         configTimer?.invalidate()
-        configTimer = scheduleCommonModeTimer(interval: 60, repeats: true) { [weak self] _ in
+        configTimer = scheduleCommonModeTimer(interval: 600, repeats: true) { [weak self] _ in
             Task { [weak self] in await self?.pollConfigForChildVisibility() }
         }
 
@@ -2257,6 +2241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                     // 锁屏持续期间：仅发送轻量 ping 保活（isPing: true），不重复落库 SCREEN_LOCK 流水记录
                     await self.client.sendHeartbeat(event: .screenLock, isPing: true)
                     self.scheduleNextHeartbeat()
+                    await self.syncAfterHeartbeat()
                     return
                 }
                 let previouslyIdle = self.wasIdle
@@ -2275,39 +2260,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
                 } else {
                     self.stopIdleActivityMonitor()
                 }
-                self.triggerImmediateCommandPollIfNeeded()
+                await self.syncAfterHeartbeat()
             }
         }
     }
 
-    /// 命令轮询自我重排：活跃态 30 秒一次，空闲态降到 5 分钟一次。
-    private func scheduleNextCommandPoll() {
-        commandTimer?.invalidate()
-        guard client.config.bound else { return }
-        let interval: TimeInterval = wasIdle ? 300 : 30
-        commandTimer = scheduleCommonModeTimer(interval: interval, repeats: false) { [weak self] _ in
-            guard let self else { return }
-            Task {
-                await self.client.pollCommands()
-                await MainActor.run { self.scheduleNextCommandPoll() }
-            }
+    /// 每次心跳之后：令牌变了就拉配置，有待办命令就去取；顺带看一眼"连不上服务器"的
+    /// 提示要不要出现或收起——这件事只在跨过阈值那一刻需要重建菜单。
+    private func syncAfterHeartbeat() async {
+        if client.needsConfigSync {
+            await pollConfigForChildVisibility()
+        }
+        triggerImmediateCommandPollIfNeeded()
+        let unreachable = isWebFilterUnreachableWhileRestricting
+        if unreachable != lastShownUnreachable {
+            lastShownUnreachable = unreachable
+            rebuildMenu()
         }
     }
 
-    /// 心跳/配置响应里如果带回 hasPendingCommand=true，立即触发一次命令轮询，
-    /// 不等下一次定时轮询窗口，缩短"测试截图命令"从下发到执行的延迟。
+    /// 心跳带回 hasPendingCommand=true 时去取命令。命令只有家长手动下发的"即时截图"
+    /// 一种，不再定时轮询：心跳本身就在报告有没有命令在等。
     private func triggerImmediateCommandPollIfNeeded() {
         guard client.config.bound, client.config.hasPendingCommand else { return }
-        commandTimer?.invalidate()
-        Task {
-            await client.pollCommands()
-            await MainActor.run { self.scheduleNextCommandPoll() }
-        }
+        Task { await client.pollCommands() }
     }
 
-    /// 近实时拉取配置：一旦家长开启或撤销截图，立即更新常驻指示并通知孩子端。
+    /// 拉取配置并把变化落到界面上：截图开关、间隔、绑定状态、约定、凭据。由同步令牌变化、
+    /// 10 分钟对账和凭据失效三处触发。
     private func pollConfigForChildVisibility() async {
-        // 补发的兜底触发点（每 60 秒一次）。前两个触发点是网络路径翻转和实时心跳成功，
+        // 补发的兜底触发点。前两个触发点是网络路径翻转和实时心跳成功，
         // 但两者都可能长时间不发生：路径一直 satisfied（强制门户/后端故障），而心跳如果
         // 也一直失败就永远没有"成功"可言。有这一条兜底，队列不会因为错过某个边沿而
         // 无限期滞留——这是旧实现最主要的缺陷（补发只挂在 NWPathMonitor 一个触发点上）。
@@ -2320,10 +2302,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let intervalBefore = client.config.screenshotIntervalMins
         let activeHeartbeatBefore = client.config.heartbeatActiveSeconds
         let idleHeartbeatBefore = client.config.heartbeatIdleSeconds
-        // "限网仍在生效、但连不上服务器"这条菜单提示只在跨过阈值那一刻才需要重建菜单——
-        // 之后每一次同样失败的轮询都不该白白触发一次 rebuildMenu()，那道门槛本身
-        // 已经在 isWebFilterUnreachableWhileRestricting 里做了消抖。
-        let unreachableBefore = isWebFilterUnreachableWhileRestricting
         // 凭据失效时签名通道全断，config 轮询收不到任何信号（包括解绑）。register 不签名：
         // 家长解绑后，后端会重新接受本机 secret（未绑定设备允许换钥），凭据在这里自动恢复，
         // 随后回到常规配置轮询——不需要重启客户端。
@@ -2333,11 +2311,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         var changed = false
         if !client.credentialsInvalid {
             changed = await client.refreshConfig().changed
-        } else {
-            // 跳过也是一次"这一轮没拿到配置"，必须照常计数——否则凭据失效期间计数器会
-            // 永远停在进入该状态的那一次上，"限制仍在生效、连不上服务器"的提示反而在
-            // 最该出现的场景里永远到不了阈值。见 noteConfigRefreshSkipped 的注释。
-            client.noteConfigRefreshSkipped()
         }
         if activeHeartbeatBefore != client.config.heartbeatActiveSeconds
             || idleHeartbeatBefore != client.config.heartbeatIdleSeconds {
@@ -2347,13 +2320,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         await reportWebFilterStatus()
         let boundChanged = client.config.bound != boundBefore
         let credentialsChanged = client.credentialsInvalid != invalidBefore
-        let unreachableChanged = isWebFilterUnreachableWhileRestricting != unreachableBefore
-        guard changed || boundChanged || credentialsChanged || unreachableChanged else { return }
+        guard changed || boundChanged || credentialsChanged else { return }
         let after = client.config.screenshotEnabled
         await MainActor.run {
-            // 60 秒配置轮询是时间约定的兜底同步路径——门铃丢失、或家长在设备离线期间
-            // 操作过（改约/中断）都靠它最终追上。syncTimeSessionState 内部会自行判断
-            // sessionId 是否真的变了，这里无脑调用即可。
+            // syncTimeSessionState 内部会自行判断 sessionId 是否真的变了，这里无脑调用即可。
             syncTimeSessionState()
             rebuildMenu()
             updateStatusItemAppearance()
@@ -2443,8 +2413,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         return anchor.remainingSeconds()
     }
 
-    /// 时间约定状态同步的统一入口。三处调用：60 秒配置轮询的兜底对比（changed 为真时）、
-    /// SYNC_TIME_SESSION 门铃触发的即时刷新、系统唤醒后的强制重新校准。
+    /// 时间约定状态同步的统一入口。两处调用：配置拉取后（changed 为真时，
+    /// 含同步令牌变化触发的那次）、系统唤醒后的强制重新校准。
     ///
     /// 截止点的定锚已经下沉到 BigDaddyClient.refreshConfig()（见 TimeSessionAnchor），
     /// 这里不再自己计算；只负责在 sessionId 确实变化（新开/被替换/被中断/清空）时，
@@ -4626,10 +4596,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
     }
 
-    /// 连续多少次配置轮询失败（每次间隔 60 秒，见 configTimer）才提示"限制仍在生效中，
-    /// 但连不上家长服务器"。10 次 ≈ 10 分钟：短暂断网/服务器重启不该触发，只在真的
-    /// 持续失联时才说。
-    private static let webFilterUnreachableNoticeThreshold = 10
+    /// 连续失联多久才提示"限制仍在生效中，但连不上家长服务器"。短暂断网/服务器重启
+    /// 不该触发，只在真的持续失联时才说。
+    private static let webFilterUnreachableNoticeThreshold: TimeInterval = 10 * 60
+    /// 菜单上次按哪个状态画的"连不上服务器"提示，见 syncAfterHeartbeat。
+    private var lastShownUnreachable = false
 
     /// 限网正在拦截、且已经连续失联了一段时间——这不是"哪里坏了"（拦截本身工作正常），
     /// 只是解除信号送不到这台 Mac。与 webFilterAttention 互斥（`webFilterAttention == .none`
@@ -4641,7 +4612,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var isWebFilterUnreachableWhileRestricting: Bool {
         webFilterAttention == .none
             && webFilterController.isRestrictingWebAccess
-            && client.consecutiveConfigRefreshFailures >= Self.webFilterUnreachableNoticeThreshold
+            && (client.serverUnreachableSince.map {
+                Date().timeIntervalSince($0) >= Self.webFilterUnreachableNoticeThreshold
+            } ?? false)
     }
 
     private func webFilterMenuTitle(for attention: WebFilterAttention) -> String? {

@@ -71,7 +71,7 @@ extension TimeSession: Equatable {
     /// 只比 sessionId：remainingSeconds 每次配置轮询都在变，若参与相等性比较，
     /// ClientConfig 的 `config != previous` 在约定进行期间会永远判定"有变化"，让
     /// pollConfigForChildVisibility 里"只在真正变化时才做的事"（rebuildMenu、发
-    /// CONFIG_UPDATED 心跳等）在每一次 60 秒轮询都被误触发。
+    /// CONFIG_UPDATED 心跳等）在每一次配置拉取时都被误触发。
     static func == (lhs: TimeSession, rhs: TimeSession) -> Bool {
         lhs.sessionId == rhs.sessionId
     }
@@ -93,7 +93,6 @@ struct NotificationChannels: Codable, Equatable {
     var telegramBotToken: String?
     var telegramChatId: String?
     var telegramEnabled: Bool?
-    var whatsappPhone: String?
 }
 
 struct ClientConfig: Codable, Equatable {
@@ -117,7 +116,7 @@ struct ClientConfig: Codable, Equatable {
     var hasPendingCommand: Bool = false
     var webFilter: WebFilterConfiguration = WebFilterConfiguration()
     /// 当前活跃的时间约定（nil = 没有）。这是客户端获取会话状态的**唯一权威来源**：
-    /// SYNC_TIME_SESSION 命令只是门铃，冷启动、断网恢复、睡眠唤醒全部走这条路恢复。
+    /// 冷启动、断网恢复、睡眠唤醒、同步令牌变化全部走这条路恢复。
     var timeSession: TimeSession? = nil
     /// 家长在 Dashboard 打开的"连续性模式"：崩溃 / 强制退出后由用户级 LaunchAgent
     /// KeepAlive 拉起。缺省 false；旧后端不下发此字段时保持关闭，行为与今天一致。
@@ -144,6 +143,9 @@ struct ClientConfig: Codable, Equatable {
     /// 家长与孩子短消息的摘要（模式、申请开关、revision）。旧后端不下发时为 nil，
     /// 菜单里不出现消息入口，也不去拉对话。
     var messaging: ClientMessagingSummary? = nil
+    /// 这份配置对应的同步令牌。心跳每次都带回服务端当前的令牌，与这里的不同就说明
+    /// 家长那边改了什么（设置、网站规则、约定、限网、消息），该重拉一次配置了。
+    var syncToken: String? = nil
 
     init() {
     }
@@ -170,6 +172,7 @@ struct ClientConfig: Codable, Equatable {
         continuityModeUpdatedAt = try container.decodeIfPresent(String.self, forKey: .continuityModeUpdatedAt)
         boundToEmailMasked = try container.decodeIfPresent(String.self, forKey: .boundToEmailMasked)
         messaging = try container.decodeIfPresent(ClientMessagingSummary.self, forKey: .messaging)
+        syncToken = try container.decodeIfPresent(String.self, forKey: .syncToken)
     }
 }
 
@@ -224,7 +227,7 @@ final class BigDaddyClient: @unchecked Sendable {
     static var lastSharedInstance: BigDaddyClient?
     static let webFilterConfigChangedNotification = Notification.Name("BigDaddyWebFilterConfigChanged")
     static let credentialsInvalidNotification = Notification.Name("BigDaddyCredentialsInvalid")
-    /// 短消息可能有变化（SYNC_MESSAGES 门铃，或配置里的 revision 与上次拉到的不同）。
+    /// 短消息可能有变化（配置里的 revision 与上次拉到的不同，或约定变了）。
     /// 收到后由 MessageCenter 去拉一次对话；通知本身不带任何内容。
     static let messagesChangedNotification = Notification.Name("BigDaddyMessagesChanged")
 
@@ -252,26 +255,32 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 最近一次成功拉取对话时服务端给的 revision。只在内存里：重启后为 nil，第一次
     /// 配置刷新必然触发一次拉取——这同时也让服务端知道"这台 Mac 的版本支持消息"。
     var lastFetchedMessagesRevision: String?
-    /// 连续拿不到配置的轮询次数，成功一次就清零。存在的理由只有一个：限网
-    /// 生效期间，如果这台 Mac 长时间连不上后端，孩子没法知道"限制会不会自动解除"——
-    /// 答案是不会（也不该会，见 AppDelegate 里那条提示的注释），但沉默本身会诱使孩子
-    /// 以为是网络故障反复重启/重装排查，制造更多真正需要家长处理的麻烦。不区分认证
-    /// 失败/网络错误/解析失败，统一算一次失败：三者对孩子来说是同一种体验（连不上），
-    /// 没必要在这个计数器里分开处理。
-    var consecutiveConfigRefreshFailures = 0
+    /// 从哪一刻起连不上后端（心跳和配置拉取都算），任何一次成功就清掉。存在的理由只有
+    /// 一个：限网生效期间，如果这台 Mac 长时间连不上后端，孩子没法知道"限制会不会自动
+    /// 解除"——答案是不会，但沉默本身会诱使孩子以为是网络故障反复重启/重装排查。不区分
+    /// 认证失败/网络错误/解析失败：三者对孩子来说是同一种体验（连不上）。
+    ///
+    /// 记的是时刻而不是失败次数：心跳在活跃/空闲/锁屏下节奏各不相同，次数换算不成时长；
+    /// 合盖睡眠期间根本不发请求，也就不会把睡着的那几个小时算成"失联"。
+    private(set) var serverUnreachableSince: Date?
+    /// 心跳带回的服务端同步令牌，与 config.syncToken 不同就该重拉配置。
+    private(set) var remoteSyncToken: String?
 
-    /// 这一轮**根本没能发起** refreshConfig()，同样计入失败。
-    ///
-    /// 专为凭据失效准备：那种状态下 60 秒主轮询会整个跳过 refreshConfig()（签名通道全断，
-    /// 调了必然 401，见 AppDelegate.pollConfigForChildVisibility），于是计数器会永远停在
-    /// 进入该状态时的那一次上，"连不上服务器"的提示再也到不了阈值——而凭据失效恰恰是
-    /// 最需要这条提示的一种：设备看着在线、限网继续拦、任何策略都收不到。
-    ///
-    /// 只该由那条 60 秒轮询调用。绑定探测那个 3 秒一轮的 burst 用着同样的跳过写法，但
-    /// 它两分钟能跑 40 轮，计进来会让阈值失去"大约十分钟"的含义。
-    func noteConfigRefreshSkipped() {
-        consecutiveConfigRefreshFailures += 1
+    var needsConfigSync: Bool {
+        guard let remoteSyncToken else { return false }
+        return remoteSyncToken != config.syncToken
     }
+
+    private func noteServerReachable() {
+        serverUnreachableSince = nil
+    }
+
+    private func noteServerUnreachable() {
+        if serverUnreachableSince == nil {
+            serverUnreachableSince = Date()
+        }
+    }
+
     /// 当前是否有浏览器处于"自动化权限被拒"状态，随心跳上报（见 sendHeartbeat 的 metadata）。
     /// 那份被拒 bundle id 的集合归 AppDelegate 管（探测、重置、菜单入口都在那边），
     /// 这里只留一个被同步过来的布尔值——心跳在这个类里组装，总得有个地方读到它。
@@ -544,21 +553,17 @@ final class BigDaddyClient: @unchecked Sendable {
             data = try await request(path: "/bigdaddy/client/config", method: "GET", body: nil, signed: true)
         } catch let error as BigDaddyAPIError where error.isAuthFailure {
             markCredentialsInvalid()
-            consecutiveConfigRefreshFailures += 1
+            noteServerUnreachable()
             return .failed
         } catch {
-            consecutiveConfigRefreshFailures += 1
+            noteServerUnreachable()
             return .failed
         }
         guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<ClientConfig>.self, from: data) else {
-            consecutiveConfigRefreshFailures += 1
+            noteServerUnreachable()
             return .failed
         }
-        // 从这里开始就是一次成功的刷新：不论后面走绑定还是未绑定分支，服务器都确实
-        // 回应了。清零失败计数——AppDelegate 拿它判断"限网期间是不是已经连不上服务器
-        // 太久了"（见 consecutiveConfigRefreshFailures 的注释），一次成功就该让计数
-        // 归零，不必等到下一轮才反映过来。
-        consecutiveConfigRefreshFailures = 0
+        noteServerReachable()
         let previous = config
         let remote = response.data
         if remote.bound {
@@ -572,6 +577,7 @@ final class BigDaddyClient: @unchecked Sendable {
             // 本地配置重置为默认值，是对规格明确要求的违反。
             config.bound = false
             config.hasPendingCommand = false
+            config.syncToken = remote.syncToken
             ConfigStore.save(config)
         }
         if config.webFilter != previous.webFilter || config.bound != previous.bound {
@@ -621,7 +627,10 @@ final class BigDaddyClient: @unchecked Sendable {
             ContinuityModePreference.overrideBaseline = nil
         }
         ContinuityModeController.sync(enabled: config.continuityMode && ContinuityModePreference.isEnabled)
-        if remote.bound, let messaging = remote.messaging, messaging.revision != lastFetchedMessagesRevision {
+        // 约定开始/结束/延长会改变孩子能不能申请、申请的是"延长"还是"新开"，而这些变化
+        // 不会让消息的 revision 变，所以约定一变也重拉一次对话。
+        if remote.bound, let messaging = remote.messaging,
+           messaging.revision != lastFetchedMessagesRevision || config.timeSession != previous.timeSession {
             NotificationCenter.default.post(name: Self.messagesChangedNotification, object: self)
         }
         return config != previous ? .successChanged : .successUnchanged
@@ -907,9 +916,12 @@ final class BigDaddyClient: @unchecked Sendable {
         }
         do {
             let data = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true, timeout: 10)
-            if let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<HeartbeatResponse>.self, from: data),
-               let pending = response.data.hasPendingCommand {
-                config.hasPendingCommand = pending
+            noteServerReachable()
+            if let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<HeartbeatResponse>.self, from: data) {
+                if let pending = response.data.hasPendingCommand {
+                    config.hasPendingCommand = pending
+                }
+                remoteSyncToken = response.data.syncToken
             }
             lastHeartbeatDescription = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
             // 实时心跳刚刚成功 ⇒ 通往后端的整条链路此刻是通的。这是补发最可靠的触发点：
@@ -925,6 +937,7 @@ final class BigDaddyClient: @unchecked Sendable {
             // 重试也不会成功——不进补发队列，改走 credentialsInvalid 恢复路径。
             NSLog("BigDaddy: heartbeat rejected (401): \(error.errorDescription ?? "")")
             markCredentialsInvalid()
+            noteServerUnreachable()
             // 这条 body 被丢弃了，墓碑时间戳还没有任何持久记录：放回去交给下一条心跳
             if let reportedCrashAt { restorePreviousCrash(reportedCrashAt) }
             return false
@@ -933,10 +946,12 @@ final class BigDaddyClient: @unchecked Sendable {
             // 实时上报的优先级高于补发历史，撞到 429 说明当下额度已经吃紧了。
             NSLog("BigDaddy: heartbeat rate limited, queuing for backfill: \(error.errorDescription ?? "")")
             noteRateLimited(retryAfter: error.retryAfterSeconds)
+            noteServerReachable()
             PendingQueue.enqueue(body)
             return false
         } catch {
             NSLog("BigDaddy: heartbeat failed, queuing for retry: \(error.localizedDescription)")
+            noteServerUnreachable()
             PendingQueue.enqueue(body)
             return false
         }
@@ -950,7 +965,7 @@ final class BigDaddyClient: @unchecked Sendable {
     /// 注意这**不是**唯一的触发点，而只是最快的那个。"网络不畅"里最常见的几种场景恰好
     /// 不改变 path.status（酒店/学校的强制门户、DNS 黑洞、后端 5xx、被限流），此时 Wi-Fi
     /// 始终是 .satisfied，路径永远不翻转。所以补发还有另外两个触发点：每次实时心跳成功后
-    /// （见 sendHeartbeat），以及 60 秒配置轮询的兜底（见 AppDelegate）。
+    /// （见 sendHeartbeat），以及 10 分钟一次的配置对账（见 AppDelegate）。
     func startNetworkMonitoring(onRecovery: @escaping @Sendable () -> Void) {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
@@ -2117,9 +2132,6 @@ final class BigDaddyClient: @unchecked Sendable {
     /// （关于面板里点"测试截图"）不广播这个——用户当时就看着"关于"面板，⚠️ 按钮本身
     /// 已经是最直接的提示，不需要再额外弹一条本机通知重复同一件事。
     static let screenshotMissingPermissionNotification = Notification.Name("BigDaddyScreenshotMissingPermission")
-    /// 时间约定状态已随一次 SYNC_TIME_SESSION 门铃刷新（config.timeSession 可能变了），
-    /// 供 AppDelegate 立即重新计算旗帜/菜单，不必等到下一次 60 秒配置轮询的对比。
-    static let timeSessionSyncedNotification = Notification.Name("BigDaddyTimeSessionSynced")
 
     /// 把截图按"最大宽度"等比缩小到严格的目标像素尺寸，只缩不放。
     ///
@@ -2545,58 +2557,17 @@ final class BigDaddyClient: @unchecked Sendable {
         }
         guard let response = try? JSONDecoder.bigDaddy.decode(ApiResponse<[Command]>.self, from: data) else { return }
         let screenshotCommands = response.data.filter { $0.type == "TAKE_SCREENSHOT_NOW" }
-        // SYNC_TIME_SESSION 是"门铃"，不携带会话状态本身——不解析 payload，收到就统一
-        // 去刷新配置，权威状态在 ConfigResponse.timeSession 里（见 TimeSession 注释）。
-        // 一次 poll 可能同时取回多条这样的门铃（家长连续操作了几次"改约/中断"），
-        // 逐条 ack 但只需要刷新一次配置，不必每条各刷一次。
-        let timeSessionCommands = response.data.filter { $0.type == "SYNC_TIME_SESSION" }
-        let configCommands = response.data.filter { $0.type == "SYNC_CONFIG" }
-        // 短消息门铃：payload 为空，不需要刷新配置——模式和申请开关会跟着对话一起回来。
-        let messageCommands = response.data.filter { $0.type == "SYNC_MESSAGES" }
-        if !messageCommands.isEmpty {
-            NotificationCenter.default.post(name: Self.messagesChangedNotification, object: self)
-        }
+        guard !screenshotCommands.isEmpty else { return }
         // 执行"即时截图"前先同步一次最新配置：家长的典型操作就是"在家长中心改完压缩质量/
-        // 截图宽度，立刻点测试截图看效果"。若不在这里刷新，这次截图会用客户端手上（最长
-        // 可能落后 60 秒配置轮询）的旧配置，家长对比时就会觉得"改了质量没区别/压缩没生效"。
-        let refreshResult: ConfigRefreshResult?
-        if !screenshotCommands.isEmpty || !timeSessionCommands.isEmpty || !configCommands.isEmpty {
-            refreshResult = await refreshConfig()
-        } else {
-            refreshResult = nil
-        }
+        // 截图宽度，立刻点测试截图看效果"。不在这里刷新的话，这次截图可能用的还是改之前的配置。
+        _ = await refreshConfig()
         for command in screenshotCommands {
-            // 之前无条件回执 SUCCEEDED，哪怕截图因为未开启/无权限/上传失败而根本没发生，
-            // 家长在 Dashboard 看到的命令状态是假的。现在按实际结果回执。
+            // 按实际结果回执：截图因为未开启/无权限/上传失败而没发生时，家长看到的不能是"成功"。
             let succeeded = (await captureAndSendScreenshot(reason: "command")).succeeded
             await ack(
                 commandId: command.commandId,
                 status: succeeded ? "SUCCEEDED" : "FAILED",
                 message: succeeded ? "Screenshot command processed" : "Screenshot not captured (disabled, missing permission, or upload failed)"
-            )
-        }
-        if !timeSessionCommands.isEmpty {
-            let succeeded = refreshResult?.succeeded == true
-            for command in timeSessionCommands {
-                await ack(
-                    commandId: command.commandId,
-                    status: succeeded ? "SUCCEEDED" : "FAILED",
-                    message: succeeded ? "Time session synced" : "Time session configuration refresh failed"
-                )
-            }
-            if succeeded {
-                NotificationCenter.default.post(name: Self.timeSessionSyncedNotification, object: nil)
-            }
-        }
-        for command in messageCommands {
-            await ack(commandId: command.commandId, status: "SUCCEEDED", message: "Messages sync requested")
-        }
-        let configSynced = refreshResult?.succeeded == true
-        for command in configCommands {
-            await ack(
-                commandId: command.commandId,
-                status: configSynced ? "SUCCEEDED" : "FAILED",
-                message: configSynced ? "Configuration synced" : "Configuration refresh failed"
             )
         }
     }
@@ -2624,7 +2595,7 @@ final class BigDaddyClient: @unchecked Sendable {
 
     // MARK: - 家长与孩子的短消息
 
-    /// 拉一次对话。服务端顺带把家长消息标成"已送达"。失败返回 nil，由下一次门铃或
+    /// 拉一次对话。服务端顺带把家长消息标成"已送达"。失败返回 nil，由下一次 revision 变化或
     /// 配置轮询再试——消息不是实时性到秒的东西，不值得为它做重试循环。
     func fetchMessages() async -> ChatConversation? {
         guard config.bound, !credentialsInvalid else { return nil }
@@ -2856,1293 +2827,5 @@ final class BigDaddyClient: @unchecked Sendable {
         runtimeLockGuard.lock()
         defer { runtimeLockGuard.unlock() }
         return runtimeLockRetired
-    }
-}
-
-/// 本机守护记录（知情透明）：把每一次实际发生的采集/上报动作追加到本地明文日志，
-/// 孩子和家长都可以在设备上直接查看或导出，用于印证"采集了什么、什么时候采集"。
-/// 这是"可导出审计留痕"的落地，不是隐蔽后台行为。
-/// 自动更新当前走的是主 feed（官网 CDN）还是备用 feed（gh-pages + 直连 GitHub 下载）。
-///
-/// 从 AppDelegate 里挪出来单独成型，是因为它有两个互不相干的读者：AppDelegate 在
-/// SPUUpdaterDelegate 回调里翻转它，而 sendHeartbeat 要把它捎给后端。**后者才是重点**——
-/// "这台机器已经退到备用下载源了"只发生在孩子那台 Mac 上，本机不会有任何人看到，
-/// 不随心跳上报就等于没人知道（本地 AuditLog 里那条 UPDATE_FEED_SWITCH 只有主动导出
-/// 守护记录时才看得见，指望不上它来发现故障）。
-///
-/// 存 UserDefaults 而不是内存：feedURLString(for:) 要同步返回、没法跳回 @MainActor
-/// 读属性，而 UserDefaults 本身线程安全；顺带也扛得住重启——官网出问题往往不是
-/// 一两分钟的事。
-enum UpdateFeedState {
-    private static let usingFallbackKey = "BigDaddyUpdateFeedUsingFallback"
-    private static let lastSwitchAtKey = "BigDaddyUpdateFeedLastSwitchAt"
-    private static let lastErrorCodeKey = "BigDaddyUpdateFeedLastErrorCode"
-
-    /// 下一次检查是否改用备用 feed。
-    static var usingFallback: Bool {
-        get { UserDefaults.standard.bool(forKey: usingFallbackKey) }
-        set { UserDefaults.standard.set(newValue, forKey: usingFallbackKey) }
-    }
-
-    /// 最近一次主备切换发生在什么时候；从没切换过时为 nil。
-    ///
-    /// 光上报 usingFallback 这一个瞬时值是不够的：切换逻辑是**翻转**而不是锁死
-    /// （见 AppDelegate 里的说明），主 feed 一直坏着时两个 feed 会交替上阵，心跳
-    /// 恰好落在"这一轮用主 feed"上时 usingFallback 就是 false，故障看起来像没发生过。
-    /// 有这个时间戳，后端才能按"最近还在反复切换"来判定，而不是靠抓那个瞬时值。
-    static var lastSwitchAt: Date? {
-        UserDefaults.standard.object(forKey: lastSwitchAtKey) as? Date
-    }
-
-    /// 触发最近一次切换的 Sparkle 错误码；从没切换过时为 nil。
-    static var lastErrorCode: Int? {
-        UserDefaults.standard.object(forKey: lastErrorCodeKey) as? Int
-    }
-
-    /// 记一次主备切换：翻转开关，并留下时刻和错误码供心跳上报。
-    static func recordSwitch(toFallback: Bool, errorCode: Int) {
-        usingFallback = toFallback
-        UserDefaults.standard.set(Date(), forKey: lastSwitchAtKey)
-        UserDefaults.standard.set(errorCode, forKey: lastErrorCodeKey)
-    }
-}
-
-enum AuditLog {
-    static var auditFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BigDaddy/guardian-audit.log")
-    }
-
-    static func record(_ line: String) {
-        let stamp = BigDaddyDateFormatter.iso8601.string(from: Date())
-        let entry = "\(stamp)\t\(line)\n"
-        let url = auditFileURL
-        do {
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            guard let data = entry.data(using: .utf8) else { return }
-            if FileManager.default.fileExists(atPath: url.path), let handle = try? FileHandle(forWritingTo: url) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            } else {
-                try data.write(to: url, options: .atomic)
-            }
-        } catch {
-            NSLog("BigDaddy: audit log write failed: \(error.localizedDescription)")
-        }
-    }
-
-    /// 解绑时清空本地历史审计日志文件
-    static func clear() {
-        try? FileManager.default.removeItem(at: auditFileURL)
-    }
-}
-
-/// 断网容错：心跳/事件发送失败时，把请求体缓存到本地文件（内存中每行一条 JSON），
-/// 绝不缓存截图字节。心跳里包含活动窗口标题、浏览器 URL 等隐私字段，落盘前用
-/// AES-GCM 加密（见 PendingQueueCrypto），磁盘上不会出现明文。网络恢复后由
-/// BigDaddyClient 的 NWPathMonitor 触发补发，重新签名（HMAC 时间戳必须是发送时刻的
-/// 新值，不能复用失败时的旧签名）后清空。
-enum PendingQueue {
-    /// **仅供单测**：把队列文件挪到临时目录，避免测试踩坏用户真实的补发队列。
-    /// 生产代码任何地方都不设置它；设置之后必须调 resetForTesting() 把内存镜像一并清掉，
-    /// 否则会拿着上一个文件的镜像去回答新文件的问题。
-    static var testFileURLOverride: URL?
-
-    static var queueFileURL: URL {
-        if let testFileURLOverride { return testFileURLOverride }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BigDaddy/pending-heartbeats.jsonl")
-    }
-
-    /// **仅供单测**：丢掉内存镜像，下次访问重新读盘。也用来模拟"进程重启"——
-    /// 这正是验证"镜像和磁盘没有分叉"的唯一手段。
-    static func resetForTesting() {
-        lock.lock()
-        defer { lock.unlock() }
-        cache = nil
-    }
-
-    /// 解除设备绑定时物理清空本地积压队列与内存镜像，防止残留敏感行为数据泄露
-    static func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        cache = []
-        try? FileManager.default.removeItem(at: queueFileURL)
-    }
-
-    /// 队列的保留窗口：**按时长**而不是按条数裁剪。
-    ///
-    /// 此前是"最多 200 条，超了丢最老的"。200 条在中度使用下只够 30 多分钟——一次晚饭时间
-    /// 的断网就开始静默丢数据，而且丢的是最早那批（最该保留的断网起点）。限速补发把排水
-    /// 速度控制住了，但水池太小的话再优雅的排水也没有意义，所以这里必须一起改。
-    ///
-    /// 24 小时覆盖了"周末外出一天""家里宽带故障一晚"这类真实场景；再长的断网（如寒假旅行）
-    /// 补回来的价值已经很低，而且补发本身要占用当下的额度。
-    private static let maxAge: TimeInterval = 24 * 60 * 60
-    /// 文件体积的硬上限，防止极端高频事件在 24 小时里堆出一个巨大的文件。
-    /// 按"1 分钟心跳 + 密集应用切换"估算，正常一天远到不了这个量级。
-    private static let maxEntries = 5000
-
-    /// 队列文件的串行化锁：补发循环在后台任务里读写，实时心跳失败时会从别的线程追加，
-    /// 两者都是"整份读出→改→整份写回"，不加锁会互相覆盖（丢事件或写出坏行）。
-    /// 内存镜像 cache 同样只在这把锁里读写。
-    private static let lock = NSLock()
-
-    /// 一条队列条目：原始 JSON 行，外加**加载时解析一次**的 reportedAt。
-    ///
-    /// 把 reportedAt 跟着行一起存下来，是为了让按龄裁剪退化成纯 Date 比较。原先每次
-    /// 裁剪都要把每一行重新 JSONSerialization 解析一遍、再 ISO8601 解析一次时间戳，
-    /// 而裁剪在每个入口（depth/peek/removeFirst/enqueue）都要跑一次。
-    private struct Entry {
-        let line: String
-        /// 解析不出来时为 nil ⇒ 这条永不过期。宁可多补一条，不要静默丢。
-        let reportedAt: Date?
-    }
-
-    /// 队列的内存镜像；nil = 还没从磁盘加载过。**本进程是这个文件的唯一写者**
-    /// （多开会被 shouldExitAsDuplicate 挡掉），所以镜像可以当作权威，不必回头校验磁盘。
-    ///
-    /// 这是本类型性能上唯一要紧的地方。补发循环每处理一条就要 peekOldest + removeFirst
-    /// 各一次，而它们原先各自都是"整文件读 + AES-GCM 解密 + 每行 JSON 解析 + 每行
-    /// ISO8601 解析"——队列放满 5000 条时，排空一次就是 5000 轮 × 约一万次解析。加上
-    /// 心跳里还要读两次 depth，而心跳由每次前台切换应用触发（见 startActivitySwitchTracking），
-    /// 这个 O(n²) 是这个 App 最容易被真实用户撞上的性能坑。
-    private static var cache: [Entry]?
-
-    static func enqueue(_ body: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: body),
-              let line = String(data: data, encoding: .utf8) else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        var entries = currentEntries()
-        entries.append(Entry(line: line, reportedAt: reportedAt(of: line)))
-        if entries.count > maxEntries {
-            entries.removeFirst(entries.count - maxEntries)
-        }
-        persist(entries)
-    }
-
-    /// 当前积压条数。随心跳上报给后端（metadata.pendingQueueDepth），家长端据此显示
-    /// "正在补传 N 条"——补发要花几十分钟，没有这个数字的话家长只会看到时间线在自己
-    /// 眼前不断长出新内容，读起来像系统不可靠。
-    static var depth: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return currentEntries().count
-    }
-
-    /// 读取**最老的** limit 条但不移除。补发成功后由调用方调 removeFirst 摘掉。
-    ///
-    /// 不用"全取出→失败再塞回"的老写法：那样一旦补发中途失败（限流、网络再断），
-    /// 塞回去的顺序和原始顺序就不一致了，而家长端的连续折叠依赖时间有序。
-    /// 保持"读→确认成功→再摘除"的顺序，失败时队列原样不动。
-    static func peekOldest(limit: Int) -> [[String: Any]] {
-        lock.lock()
-        defer { lock.unlock() }
-        return currentEntries().prefix(limit).compactMap { decode($0.line) }
-    }
-
-    /// 摘掉队首 count 条（已确认送达的）。返回是否真的落盘成功。
-    ///
-    /// 仍然是**每摘一条落盘一次**，没有攒批：补发的语义是"服务端已经确认收下了这一条"，
-    /// 把落盘推迟就等于在崩溃窗口里留下重复上报的机会。一次写盘（几百 KB 的密封+原子
-    /// 写）本来也不是这里的瓶颈——瓶颈是原先每次都要把整份重新解析一遍，那部分已经被
-    /// 内存镜像消掉了。
-    ///
-    /// 返回值存在的理由：如果这次落盘失败（磁盘满/权限问题，见 persist 的注释），
-    /// 磁盘上的队首其实**没有**被摘掉，下次读盘还会读到同一条。调用方（drainPendingQueue）
-    /// 靠这个返回值判断"摘除到底有没有真的生效"，失败时必须停手，否则会把已经发送
-    /// 成功的同一条记录当成"新的队首"每隔几秒重发一次，没有自然终止条件。
-    @discardableResult
-    static func removeFirst(_ count: Int) -> Bool {
-        guard count > 0 else { return true }
-        lock.lock()
-        defer { lock.unlock() }
-        var entries = currentEntries()
-        entries.removeFirst(min(count, entries.count))
-        return persist(entries)
-    }
-
-    private static func decode(_ line: String) -> [String: Any]? {
-        guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return obj
-    }
-
-    /// 一行的 reportedAt。只在这条行**进入内存镜像**的那一刻调用一次——要么是
-    /// enqueue 新追加的，要么是 loadFromDisk 首次读盘时的。
-    ///
-    /// 按 body 里的 reportedAt 判龄，而不是文件写入时间：那是事件真正发生的时刻，也正是
-    /// 补发上去之后家长在时间线上看到的时刻；用文件时间无法区分同一个文件里新旧混杂的条目。
-    private static func reportedAt(of line: String) -> Date? {
-        guard let obj = decode(line),
-              let stamp = obj["reportedAt"] as? String else { return nil }
-        return BigDaddyDateFormatter.iso8601.date(from: stamp)
-    }
-
-    /// 调用方必须已持有 lock。返回**已按保留窗口裁剪过**的当前队列，并把裁剪结果留在镜像里。
-    /// 裁剪只比较 Date，不碰磁盘也不解析任何 JSON。
-    ///
-    /// 跟原来一样，裁剪只发生在内存里：磁盘上的过期条目要等下一次 persist() 才真正消失。
-    private static func currentEntries() -> [Entry] {
-        let cutoff = Date().addingTimeInterval(-maxAge)
-        let pruned = (cache ?? loadFromDisk()).filter { entry in
-            guard let reportedAt = entry.reportedAt else { return true }
-            return reportedAt > cutoff
-        }
-        cache = pruned
-        return pruned
-    }
-
-    /// 调用方必须已持有 lock。整份读盘并把每行的 reportedAt 解析出来——**每行只在这里
-    /// 解析一次**，此后都靠内存镜像。进程生命周期内正常只走一次。
-    private static func loadFromDisk() -> [Entry] {
-        readLines().map { Entry(line: $0, reportedAt: reportedAt(of: $0)) }
-    }
-
-    /// 调用方必须已持有 lock。落盘成功才更新镜像。返回是否真的落盘成功——
-    /// removeFirst 靠它判断"摘除有没有真的生效"，见该函数的注释。
-    @discardableResult
-    private static func persist(_ entries: [Entry]) -> Bool {
-        guard write(entries.map(\.line)) else {
-            // 落盘失败（磁盘满、权限、密钥读不出来）。镜像已经不能代表磁盘了，丢掉它，
-            // 下次访问重新读盘——退回慢路径，但绝不拿一份跟磁盘对不上的账继续记：
-            // 那会让"已经补发过的条目"在镜像里消失、在磁盘上还在，下次启动重复上报。
-            cache = nil
-            return false
-        }
-        cache = entries
-        return true
-    }
-
-    /// 先按新的 AES-GCM 加密格式解密；如果失败（多半是磁盘上还留着升级前的旧版本
-    /// 明文 JSONL 文件），一次性按明文兼容读取。读到的内容会在下一次 write()（无论是
-    /// enqueue 追加新条目，还是补发摘除队首）时按新格式重新落盘，之后就不再需要兼容分支。
-    private static func readLines() -> [String] {
-        guard let data = try? Data(contentsOf: queueFileURL) else { return [] }
-        if let text = decrypt(data) {
-            return text.split(separator: "\n").map(String.init)
-        }
-        if let text = String(data: data, encoding: .utf8) {
-            NSLog("BigDaddy: pending queue file is legacy plaintext format, will re-encrypt on next write")
-            return text.split(separator: "\n").map(String.init)
-        }
-        return []
-    }
-
-    /// 落盘。返回是否确实写成功——调用方（persist）靠它决定内存镜像还能不能信。
-    private static func write(_ lines: [String]) -> Bool {
-        let url = queueFileURL
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let text = lines.joined(separator: "\n")
-        guard let sealed = encrypt(text) else { return false }
-        do {
-            try sealed.write(to: url, options: .atomic)
-            return true
-        } catch {
-            NSLog("BigDaddy: pending queue write failed: \(error.localizedDescription)")
-            return false
-        }
-    }
-
-    private static func encrypt(_ text: String) -> Data? {
-        guard let plaintext = text.data(using: .utf8) else { return nil }
-        let key = PendingQueueCrypto.loadOrCreateKey()
-        guard let sealedBox = try? AES.GCM.seal(plaintext, using: key) else { return nil }
-        return sealedBox.combined
-    }
-
-    private static func decrypt(_ data: Data) -> String? {
-        let key = PendingQueueCrypto.loadOrCreateKey()
-        guard let sealedBox = try? AES.GCM.SealedBox(combined: data),
-              let plaintext = try? AES.GCM.open(sealedBox, using: key) else { return nil }
-        return String(data: plaintext, encoding: .utf8)
-    }
-}
-
-/// 补发队列的加密密钥：与设备身份的 deviceSecret 分开、单独存一份文件，
-/// 首次使用时生成一个真正随机的 256-bit 对称密钥并持久化，之后每次启动直接复用同一把
-/// 密钥，保证之前落盘的队列文件在下次读取时依然能解密。不走 Keychain：这把密钥只保护
-/// 本地暂存、尚未补发的队列数据，不涉及跟后端的身份验签，文件持久化即可。
-enum PendingQueueCrypto {
-    private static var keyFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BigDaddy/pending-queue-key")
-    }
-
-    /// 进程内只读一次盘。上面那句"每次启动直接复用同一把密钥"说的就是这个意思——
-    /// 原先每次 encrypt/decrypt 都要重新读一遍密钥文件，而补发排空时这两个操作每条
-    /// 记录都要各走一次。密钥一旦确定，本进程生命周期内不会再变（真被外部换掉了，
-    /// 之前落盘的队列本来也解不开了）。
-    private static let keyLock = NSLock()
-    private static var cachedKey: SymmetricKey?
-
-    static func loadOrCreateKey() -> SymmetricKey {
-        keyLock.lock()
-        defer { keyLock.unlock() }
-        if let cachedKey { return cachedKey }
-        let key = loadOrCreateKeyFromDisk()
-        cachedKey = key
-        return key
-    }
-
-    private static func loadOrCreateKeyFromDisk() -> SymmetricKey {
-        if let data = try? Data(contentsOf: keyFileURL), data.count == 32 {
-            return SymmetricKey(data: data)
-        }
-        let newKey = SymmetricKey(size: .bits256)
-        let data = newKey.withUnsafeBytes { Data($0) }
-        try? FileManager.default.createDirectory(
-            at: keyFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: keyFileURL, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFileURL.path)
-        return newKey
-    }
-}
-
-/// 开机自动启动的本地开关：默认开启（首次运行未写过值时视为 true），孩子可在客户端
-/// 菜单里手动关闭。关闭是敏感操作（会让监控从下次登录起失效），需要家长验证码
-/// 才能生效，见 AppDelegate.disableLaunchAtLoginWithVerification；开启则不设防护，
-/// 因为开启只会增加监控覆盖面，不构成绕过风险。
-enum LaunchAtLoginPreference {
-    private static let key = "LaunchAtLoginEnabled"
-
-    static var isEnabled: Bool {
-        get {
-            guard UserDefaults.standard.object(forKey: key) != nil else { return true }
-            return UserDefaults.standard.bool(forKey: key)
-        }
-        set { UserDefaults.standard.set(newValue, forKey: key) }
-    }
-}
-
-/// 开机自启的统一入口：macOS 13+ 用官方 SMAppService（能查询 OS 级实际状态、从而
-/// 察觉用户在「系统设置 → 登录项」里的手动关闭，且用 bundle 身份、不受 .app 被移动
-/// 影响），12.x 回退到手写 LaunchAgent plist。连续性模式打开时改由 ContinuityModeController
-/// 托管同一份用户级 LaunchAgent（RunAtLoad + KeepAlive），13+ 会先注销 SMAppService，
-/// 避免登录时双启动。全项目对"开机自启"的启停/查询都应经过这里；连续性模式打开期间
-/// enable/disable 直接 return，避免把 KeepAlive agent 拆掉。
-enum LaunchAtLoginController {
-    /// 按 LaunchAtLoginPreference（默认开启）同步 OS 层的自启状态。连续性关闭时由
-    /// ContinuityModeController.sync(false) 调用；启动路径也走那一次 sync。
-    static func syncWithPreference() {
-        if ContinuityModeController.isActive { return }
-        if LaunchAtLoginPreference.isEnabled {
-            enable()
-        } else {
-            disable()
-        }
-    }
-
-    static func enable() {
-        if ContinuityModeController.isActive { return }
-        if #available(macOS 13.0, *) {
-            // 迁移：老版本可能已用手写 plist 装过自启；13+ 改用 SMAppService 后必须把
-            // 遗留 plist 删掉，否则登录时两条机制各拉起一次、进程被重复启动。
-            // 连续性模式打开时不会走到这里（isActive 已 return），KeepAlive agent 由
-            // ContinuityModeController 持有。
-            LaunchAgentInstaller.uninstall()
-            // .enabled 已经生效、.requiresApproval 已经注册只是在等家长去系统设置批准——
-            // 这两种状态下都不用再调 register()。syncWithPreference() 每次启动都会跑
-            // 到这里，如果只排除 .enabled，会导致 requiresApproval 期间每次启动都重复
-            // 调用 register()（且很可能每次都以"已注册"报错收场，纯粹的日志噪音）。
-            let status = SMAppService.mainApp.status
-            guard status != .enabled && status != .requiresApproval else { return }
-            do {
-                try SMAppService.mainApp.register()
-                OSLevelStatusCache.invalidate()
-                AuditLog.record("LAUNCH_AT_LOGIN_REGISTERED via=SMAppService")
-            } catch {
-                // 常见于 DEBUG 裸二进制（非 .app bundle）或未签名场景；如实记录、不崩。
-                NSLog("BigDaddy: SMAppService register failed: \(error.localizedDescription)")
-            }
-        } else {
-            LaunchAgentInstaller.installIfNeeded(crashRelaunch: false, runAtLoad: true)
-        }
-    }
-
-    static func disable() {
-        if ContinuityModeController.isActive { return }
-        if #available(macOS 13.0, *) {
-            LaunchAgentInstaller.uninstall() // 遗留 plist 一并清掉，双保险
-            // 只有确实处于"已注册"的某种状态（enabled / requiresApproval）时才需要
-            // unregister()；notRegistered / notFound 下调用只会换来一次可预期的报错。
-            let status = SMAppService.mainApp.status
-            guard status == .enabled || status == .requiresApproval else { return }
-            do {
-                try SMAppService.mainApp.unregister()
-                OSLevelStatusCache.invalidate()
-                AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService")
-            } catch {
-                NSLog("BigDaddy: SMAppService unregister failed: \(error.localizedDescription)")
-            }
-        } else {
-            LaunchAgentInstaller.uninstall()
-        }
-    }
-
-    /// OS 层实际状态字符串，供心跳上报。它与本地偏好 LaunchAtLoginPreference 可能不一致：
-    /// 家长端据此能看出"孩子在系统设置里手动关掉了自启"（偏好还是 enabled，但这里变成
-    /// notRegistered）这类客户端 App 内开关拦不住的绕过。
-    ///
-    /// 走 OSLevelStatusCache：这个属性只被 sendHeartbeat 的 metadata 读，而下面那次探测
-    /// 压着一回 plist 读盘 + 一个 `launchctl print` 子进程。缓存的取舍见该类型的注释。
-    static var osLevelStatusDescription: String {
-        OSLevelStatusCache.value(for: "launchAtLogin") { probeOSLevelStatus() }
-    }
-
-    /// 连续性模式打开时 13+ 会注销 SMAppService、改用 LaunchAgent RunAtLoad，所以这里
-    /// 先看 agent 的 RunAtLoad，再回退到 SMAppService / 文件是否存在。
-    private static func probeOSLevelStatus() -> String {
-        if let plist = LaunchAgentInstaller.readInstalled(), LaunchAgentPlist.runAtLoad(from: plist) {
-            return Launchctl.isLoaded() ? "enabled" : "plistPresent"
-        }
-        if #available(macOS 13.0, *) {
-            switch SMAppService.mainApp.status {
-            case .enabled: return "enabled"
-            case .requiresApproval: return "requiresApproval"
-            case .notRegistered: return "notRegistered"
-            case .notFound: return "notFound"
-            @unknown default: return "unknown"
-            }
-        } else {
-            return "plistAbsent"
-        }
-    }
-}
-
-/// 用户级 LaunchAgent plist 的纯数据形状，便于单测断言 KeepAlive 结构，不碰磁盘、不调 launchctl。
-enum LaunchAgentPlist {
-    static let label = "com.bigdaddy.client"
-    static let launchedByLaunchdEnvKey = "BIGDADDY_LAUNCHED_BY_LAUNCHD"
-
-    static func make(executablePath: String, runAtLoad: Bool, crashRelaunch: Bool) -> [String: Any] {
-        var plist: [String: Any] = [
-            "Label": label,
-            "ProgramArguments": [executablePath],
-            "RunAtLoad": runAtLoad,
-            "EnvironmentVariables": [launchedByLaunchdEnvKey: "1"]
-        ]
-        if crashRelaunch {
-            // exit 0（验证退出、Sparkle 正常结束）不拉起；非 0 / 崩溃 / SIGKILL 拉起。
-            plist["KeepAlive"] = ["SuccessfulExit": false]
-        } else {
-            plist["KeepAlive"] = false
-        }
-        return plist
-    }
-
-    static func parse(_ data: Data) -> [String: Any]? {
-        try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
-    }
-
-    static func data(from plist: [String: Any]) -> Data? {
-        try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-    }
-
-    static func plistBool(_ value: Any?) -> Bool? {
-        if let flag = value as? Bool { return flag }
-        if let number = value as? NSNumber { return number.boolValue }
-        return nil
-    }
-
-    static func crashRelaunch(from plist: [String: Any]) -> Bool {
-        if let dict = plist["KeepAlive"] as? [String: Any] {
-            return plistBool(dict["SuccessfulExit"]) == false
-        }
-        return false
-    }
-
-    static func runAtLoad(from plist: [String: Any]) -> Bool {
-        plistBool(plist["RunAtLoad"]) ?? false
-    }
-}
-
-/// 心跳上报用的 OS 层状态缓存。
-///
-/// LaunchAtLoginController / ContinuityModeController 的 osLevelStatusDescription 都要先读
-/// 一次 LaunchAgent plist、再 `launchctl print` 一把（后者在本进程不归 launchd 托管时还要
-/// 多一次 jobPid()）。每次 Launchctl.run 都是一次 fork + exec + waitUntilExit，实测约 8ms
-/// 挂在调用线程上。而这两个属性**只有一个调用点**——sendHeartbeat 的 metadata——心跳又由
-/// 每次前台切换应用触发（startActivitySwitchTracking，2 秒防抖），连续性模式开着、孩子在
-/// 密集 alt-tab 时，就是每 2 秒 fork 两三个进程、白等几十毫秒，只为了重复回答同一个答案。
-///
-/// 用 TTL 而不是永久缓存：这两个字段的意义恰恰是"察觉有人从系统设置里把自启/连续性关了"，
-/// 那是外部变化，必须还看得见。60 秒与活跃态心跳间隔同量级，家长端拿到的新鲜度不变，只是
-/// 把同一分钟内的重复探测合并掉。我们**自己**改状态的每条路径（装/卸 plist、SMAppService
-/// 注册注销、launchctl bootstrap/bootout/kickstart）都会显式 invalidate()，所以自家操作的
-/// 结果立刻可见，不必等 TTL 过期。
-enum OSLevelStatusCache {
-    private static let ttl: TimeInterval = 60
-    private static let lock = NSLock()
-    private static var cached: [String: (value: String, at: Date)] = [:]
-    /// 每次 invalidate() 自增。compute() 跑在锁外（见下），一次真实的状态变更可能恰好
-    /// 夹在"读到过期缓存"和"探测结果写回"之间——不夹这道校验的话，那次探测捞回来的
-    /// 还是变更前的旧值，写回缓存时盖上新时间戳，等于把刚刚 invalidate() 掉的失效
-    /// 悄悄撤销，让本该立刻可见的自家操作又被压回最长 60 秒的 TTL 里。
-    private static var generation = 0
-
-    static func value(for key: String, compute: () -> String) -> String {
-        lock.lock()
-        if let entry = cached[key], Date().timeIntervalSince(entry.at) < ttl {
-            lock.unlock()
-            return entry.value
-        }
-        let generationAtStart = generation
-        lock.unlock()
-        // 刻意不在锁里跑 compute：它会 fork launchctl 并同步等待，占着锁会让另一个字段
-        // 的查询一起阻塞。代价是偶尔两个线程各探一次，两次结果相同，无害。
-        let value = compute()
-        lock.lock()
-        // generation 没变 ⇒ compute() 跑的这段时间里没人 invalidate 过，写回去安全。
-        // generation 变了 ⇒ 这次探测的结果可能已经是旧状态，不写回，把它让给下一次
-        // 调用重新探测；返回给这一次调用方的 value 不受影响，只是不再持久化。
-        if generation == generationAtStart {
-            cached[key] = (value, Date())
-        }
-        lock.unlock()
-        return value
-    }
-
-    static func invalidate() {
-        lock.lock()
-        cached.removeAll()
-        generation += 1
-        lock.unlock()
-    }
-}
-
-enum Launchctl {
-    static var uid: uid_t { getuid() }
-    static var domain: String { "gui/\(uid)" }
-    static var serviceTarget: String { "\(domain)/\(LaunchAgentPlist.label)" }
-
-    @discardableResult
-    static func run(_ arguments: [String]) -> (status: Int32, output: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = arguments
-        let out = Pipe()
-        let err = Pipe()
-        process.standardOutput = out
-        process.standardError = err
-        do {
-            try process.run()
-        } catch {
-            return (1, "")
-        }
-        process.waitUntilExit()
-        let combined = out.fileHandleForReading.readDataToEndOfFile()
-            + err.fileHandleForReading.readDataToEndOfFile()
-        return (process.terminationStatus, String(data: combined, encoding: .utf8) ?? "")
-    }
-
-    static func isLoaded() -> Bool {
-        run(["print", serviceTarget]).status == 0
-    }
-
-    static func jobPid() -> pid_t? {
-        let result = run(["print", serviceTarget])
-        guard result.status == 0 else { return nil }
-        guard let match = result.output.range(of: #"pid\s*=\s*(\d+)"#, options: .regularExpression) else {
-            return nil
-        }
-        let digits = result.output[match].filter(\.isNumber)
-        return pid_t(digits)
-    }
-
-    /// 已加载 job 实际要拉起的可执行文件。App 被挪过位置后，launchd 手里的旧定义
-    /// 仍指向旧路径，kickstart 会拉一个不存在的程序。
-    static func jobProgram() -> String? {
-        let result = run(["print", serviceTarget])
-        guard result.status == 0,
-              let line = result.output.split(separator: "\n").first(where: {
-                  $0.trimmingCharacters(in: .whitespaces).hasPrefix("program = ")
-              }) else {
-            return nil
-        }
-        return String(line.trimmingCharacters(in: .whitespaces).dropFirst("program = ".count))
-    }
-
-    /// 系统设置「允许在后台」关掉，或 `launchctl disable` 过：job 无法加载，
-    /// bootstrap 会失败，下次登录也不会启动。
-    static func isDisabled() -> Bool {
-        let output = run(["print-disabled", domain]).output
-        return output.split(separator: "\n").contains {
-            $0.contains("\"\(LaunchAgentPlist.label)\"") && ($0.contains("=> disabled") || $0.contains("=> true"))
-        }
-    }
-
-    // 下面三条会改变 job 的加载状态，跑完必须作废 OSLevelStatusCache——否则家长端要等
-    // 最多一个 TTL 才看得到我们自己刚做的改动。只读的 print（isLoaded/jobPid）不用管。
-    static func bootout() {
-        _ = run(["bootout", serviceTarget])
-        OSLevelStatusCache.invalidate()
-    }
-
-    static func bootstrap(plistURL: URL) -> Bool {
-        defer { OSLevelStatusCache.invalidate() }
-        return run(["bootstrap", domain, plistURL.path]).status == 0
-    }
-
-    static func kickstart() {
-        _ = run(["kickstart", "-k", serviceTarget])
-        OSLevelStatusCache.invalidate()
-    }
-}
-
-/// 用户级 LaunchAgent（不使用特权 daemon / SMJobBless）。macOS 12.x 开机自启、以及
-/// 连续性模式的 KeepAlive，都写 `~/Library/LaunchAgents/com.bigdaddy.client.plist`。
-/// 对孩子在系统设置的登录项 / LaunchAgents 列表里始终可见。
-///
-/// KeepAlive 一旦打开，当前会话要生效就必须 `launchctl bootstrap/bootout`：只改 plist
-/// 而不加载 job，launchd 不会盯着正在跑的进程。反过来，对本进程自己的 job 做 bootout
-/// 会把本进程杀掉，所以 bootout 时机由 ContinuityModeController 决定，uninstall()
-/// 只删文件。
-enum LaunchAgentInstaller {
-    static var launchAgentURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/com.bigdaddy.client.plist")
-    }
-
-    static func installIfNeeded(crashRelaunch: Bool = false, runAtLoad: Bool = true) {
-        guard let executablePath = Bundle.main.executablePath else { return }
-        let plist = LaunchAgentPlist.make(
-            executablePath: executablePath,
-            runAtLoad: runAtLoad,
-            crashRelaunch: crashRelaunch
-        )
-        let url = launchAgentURL
-        if let existingData = try? Data(contentsOf: url),
-           let existingPlist = LaunchAgentPlist.parse(existingData),
-           (existingPlist as NSDictionary) == (plist as NSDictionary) {
-            return
-        }
-        guard let data = LaunchAgentPlist.data(from: plist) else { return }
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
-        OSLevelStatusCache.invalidate()
-        AuditLog.record("LAUNCH_AGENT_INSTALLED path=\(executablePath) keepAlive=\(crashRelaunch) runAtLoad=\(runAtLoad)")
-    }
-
-    static func readInstalled() -> [String: Any]? {
-        guard let data = try? Data(contentsOf: launchAgentURL) else { return nil }
-        return LaunchAgentPlist.parse(data)
-    }
-
-    static func uninstall() {
-        let url = launchAgentURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try? FileManager.default.removeItem(at: url)
-        OSLevelStatusCache.invalidate()
-        AuditLog.record("LAUNCH_AGENT_UNINSTALLED")
-    }
-}
-
-/// 孩子用验证码在本机关闭连续性之后为 false。默认 true（不拦截家长配置）。
-/// 家长在 Dashboard 把 continuityMode 从关拨到开时会清掉这份覆盖。
-enum ContinuityModePreference {
-    private static let key = "ContinuityModeLocallyEnabled"
-    private static let overrideBaselineKey = "ContinuityModeOverrideBaselineToken"
-
-    static var isEnabled: Bool {
-        get {
-            guard UserDefaults.standard.object(forKey: key) != nil else { return true }
-            return UserDefaults.standard.bool(forKey: key)
-        }
-        set { UserDefaults.standard.set(newValue, forKey: key) }
-    }
-
-    /// 本地覆盖生效那一刻，服务端 config.continuityModeUpdatedAt 的快照（存原始字符串，
-    /// 理由见 ClientConfig.continuityModeUpdatedAt）。refreshConfig() 拿它跟服务端最新值
-    /// 做**等值**比较，判断"家长是否在本地覆盖之后又重新动过这个开关"，不再要求恰好
-    /// 观察到一次 false→true 边沿（旧办法在轮询节奏不巧漏过中间的 false 时，覆盖永远
-    /// 清不掉）。isEnabled 变回 true 时必须同步清掉，避免下次覆盖复用一份过期快照。
-    static var overrideBaseline: String? {
-        get { UserDefaults.standard.object(forKey: overrideBaselineKey) as? String }
-        set {
-            if let newValue {
-                UserDefaults.standard.set(newValue, forKey: overrideBaselineKey)
-            } else {
-                UserDefaults.standard.removeObject(forKey: overrideBaselineKey)
-            }
-        }
-    }
-}
-
-/// 连续性模式：家长打开后，用用户级 LaunchAgent 的 KeepAlive `{ SuccessfulExit: false }`
-/// 在崩溃 / 强制退出后拉起客户端。SMAppService.mainApp 是登录项，崩了不会拉，所以
-/// 13+ 打开连续性时注销登录项、改由 launchd 托管。不隐藏第二份 .app，删除应用后
-/// launchd 拉不起来——那是产品限制，不是没做完的恢复。
-enum ContinuityModeController {
-    /// 最近一次 sync 的目标状态。LaunchAtLoginController 用它避免拆掉 KeepAlive agent。
-    private(set) static var isActive = false
-
-    /// refreshConfig() 里"要不要清掉孩子用验证码打下的本地覆盖"这个判断，抽成纯函数
-    /// 单独测试——调用方已经用 `!ContinuityModePreference.isEnabled` 保证只在覆盖确实
-    /// 生效时才调用这里，这个前提不在函数内部重复判断。
-    ///
-    /// 两种信号任一命中都清：
-    /// 1) 边沿：这次轮询看到 continuityMode 从 false 变 true。轮询节奏凑巧时才会
-    ///    观察到，但胜在不依赖后端有没有下发时间戳，旧后端也能用。
-    /// 2) 时间戳变了：remoteUpdatedAt 跟创建覆盖那一刻记下的 overrideBaseline **不相等**，
-    ///    说明家长确实在覆盖生效之后又重新动过这个开关——不管中间有没有一次轮询真的
-    ///    落在"已经变回 false"的那一拍。这是给 1) 补的洞：家长把开关关了又立刻打开，
-    ///    两次保存之间如果没轮询到，光看边沿会永远漏判，覆盖清不掉。
-    ///
-    /// 用等值而不是先后比较，是因为要回答的问题本来就是"这个值变了没有"。先后比较需要
-    /// 把不带时区的 LocalDateTime 解析成绝对时刻，夏令时切换会让一个从没变过的时间戳
-    /// 凭空显得更新（详见 ClientConfig.continuityModeUpdatedAt 的说明）。
-    ///
-    /// nil 的两种含义都能正确落地：
-    /// - 两边都 nil（旧后端从不下发）→ 相等 → 只剩边沿判断，行为退回改动前，不会更差。
-    /// - baseline 为 nil、remote 有值 → 不等 → 清。这正是**老部署**的主场景：升级前就
-    ///   已经打开连续性的设备，新列是 NULL，孩子建立覆盖时快照只能是 nil；此后家长任何
-    ///   一次真正的开关翻转都会写出时间戳，从 nil 变成有值本身就是"家长动过"的证据。
-    static func shouldClearOverride(
-        remoteContinuityMode: Bool,
-        previousContinuityMode: Bool,
-        remoteUpdatedAt: String?,
-        overrideBaseline: String?
-    ) -> Bool {
-        guard remoteContinuityMode else { return false }
-        let sawEdge = !previousContinuityMode
-        let tokenChanged = remoteUpdatedAt != overrideBaseline
-        return sawEdge || tokenChanged
-    }
-
-    static var isLaunchdManaged: Bool {
-        if ProcessInfo.processInfo.environment[LaunchAgentPlist.launchedByLaunchdEnvKey] == "1" {
-            return true
-        }
-        return Launchctl.jobPid() == ProcessInfo.processInfo.processIdentifier
-    }
-
-    /// "本进程主动拉起一份继任者、然后自己退出"这套交接，有两个调用点：
-    /// disableKeepAlive()（关闭连续性时从 launchd 手里接管）和 AppDelegate.restartApplication()
-    /// （非 launchd 托管时的重启）。两者都先 spawn 再让自己死，于是继任者启动那一刻旧进程
-    /// 通常还活着。没有这个标记时，shouldExitAsDuplicate() 会把继任者当成"非 launchd 的
-    /// 后来者"——检测到"已有实例在跑"就直接把自己也退出，跟随后死掉的旧进程一起两个全灭
-    /// （用户看到的"点关闭崩溃后自动恢复，整个 App 退出了"）。带上标记后，
-    /// shouldExitAsDuplicate() 对它按 isLaunchdManaged 同等处理：等旧实例真正退出，而不是自杀。
-    private static let handoverSuccessorEnvKey = "BIGDADDY_HANDOVER_SUCCESSOR"
-
-    private static var isHandoverSuccessor: Bool {
-        ProcessInfo.processInfo.environment[handoverSuccessorEnvKey] == "1"
-    }
-
-    /// 交接用继任进程的环境：摘掉 launchd 注入的标记（继任者本就不归 launchd 管），
-    /// 打上交接标记。两个 spawn 点共用，避免其中一个漏标又退化成"两个全灭"。
-    static func successorEnvironment() -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: LaunchAgentPlist.launchedByLaunchdEnvKey)
-        env[handoverSuccessorEnvKey] = "1"
-        return env
-    }
-
-    /// 走 OSLevelStatusCache，同 LaunchAtLoginController.osLevelStatusDescription。这一个更贵：
-    /// 未被 launchd 托管时 isLaunchdManaged 还要再 fork 一次 `launchctl print` 取 jobPid。
-    static var osLevelStatusDescription: String {
-        OSLevelStatusCache.value(for: "continuityMode") { probeOSLevelStatus() }
-    }
-
-    private static func probeOSLevelStatus() -> String {
-        guard let plist = LaunchAgentInstaller.readInstalled(),
-              LaunchAgentPlist.crashRelaunch(from: plist) else {
-            return "off"
-        }
-        if Launchctl.isDisabled() { return "keepAliveDisabled" }
-        guard Launchctl.isLoaded() else { return "keepAlivePlistNotLoaded" }
-        return isLaunchdManaged ? "keepAliveLoaded" : "keepAliveLoadedUnmanaged"
-    }
-
-    static func sync(enabled: Bool) {
-        if enabled {
-            enableKeepAlive()
-        } else {
-            disableKeepAlive()
-        }
-    }
-
-    /// 验证退出 / Sparkle：先安排延迟 bootout，再让本进程把 SHUTDOWN / 更新收尾做完。
-    /// 对本进程自己的 job 立刻 bootout 会直接杀掉还在跑的退出流程。
-    /// SuccessfulExit=false 下 exit 0 本身不会被立刻拉起；延迟 bootout 是卸掉本会话的 job。
-    static func prepareForPlannedExit() {
-        let keepAlive = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
-        guard isActive || keepAlive else { return }
-        scheduleDelayedBootout()
-        AuditLog.record("CONTINUITY_KEEPALIVE_BOOTED_OUT reason=planned-exit")
-    }
-
-    /// 屏幕录制授权后的重启：已经在 launchd 手里时 kickstart -k，不要再 Process() 拉一份。
-    static func restartViaLaunchdIfManaged() -> Bool {
-        guard isLaunchdManaged, Launchctl.isLoaded() else { return false }
-        AuditLog.record("CONTINUITY_KEEPALIVE_KICKSTART")
-        // kickstart -k 发的是 SIGTERM，先退休墓碑，信号处理器据此不报 FORCE_KILL。
-        BigDaddyClient.notePlannedRelaunch()
-        Launchctl.kickstart()
-        return true
-    }
-
-    /// 启动最开头调用：已有实例时，非 launchd 的后来者直接退出；launchd 拉起的新实例，
-    /// 或者本进程主动交接出来的继任者（successorEnvironment 打的标记，来自
-    /// disableKeepAlive() 与 restartApplication()），等旧实例把进程交出来再接管。
-    static func shouldExitAsDuplicate() -> Bool {
-        guard let bundleId = Bundle.main.bundleIdentifier else { return false }
-        let own = ProcessInfo.processInfo.processIdentifier
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
-            .filter { $0.processIdentifier != own }
-        guard !others.isEmpty else { return false }
-        if isLaunchdManaged || isHandoverSuccessor {
-            let deadline = Date().addingTimeInterval(5)
-            while Date() < deadline {
-                let remaining = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
-                    .filter { $0.processIdentifier != own }
-                if remaining.isEmpty { return false }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-        }
-        return true
-    }
-
-    private static func enableKeepAlive() {
-        // launchd 必须在加载 job 时把进程拉起来，KeepAlive 才能盯着。连续性打开期间
-        // 因此强制 RunAtLoad：否则 bootstrap 后交接 exit(0)，job 停着没人拉，守护直接没了。
-        LaunchAgentInstaller.installIfNeeded(crashRelaunch: true, runAtLoad: true)
-        unregisterLoginItemIfNeeded()
-        isActive = true
-
-        let keepAliveInstalled = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
-        let launchedWithKeepAliveEnv = ProcessInfo.processInfo.environment[LaunchAgentPlist.launchedByLaunchdEnvKey] == "1"
-        // 磁盘上已是 KeepAlive plist 还不够：12.x 登录进来的旧 job 定义可能仍是 KeepAlive=false，
-        // 必须看到 launchd 注入的环境变量，才说明当前这份进程真的被 KeepAlive 盯着。
-        if isLaunchdManaged && Launchctl.isLoaded() && keepAliveInstalled && launchedWithKeepAliveEnv {
-            return
-        }
-
-        if Launchctl.isLoaded() && isLaunchdManaged {
-            AuditLog.record("CONTINUITY_MODE_ENABLED via=reload-job")
-            scheduleReloadAfterExit()
-            handoverExit()
-            return
-        }
-
-        if Launchctl.isLoaded() {
-            // 只有 launchd 手里的定义就是本份可执行文件时才直接 kickstart；App 挪过位置后
-            // 旧定义指向不存在的路径，必须 bootout + bootstrap 换成磁盘上的新 plist。
-            if Launchctl.jobPid() == nil && Launchctl.jobProgram() == Bundle.main.executablePath {
-                let kicked = Launchctl.run(["kickstart", Launchctl.serviceTarget]).status == 0
-                OSLevelStatusCache.invalidate()
-                AuditLog.record("CONTINUITY_MODE_ENABLED via=kickstart-idle success=\(kicked)")
-                if isLaunchdManaged { return }
-                if kicked && launchdStartedSuccessor() {
-                    handoverExit()
-                }
-            }
-            Launchctl.bootout()
-        }
-        let bootstrapped = Launchctl.bootstrap(plistURL: LaunchAgentInstaller.launchAgentURL)
-        AuditLog.record("CONTINUITY_MODE_ENABLED via=bootstrap success=\(bootstrapped)")
-        if bootstrapped && !isLaunchdManaged && launchdStartedSuccessor() {
-            handoverExit()
-        }
-    }
-
-    /// 交接前确认 launchd 真的拉起了一份新进程。拉不起来就不退出，守护留在本进程，
-    /// 下一轮 sync 再试；否则新旧两份都没了。新进程会在 shouldExitAsDuplicate 里等本进程
-    /// 最多 5 秒，这里的等待必须远短于它。
-    private static func launchdStartedSuccessor() -> Bool {
-        let own = ProcessInfo.processInfo.processIdentifier
-        let deadline = Date().addingTimeInterval(2)
-        repeat {
-            if let pid = Launchctl.jobPid(), pid != own { return true }
-            Thread.sleep(forTimeInterval: 0.1)
-        } while Date() < deadline
-        AuditLog.record("CONTINUITY_HANDOVER_ABORTED reason=successor-not-started")
-        return false
-    }
-
-    /// 放行系统注销 / 关机时调用。注销可能被别的 App 取消，而本进程已经以 exit 0 退出，
-    /// KeepAlive 不会拉。留一个脱离本进程的 kickstart：注销真的完成，它随会话一起没了
-    /// 或找不到 job 静默失败；被取消，就在 60 秒后把守护拉回来。job 已在运行时不带 -k 的
-    /// kickstart 什么也不做。
-    static func scheduleKickstartIfSessionSurvives() {
-        guard isActive else { return }
-        spawnDetachedShell("""
-        sleep 60
-        /bin/launchctl kickstart \(Launchctl.serviceTarget)
-        """)
-    }
-
-    private static func disableKeepAlive() {
-        let hadKeepAlive = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
-        isActive = false
-        guard hadKeepAlive else {
-            LaunchAtLoginController.syncWithPreference()
-            return
-        }
-        AuditLog.record("CONTINUITY_MODE_DISABLED")
-        if isLaunchdManaged && Launchctl.isLoaded() {
-            restorePlistForLaunchAtLoginWithoutKeepAlive()
-            spawnUnmanagedSuccessor()
-            // bootout 本进程自己的 job 会收到 SIGTERM，这是计划内交接，不报 FORCE_KILL。
-            BigDaddyClient.notePlannedRelaunch()
-            Launchctl.bootout()
-            return
-        }
-        Launchctl.bootout()
-        restorePlistForLaunchAtLoginWithoutKeepAlive()
-        LaunchAtLoginController.syncWithPreference()
-    }
-
-    private static func restorePlistForLaunchAtLoginWithoutKeepAlive() {
-        if #available(macOS 13.0, *) {
-            LaunchAgentInstaller.uninstall()
-        } else {
-            LaunchAgentInstaller.installIfNeeded(
-                crashRelaunch: false,
-                runAtLoad: LaunchAtLoginPreference.isEnabled
-            )
-        }
-    }
-
-    private static func unregisterLoginItemIfNeeded() {
-        if #available(macOS 13.0, *) {
-            let status = SMAppService.mainApp.status
-            guard status == .enabled || status == .requiresApproval else { return }
-            do {
-                try SMAppService.mainApp.unregister()
-                OSLevelStatusCache.invalidate()
-                AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService reason=continuity")
-            } catch {
-                NSLog("BigDaddy: SMAppService unregister for continuity failed: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    private static func handoverExit() {
-        AuditLog.record("CONTINUITY_HANDOVER_TO_LAUNCHD")
-        BigDaddyClient.notePlannedRelaunch()
-        exit(0)
-    }
-
-    private static func spawnUnmanagedSuccessor() {
-        guard let executablePath = Bundle.main.executablePath else { return }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executablePath)
-        process.environment = successorEnvironment()
-        try? process.run()
-        Thread.sleep(forTimeInterval: 0.4)
-    }
-
-    private static func scheduleReloadAfterExit() {
-        let plistPath = LaunchAgentInstaller.launchAgentURL.path
-        let script = """
-        sleep 0.5
-        /bin/launchctl bootout \(Launchctl.serviceTarget)
-        /bin/launchctl bootstrap \(Launchctl.domain) '\(plistPath)'
-        """
-        spawnDetachedShell(script)
-    }
-
-    private static func scheduleDelayedBootout() {
-        spawnDetachedShell("""
-        sleep 1
-        /bin/launchctl bootout \(Launchctl.serviceTarget)
-        """)
-    }
-
-    private static func spawnDetachedShell(_ script: String) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-c", script]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try? process.run()
-    }
-}
-
-enum ConfigStore {
-    static var configFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BigDaddy/config.json")
-    }
-
-    static func load() -> ClientConfig? {
-        guard let data = try? Data(contentsOf: configFileURL) else { return nil }
-        return try? JSONDecoder.bigDaddy.decode(ClientConfig.self, from: data)
-    }
-
-    static func save(_ config: ClientConfig) {
-        do {
-            try FileManager.default.createDirectory(at: configFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let encoder = JSONEncoder.bigDaddy
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try encoder.encode(config)
-            try data.write(to: configFileURL, options: .atomic)
-        } catch {
-            NSLog("BigDaddy failed to save config: \(error.localizedDescription)")
-        }
-    }
-}
-
-struct ApiResponse<T: Codable>: Codable {
-    let code: Int
-    let message: String
-    let data: T
-}
-
-/// 只含业务码和消息的响应信封：错误响应的 data 为 null，无法按 ApiResponse<T> 解析
-struct ApiEnvelope: Codable {
-    let code: Int
-    let message: String
-}
-
-/// HTTP 状态码非 2xx 时 request() 抛出的错误：区分"服务器明确拒绝"和"网络传输失败"，
-/// 前者（尤其 401）不该被调用方当成可重试的临时故障静默吞掉。
-struct BigDaddyAPIError: LocalizedError {
-    let statusCode: Int
-    let serverMessage: String?
-    /// 服务端 Retry-After 响应头（秒）。限流过滤器在 429 时会带上它，补发循环据此
-    /// 自适应节奏，而不是靠客户端写死的常量猜服务端还剩多少额度。
-    let retryAfterSeconds: Int?
-
-    init(statusCode: Int, serverMessage: String?, retryAfterSeconds: Int? = nil) {
-        self.statusCode = statusCode
-        self.serverMessage = serverMessage
-        self.retryAfterSeconds = retryAfterSeconds
-    }
-
-    var errorDescription: String? { serverMessage ?? "HTTP \(statusCode)" }
-    /// 签名接口返回 401 只可能是 BigDaddyDeviceAuthService 里的认证失败
-    /// （设备未注册/无 secret/签名不对/时间戳超窗），语义上等价于 register() 报告的
-    /// credentialsValid=false，都意味着本机手上的凭据当下用不了。
-    var isAuthFailure: Bool { statusCode == 401 }
-    /// 被限流。与网络故障的处理必须分开：事件照样要进补发队列（不能丢），但重试节奏
-    /// 得听服务端的，而且不该像网络恢复那样立刻重试。
-    var isRateLimited: Bool { statusCode == 429 }
-}
-
-/// 携带后端 message 的业务错误，让弹窗能直接展示真实原因而不是笼统的"绑定码无效"
-struct BigDaddyServerError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
-}
-
-struct DeviceResponse: Codable {
-    let deviceFingerprint: String
-    let deviceName: String?
-    let status: String
-    let latestEvent: String?
-    let appVersion: String?
-    let lastHeartbeatAt: Date?
-    let lastScreenshotAt: Date?
-    let boundAt: Date?
-    let bindToken: String?
-    let credentialsValid: Bool?
-    let bound: Bool?
-}
-
-struct Command: Codable {
-    let commandId: String
-    let type: String
-}
-
-struct HeartbeatResponse: Codable {
-    let configVersion: Int?
-    let configChanged: Bool?
-    let hasPendingCommand: Bool?
-}
-
-struct ScreenshotUploadResponse: Codable {
-    let delivered: Bool?
-    let emailStatus: String?
-    let telegramStatus: String?
-    let reason: String?
-}
-
-enum IdentityStore {
-    static func load() -> DeviceIdentity {
-        print("BigDaddy: IdentityStore.load started")
-        // 不再依赖 Keychain 持久化：开发构建每次 swift build / Xcode 运行的代码签名都不同，
-        // 读不到上一个构建创建的 Keychain 条目会静默重造 secret；设备一旦绑定，重造即永久
-        // 验签失败（后端拒绝已绑定设备换钥）。改用 Application Support 下 0600 权限的文件
-        // 持久化，跨构建、跨签名都稳定。
-        let secret: String
-        if let fromFile = fileSecret() {
-            secret = fromFile
-        } else {
-            secret = generateSecret()
-            saveFileSecret(secret)
-        }
-        print("BigDaddy: deviceSecret ready")
-        let platform = IOPlatformUUID.read() ?? Host.current().localizedName ?? "BigDaddyMac"
-        print("BigDaddy: platform UUID read complete")
-        let fingerprint = SHA256.hash(data: platform.data(using: .utf8)!).hex
-        let secretHash = SHA256.hash(data: secret.data(using: .utf8)!).hex
-        print("BigDaddy: IdentityStore.load completed, fingerprint: \(fingerprint)")
-        return DeviceIdentity(fingerprint: fingerprint, secretHash: secretHash)
-    }
-
-    /// 生成密码学安全的 32 字节随机 deviceSecret（用 SecRandomCopyBytes，而不是拼接
-    /// 两个 UUID 字符串这种可预测格式），十六进制编码后作为 String 存入文件，
-    /// 与现有消费方（SHA256 取 secretHash、HMAC 签名）完全兼容，无需改动下游逻辑。
-    private static func generateSecret() -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        guard status == errSecSuccess else {
-            // 极罕见的降级路径：系统随机数生成失败时退回旧格式，保证指纹生成流程
-            // 不会因此崩溃或阻塞设备绑定。
-            return UUID().uuidString + UUID().uuidString
-        }
-        return bytes.map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static var secretFileURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/BigDaddy/device-secret")
-    }
-
-    private static func fileSecret() -> String? {
-        guard let raw = try? String(contentsOf: secretFileURL, encoding: .utf8) else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func saveFileSecret(_ secret: String) {
-        try? FileManager.default.createDirectory(
-            at: secretFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? secret.data(using: .utf8)?.write(to: secretFileURL, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretFileURL.path)
-    }
-}
-
-enum IOPlatformUUID {
-    static func read() -> String? {
-        print("BigDaddy: IOPlatformUUID.read started")
-        let task = Process()
-        task.launchPath = "/usr/sbin/ioreg"
-        task.arguments = ["-rd1", "-c", "IOPlatformExpertDevice"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        do {
-            try task.run()
-            print("BigDaddy: ioreg task launched successfully")
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            let uuid = output.split(separator: "\n").first { $0.contains("IOPlatformUUID") }?
-                .split(separator: "\"").dropFirst(3).first.map(String.init)
-            print("BigDaddy: ioreg task read completed, uuid is nil: \(uuid == nil)")
-            return uuid
-        } catch {
-            print("BigDaddy Error: Failed to run ioreg task: \(error.localizedDescription)")
-            return nil
-        }
-    }
-}
-
-extension JSONDecoder {
-    /// 后端 Jackson 序列化 LocalDateTime 输出 "2026-07-16T23:01:02.123456"——无时区、带小数秒，
-    /// 而 Foundation 的 .iso8601 策略要求带时区、不带小数秒，解析必然失败。曾导致 bind-with-code
-    /// 的成功响应（boundAt 非空）解析失败被吞掉，误报"绑定失败"。这里两类格式都接受。
-    static var bigDaddy: JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let raw = try container.decode(String.self)
-            if let date = BigDaddyDateParser.parse(raw) { return date }
-            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unrecognized date: \(raw)")
-        }
-        return decoder
-    }
-}
-
-extension JSONEncoder {
-    /// 与 JSONDecoder.bigDaddy 配对，给 ConfigStore 把 ClientConfig 存盘再读回来用。
-    ///
-    /// 这是**预防性**的：ClientConfig 目前一个 Date 字段都没有（continuityModeUpdatedAt
-    /// 存的是后端原文字符串），所以换不换编码器眼下没有任何行为差别。留着是因为
-    /// save() 和 load() 之间存在一处很容易踩、且踩了没有任何报错的不对称——普通
-    /// JSONEncoder() 默认把 Date 编成距 2001 参考日的秒数（Double），而
-    /// JSONDecoder.bigDaddy 的自定义策略无条件按字符串解析。将来只要有人往
-    /// ClientConfig 里加一个 Date 字段，存盘再读回来就会在那个字段上解码失败，
-    /// 而 load() 是 `try?`，失败的后果不是这一个字段丢了，是**整份本地配置**
-    /// 静默退回默认值。这里让编码端输出 BigDaddyDateParser 认得的 ISO 8601 字符串，
-    /// 把这个陷阱一次性堵死。
-    static var bigDaddy: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .custom { date, encoder in
-            var container = encoder.singleValueContainer()
-            try container.encode(BigDaddyDateFormatter.iso8601Fractional.string(from: date))
-        }
-        return encoder
-    }
-}
-
-/// **输出**用的共享 ISO 8601 formatter（解析走 BigDaddyDateParser，那边另有一套
-/// 兼容多种格式的实例）。
-///
-/// 单独共享一份的理由是频率：ISO8601DateFormatter 的构造并不便宜（内部要建一个
-/// CFDateFormatter 并绑 locale），而 sendHeartbeat 一次就要用三四回，心跳本身又由
-/// **每次前台切换应用**触发（见 startActivitySwitchTracking，2 秒防抖），密集 alt-tab
-/// 时这是全 App 最高频的路径；AuditLog.record 也是每条记录新建一个。
-///
-/// 配置完之后只调 string(from:)/date(from:)，与 BigDaddyDateParser 里那几个共享静态
-/// 实例同一个用法。默认 formatOptions（.withInternetDateTime）必须保持不变——上报给
-/// 后端的时间戳格式由它决定。
-enum BigDaddyDateFormatter {
-    static let iso8601 = ISO8601DateFormatter()
-    /// 带小数秒的变体，供 JSONEncoder.bigDaddy 编码 ClientConfig 里的 Date 字段用——
-    /// 必须跟 BigDaddyDateParser.iso8601Fractional 同一组 formatOptions，否则
-    /// 编码端写出去的字符串解码端读不回来（该类型的注释详述了这个坑）。
-    static let iso8601Fractional: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-}
-
-enum BigDaddyDateParser {
-    private static let iso8601Fractional: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-    private static let iso8601 = ISO8601DateFormatter()
-    /// LocalDateTime 不携带时区，按本机时区解释
-    private static let localDateTime: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        return formatter
-    }()
-
-    static func parse(_ raw: String) -> Date? {
-        if let date = iso8601Fractional.date(from: raw) ?? iso8601.date(from: raw) {
-            return date
-        }
-        // Jackson LocalDateTime 的小数秒位数不定（0–9 位），截掉后按秒级精度解析
-        let withoutFraction = raw.split(separator: ".").first.map(String.init) ?? raw
-        return localDateTime.date(from: withoutFraction)
-    }
-}
-
-extension SHA256.Digest {
-    var hex: String { map { String(format: "%02x", $0) }.joined() }
-}
-
-extension HMAC<SHA256>.MAC {
-    var data: Data { Data(self) }
-}
-
-extension Data {
-    func base64URLEncodedString() -> String {
-        base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-    }
-
-    mutating func appendMultipartField(name: String, value: String, boundary: String) {
-        append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
     }
 }

@@ -1,0 +1,531 @@
+{
+  "description": "网站能不能打开的共用判例。孩子 Mac 上执行拦截的 WebFilterPolicy、dashboard 的 websiteAccess.ts、iPhone 的 WebsiteAccess.swift 三端的测试都跑这一份；判定规则改了，先改这里，三端一起红一起绿。now 固定为北京时间周三 18:30，每周计划都带时区，结果与跑测试的机器所在时区无关。lockdownActive 表示临时拦截生效（此时不会同时处于限时放行）；Mac 不出 reason，只比 canOpen。",
+  "now": "2026-11-11T10:30:00Z",
+  "cases": [
+    {
+      "name": "网站规则关着时什么都能打开",
+      "config": {
+        "enabled": false,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "bad.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "FILTER_OFF"
+    },
+    {
+      "name": "任何时候都不行：约定期间也打不开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "bad.com",
+      "agreementOpen": true,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "NEVER"
+    },
+    {
+      "name": "任何时候都不行压过随时可以",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "ALLOW_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true
+          }
+        ],
+        "weeklyPlans": []
+      },
+      "host": "bad.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "NEVER"
+    },
+    {
+      "name": "连子域名一起管的规则管住子域名",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "cdn.bad.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "NEVER"
+    },
+    {
+      "name": "不含子域名的规则不管子域名",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": false,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "www.bad.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "DEFAULT_OPEN"
+    },
+    {
+      "name": "不是上级域名的相似域名不受影响",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "notbad.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "DEFAULT_OPEN"
+    },
+    {
+      "name": "网址大小写和末尾的点不影响匹配",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "WWW.Bilibili.COM.",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "AGREEMENT_NO_PLAN"
+    },
+    {
+      "name": "约好的时间里才可以、没挂计划：平时打不开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "www.bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "AGREEMENT_NO_PLAN"
+    },
+    {
+      "name": "约好的时间里才可以：限时放行期间打开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "www.bilibili.com",
+      "agreementOpen": true,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "AGREEMENT_OPEN"
+    },
+    {
+      "name": "每周计划正在开放：打开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT",
+            "weeklyPlanId": "evening"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": [
+          {
+            "id": "evening",
+            "name": "周三晚上",
+            "enabled": true,
+            "timeZone": "Asia/Shanghai",
+            "windows": [
+              {
+                "daysOfWeek": [
+                  3
+                ],
+                "startMinute": 1080,
+                "endMinute": 1200
+              }
+            ]
+          },
+          {
+            "id": "weekend",
+            "name": "周末",
+            "enabled": true,
+            "timeZone": "Asia/Shanghai",
+            "windows": [
+              {
+                "daysOfWeek": [
+                  6,
+                  7
+                ],
+                "startMinute": 600,
+                "endMinute": 1200
+              }
+            ]
+          }
+        ]
+      },
+      "host": "bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "WEEKLY_PLAN_OPEN"
+    },
+    {
+      "name": "每周计划没在开放：打不开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT",
+            "weeklyPlanId": "weekend"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": [
+          {
+            "id": "evening",
+            "name": "周三晚上",
+            "enabled": true,
+            "timeZone": "Asia/Shanghai",
+            "windows": [
+              {
+                "daysOfWeek": [
+                  3
+                ],
+                "startMinute": 1080,
+                "endMinute": 1200
+              }
+            ]
+          },
+          {
+            "id": "weekend",
+            "name": "周末",
+            "enabled": true,
+            "timeZone": "Asia/Shanghai",
+            "windows": [
+              {
+                "daysOfWeek": [
+                  6,
+                  7
+                ],
+                "startMinute": 600,
+                "endMinute": 1200
+              }
+            ]
+          }
+        ]
+      },
+      "host": "bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "AGREEMENT_CLOSED"
+    },
+    {
+      "name": "每周计划被暂停：打不开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT",
+            "weeklyPlanId": "paused"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": [
+          {
+            "id": "paused",
+            "name": "暂停的计划",
+            "enabled": false,
+            "timeZone": "Asia/Shanghai",
+            "windows": [
+              {
+                "daysOfWeek": [
+                  3
+                ],
+                "startMinute": 1080,
+                "endMinute": 1200
+              }
+            ]
+          }
+        ]
+      },
+      "host": "bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "AGREEMENT_PLAN_PAUSED"
+    },
+    {
+      "name": "约好的时间里才可以压过随时可以",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "ALLOW_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT"
+          }
+        ],
+        "allowedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true
+          }
+        ],
+        "weeklyPlans": []
+      },
+      "host": "bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "AGREEMENT_NO_PLAN"
+    },
+    {
+      "name": "临时拦截压过正在开放的每周计划",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT",
+            "weeklyPlanId": "evening"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": [
+          {
+            "id": "evening",
+            "name": "周三晚上",
+            "enabled": true,
+            "timeZone": "Asia/Shanghai",
+            "windows": [
+              {
+                "daysOfWeek": [
+                  3
+                ],
+                "startMinute": 1080,
+                "endMinute": 1200
+              }
+            ]
+          }
+        ]
+      },
+      "host": "bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": true,
+      "canOpen": false,
+      "reason": "LOCKDOWN"
+    },
+    {
+      "name": "网站规则关着时临时拦截照样执行名单",
+      "config": {
+        "enabled": false,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bilibili.com",
+            "includeSubdomains": true,
+            "category": "ENTERTAINMENT"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "bilibili.com",
+      "agreementOpen": false,
+      "lockdownActive": true,
+      "canOpen": false,
+      "reason": "LOCKDOWN"
+    },
+    {
+      "name": "网站规则关着时临时拦截不让名单之外的网站也打不开",
+      "config": {
+        "enabled": false,
+        "revision": 1,
+        "mode": "ALLOW_SELECTED",
+        "blockedDomains": [],
+        "allowedDomains": [
+          {
+            "domain": "khanacademy.org",
+            "includeSubdomains": true
+          }
+        ],
+        "weeklyPlans": []
+      },
+      "host": "example.com",
+      "agreementOpen": false,
+      "lockdownActive": true,
+      "canOpen": true,
+      "reason": "DEFAULT_OPEN"
+    },
+    {
+      "name": "只放名单里的：名单之外打不开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "ALLOW_SELECTED",
+        "blockedDomains": [],
+        "allowedDomains": [
+          {
+            "domain": "khanacademy.org",
+            "includeSubdomains": true
+          }
+        ],
+        "weeklyPlans": []
+      },
+      "host": "example.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": false,
+      "reason": "DEFAULT_CLOSED"
+    },
+    {
+      "name": "只放名单里的：随时可以的网站打开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "ALLOW_SELECTED",
+        "blockedDomains": [],
+        "allowedDomains": [
+          {
+            "domain": "khanacademy.org",
+            "includeSubdomains": true
+          }
+        ],
+        "weeklyPlans": []
+      },
+      "host": "www.khanacademy.org",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "ALWAYS"
+    },
+    {
+      "name": "只挡名单里的：名单之外打开",
+      "config": {
+        "enabled": true,
+        "revision": 1,
+        "mode": "BLOCK_SELECTED",
+        "blockedDomains": [
+          {
+            "domain": "bad.com",
+            "includeSubdomains": true,
+            "category": "ALWAYS_BLOCKED"
+          }
+        ],
+        "allowedDomains": [],
+        "weeklyPlans": []
+      },
+      "host": "example.com",
+      "agreementOpen": false,
+      "lockdownActive": false,
+      "canOpen": true,
+      "reason": "DEFAULT_OPEN"
+    }
+  ]
+}
