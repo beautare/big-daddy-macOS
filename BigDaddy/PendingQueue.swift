@@ -66,17 +66,33 @@ enum PendingQueue {
     ///
     /// 把 reportedAt 跟着行一起存下来，是为了让按龄裁剪退化成纯 Date 比较。原先每次
     /// 裁剪都要把每一行重新 JSONSerialization 解析一遍、再 ISO8601 解析一次时间戳，
-    /// 而裁剪在每个入口（depth/peek/removeFirst/enqueue）都要跑一次。
+    /// 而裁剪在每个入口（depth/peek/remove/enqueue）都要跑一次。
     private struct Entry {
+        /// 进程内唯一标识，只活在内存镜像里、不落盘。补发确认时按它摘除，而不是按"队首"位置：
+        /// 请求在途期间队首可能被按龄裁剪或被 maxEntries 挤掉，位置早就不是发出去的那一条了。
+        let id: UInt64
         let line: String
         /// 解析不出来时为 nil ⇒ 这条永不过期。宁可多补一条，不要静默丢。
         let reportedAt: Date?
     }
 
+    /// 调用方必须已持有 lock。
+    private static var nextEntryID: UInt64 = 0
+    private static func makeEntry(_ line: String) -> Entry {
+        nextEntryID += 1
+        return Entry(id: nextEntryID, line: line, reportedAt: reportedAt(of: line))
+    }
+
+    /// peekOldestEntry 交给补发循环的句柄：确认送达后拿 id 调 remove(id:)。
+    struct PeekedEntry {
+        let id: UInt64
+        let body: [String: Any]
+    }
+
     /// 队列的内存镜像；nil = 还没从磁盘加载过。**本进程是这个文件的唯一写者**
     /// （多开会被 shouldExitAsDuplicate 挡掉），所以镜像可以当作权威，不必回头校验磁盘。
     ///
-    /// 这是本类型性能上唯一要紧的地方。补发循环每处理一条就要 peekOldest + removeFirst
+    /// 这是本类型性能上唯一要紧的地方。补发循环每处理一条就要 peekOldestEntry + remove
     /// 各一次，而它们原先各自都是"整文件读 + AES-GCM 解密 + 每行 JSON 解析 + 每行
     /// ISO8601 解析"——队列放满 5000 条时，排空一次就是 5000 轮 × 约一万次解析。加上
     /// 心跳里还要读两次 depth，而心跳由每次前台切换应用触发（见 startActivitySwitchTracking），
@@ -89,7 +105,7 @@ enum PendingQueue {
         lock.lock()
         defer { lock.unlock() }
         var entries = currentEntries()
-        entries.append(Entry(line: line, reportedAt: reportedAt(of: line)))
+        entries.append(makeEntry(line))
         if entries.count > maxEntries {
             entries.removeFirst(entries.count - maxEntries)
         }
@@ -105,7 +121,7 @@ enum PendingQueue {
         return currentEntries().count
     }
 
-    /// 读取**最老的** limit 条但不移除。补发成功后由调用方调 removeFirst 摘掉。
+    /// 读取**最老的** limit 条但不移除（只读视图，补发循环用 peekOldestEntry）。
     ///
     /// 不用"全取出→失败再塞回"的老写法：那样一旦补发中途失败（限流、网络再断），
     /// 塞回去的顺序和原始顺序就不一致了，而家长端的连续折叠依赖时间有序。
@@ -116,24 +132,37 @@ enum PendingQueue {
         return currentEntries().prefix(limit).compactMap { decode($0.line) }
     }
 
-    /// 摘掉队首 count 条（已确认送达的）。返回是否真的落盘成功。
+    /// 最老的一条（连同它的 id）但不移除。补发成功后由调用方拿 id 调 remove(id:)。
+    static func peekOldestEntry() -> PeekedEntry? {
+        lock.lock()
+        defer { lock.unlock() }
+        for entry in currentEntries() {
+            if let body = decode(entry.line) { return PeekedEntry(id: entry.id, body: body) }
+        }
+        return nil
+    }
+
+    /// 摘掉 peekOldestEntry 交出去的那一条（已确认送达，或被服务端明确拒收）。返回是否真的落盘成功。
+    ///
+    /// **必须按 id 摘，不能按位置摘**：请求在途的几秒里，这条可能刚好跨过 24 小时保留期
+    /// 被 currentEntries() 裁掉，或被 enqueue 的 maxEntries 上限挤掉。此前的 removeFirst(1)
+    /// 会在裁剪之后再删"新的队首"——一条还没发出去的记录就这样静默丢了。
+    /// 这条已经不在队列里时什么也不用做，直接返回 true。
     ///
     /// 仍然是**每摘一条落盘一次**，没有攒批：补发的语义是"服务端已经确认收下了这一条"，
-    /// 把落盘推迟就等于在崩溃窗口里留下重复上报的机会。一次写盘（几百 KB 的密封+原子
-    /// 写）本来也不是这里的瓶颈——瓶颈是原先每次都要把整份重新解析一遍，那部分已经被
-    /// 内存镜像消掉了。
+    /// 把落盘推迟就等于在崩溃窗口里留下重复上报的机会。
     ///
     /// 返回值存在的理由：如果这次落盘失败（磁盘满/权限问题，见 persist 的注释），
-    /// 磁盘上的队首其实**没有**被摘掉，下次读盘还会读到同一条。调用方（drainPendingQueue）
+    /// 磁盘上的这条其实**没有**被摘掉，下次读盘还会读到。调用方（drainPendingQueue）
     /// 靠这个返回值判断"摘除到底有没有真的生效"，失败时必须停手，否则会把已经发送
-    /// 成功的同一条记录当成"新的队首"每隔几秒重发一次，没有自然终止条件。
+    /// 成功的同一条记录每隔几秒重发一次，没有自然终止条件。
     @discardableResult
-    static func removeFirst(_ count: Int) -> Bool {
-        guard count > 0 else { return true }
+    static func remove(id: UInt64) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         var entries = currentEntries()
-        entries.removeFirst(min(count, entries.count))
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return true }
+        entries.remove(at: index)
         return persist(entries)
     }
 
@@ -171,18 +200,21 @@ enum PendingQueue {
     /// 调用方必须已持有 lock。整份读盘并把每行的 reportedAt 解析出来——**每行只在这里
     /// 解析一次**，此后都靠内存镜像。进程生命周期内正常只走一次。
     private static func loadFromDisk() -> [Entry] {
-        readLines().map { Entry(line: $0, reportedAt: reportedAt(of: $0)) }
+        readLines().map(makeEntry)
     }
 
     /// 调用方必须已持有 lock。落盘成功才更新镜像。返回是否真的落盘成功——
-    /// removeFirst 靠它判断"摘除有没有真的生效"，见该函数的注释。
+    /// remove(id:) 靠它判断"摘除有没有真的生效"，见该函数的注释。
     @discardableResult
     private static func persist(_ entries: [Entry]) -> Bool {
         guard write(entries.map(\.line)) else {
-            // 落盘失败（磁盘满、权限、密钥读不出来）。镜像已经不能代表磁盘了，丢掉它，
-            // 下次访问重新读盘——退回慢路径，但绝不拿一份跟磁盘对不上的账继续记：
-            // 那会让"已经补发过的条目"在镜像里消失、在磁盘上还在，下次启动重复上报。
-            cache = nil
+            // 落盘失败（磁盘满、权限、密钥读不出来）。write 是原子写，失败时磁盘上仍是上一次
+            // 成功落盘的内容，而镜像此刻也正是那份（本次改动只在局部变量 entries 里，没有
+            // 赋给 cache）——所以**保留镜像不动**，它依然忠实于磁盘。
+            //
+            // 不能像以前那样置 nil 重新读盘：重新读盘会给每条分配新 id，补发循环手里那条
+            // 在途条目的旧 id 就对不上了，remove(id:) 找不到它会当作"已经不在"返回成功，
+            // 结果这条留在队首被重复补发。
             return false
         }
         cache = entries

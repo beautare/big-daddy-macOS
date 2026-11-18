@@ -1046,11 +1046,12 @@ final class BigDaddyClient: @unchecked Sendable {
                 try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
             }
 
-            guard let body = PendingQueue.peekOldest(limit: 1).first else { break }
+            guard let peeked = PendingQueue.peekOldestEntry() else { break }
+            let body = peeked.body
 
             do {
                 _ = try await request(path: "/bigdaddy/client/heartbeat", method: "POST", body: body, signed: true)
-                guard PendingQueue.removeFirst(1) else {
+                guard PendingQueue.remove(id: peeked.id) else {
                     // 已经发送成功，但摘除没能落盘（磁盘满/权限问题）——磁盘上的队首
                     // 其实还是这一条。跟网络失败一视同仁，立刻退出：继续循环只会把
                     // 这条已经发过的记录当成"新的队首"再读到、每隔几秒重发一次，
@@ -1079,7 +1080,7 @@ final class BigDaddyClient: @unchecked Sendable {
                 // 必须丢掉它，否则这条"毒丸"会永远卡在队首，把它后面所有正常记录一起堵死
                 // （典型来源：旧版客户端写下的、字段已经不兼容的队列条目）。
                 NSLog("BigDaddy: dropping unacceptable queued entry (HTTP \(error.statusCode)): \(error.errorDescription ?? "")")
-                guard PendingQueue.removeFirst(1) else {
+                guard PendingQueue.remove(id: peeked.id) else {
                     // 同上：丢弃动作没能落盘，磁盘上这条"毒丸"还在队首。继续循环会
                     // 把它当队首重新读到，重复走一遍同样注定失败的请求——同样退避，
                     // 留给下一个触发点重试。

@@ -47,15 +47,16 @@ final class PendingQueueTests: XCTestCase {
         XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 10)), ["A", "B"])
     }
 
-    /// 补发的顺序契约：peekOldest 给最老的，removeFirst 摘掉的必须正是刚补发成功的那条。
-    func testPeekOldestReturnsOldestAndRemoveFirstDropsIt() {
+    /// 补发的顺序契约：peekOldestEntry 给最老的，remove(id:) 摘掉的必须正是刚补发成功的那条。
+    func testPeekOldestReturnsOldestAndRemoveDropsIt() {
         PendingQueue.enqueue(body(event: "A"))
         PendingQueue.enqueue(body(event: "B"))
         PendingQueue.enqueue(body(event: "C"))
 
-        XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 1)), ["A"])
+        let peeked = PendingQueue.peekOldestEntry()
+        XCTAssertEqual(peeked?.body["eventType"] as? String, "A")
 
-        PendingQueue.removeFirst(1)
+        PendingQueue.remove(id: peeked!.id)
 
         XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 1)), ["B"])
         XCTAssertEqual(PendingQueue.depth, 2)
@@ -63,10 +64,10 @@ final class PendingQueueTests: XCTestCase {
 
     /// 摘除必须**真的落盘**，不能只在内存里消失——否则崩溃重启后这批记录会被重复补报。
     /// 这是内存镜像最危险的失败模式，单独钉一条。
-    func testRemoveFirstIsPersisted() {
+    func testRemoveIsPersisted() {
         PendingQueue.enqueue(body(event: "A"))
         PendingQueue.enqueue(body(event: "B"))
-        PendingQueue.removeFirst(1)
+        PendingQueue.remove(id: PendingQueue.peekOldestEntry()!.id)
 
         PendingQueue.resetForTesting()
 
@@ -88,6 +89,42 @@ final class PendingQueueTests: XCTestCase {
                        "重新读盘之后裁剪结果必须一致，不能因为镜像重建就把过期条目放回来")
     }
 
+    /// 回归测试：补发请求在途时队首 A 跨过 24 小时保留期被裁掉，确认 A 送达时
+    /// 绝不能把还没发出去的 B 一起删掉。此前按位置 removeFirst(1)，裁剪后删的是新队首 B，
+    /// 剩余条数变成 0。
+    func testRemoveDoesNotDropNextEntryWhenSentEntryExpiresInFlight() throws {
+        PendingQueue.enqueue(body(event: "A", reportedAt: Date(timeIntervalSinceNow: -24 * 60 * 60 + 2)))
+        PendingQueue.enqueue(body(event: "B"))
+
+        let peeked = try XCTUnwrap(PendingQueue.peekOldestEntry())
+        XCTAssertEqual(peeked.body["eventType"] as? String, "A")
+
+        Thread.sleep(forTimeInterval: 3.0)   // reportedAt 序列化不带小数秒，留足余量；模拟请求在途期间 A 过期
+
+        XCTAssertTrue(PendingQueue.remove(id: peeked.id))
+        XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 10)), ["B"])
+
+        PendingQueue.resetForTesting()
+        XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 10)), ["B"])
+    }
+
+    /// 回归测试：A 在途期间，追加 B 落盘失败。此前写失败会清空镜像、重新读盘给 A 分配新 id，
+    /// 确认 A 时 remove(id:) 找不到旧 id 却返回成功，A 留在队首被重复补发。
+    func testRemoveStillMatchesInFlightEntryAfterFailedEnqueue() throws {
+        PendingQueue.enqueue(body(event: "A"))
+        let peeked = try XCTUnwrap(PendingQueue.peekOldestEntry())
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        PendingQueue.enqueue(body(event: "B"))   // 原子写失败，B 没能入队
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+
+        XCTAssertTrue(PendingQueue.remove(id: peeked.id))
+        XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 10)), [], "A 已确认送达，不该还留在队首")
+
+        PendingQueue.resetForTesting()
+        XCTAssertEqual(eventNames(PendingQueue.peekOldest(limit: 10)), [], "磁盘上的 A 也必须真的被摘掉")
+    }
+
     /// 解析不出 reportedAt 的条目**永不过期**：宁可多补一条，不要静默丢。
     func testEntryWithoutParsableTimestampIsKept() {
         PendingQueue.enqueue(["eventType": "NO_TIMESTAMP"])
@@ -99,28 +136,29 @@ final class PendingQueueTests: XCTestCase {
         XCTAssertEqual(PendingQueue.depth, 1)
     }
 
-    /// 回归测试：磁盘持续写不进去（磁盘满/权限问题）时，removeFirst 必须如实报告失败，
+    /// 回归测试：磁盘持续写不进去（磁盘满/权限问题）时，remove(id:) 必须如实报告失败，
     /// 且磁盘上的队首**没有**被真的摘掉。
     ///
     /// 这条钉的是一个真实发生过的 bug：removeFirst 曾经不管落盘成不成功都直接返回，
     /// drainPendingQueue 因此会把这条"其实还在磁盘上"的记录当成新的队首重新读到、
     /// 再发一次——服务端确认成功、摘除又落盘失败、再读到同一条——每隔几秒重复上报
-    /// 同一条记录，没有自然终止条件。用只读目录模拟持续写失败：只要 removeFirst
+    /// 同一条记录，没有自然终止条件。用只读目录模拟持续写失败：只要 remove(id:)
     /// 老实报告 false，调用方（drainPendingQueue）就会跟网络失败一视同仁地退避，
     /// 不会陷入这个循环。
-    func testRemoveFirstReportsFailureAndLeavesDiskUntouchedWhenPersistFails() throws {
+    func testRemoveReportsFailureAndLeavesDiskUntouchedWhenPersistFails() throws {
         PendingQueue.enqueue(body(event: "A"))
         PendingQueue.enqueue(body(event: "B"))
+        let peeked = try XCTUnwrap(PendingQueue.peekOldestEntry())
 
         // 去掉目录的写权限：atomic write 需要在同目录建临时文件再 rename，
         // 目录只读时这一步必然失败——不依赖某个具体系统调用报错方式，是最贴近
         // 真实"磁盘满/权限被收回"场景的模拟方式。
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
-        let removed = PendingQueue.removeFirst(1)
+        let removed = PendingQueue.remove(id: peeked.id)
         // 无论测试本身通过与否，都要把权限改回来，否则 tearDown 删不掉这个目录。
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
 
-        XCTAssertFalse(removed, "落盘失败时 removeFirst 必须报告 false，不能假装摘除已经生效")
+        XCTAssertFalse(removed, "落盘失败时 remove(id:) 必须报告 false，不能假装摘除已经生效")
 
         // 重新读盘（模拟下一次访问）：A 必须还在队首，没有被真的摘掉。
         PendingQueue.resetForTesting()
