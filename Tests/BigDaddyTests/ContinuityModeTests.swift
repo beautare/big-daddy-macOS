@@ -74,6 +74,28 @@ final class ContinuityModeTests: XCTestCase {
         XCTAssertEqual(parsed["Label"] as? String, LaunchAgentPlist.label)
     }
 
+    /// 系统设置「允许在后台」靠这个键把后台项挂到 BigDaddy 名下；缺了它就只显示开发者公司名，
+    /// 家长按告警去找"BigDaddy"根本找不到开关。
+    func testPlistAssociatesAgentWithAppBundle() throws {
+        let plist = LaunchAgentPlist.make(
+            executablePath: "/Applications/BigDaddy.app/Contents/MacOS/BigDaddy",
+            runAtLoad: true,
+            crashRelaunch: true,
+            associatedBundleIdentifier: "vip.bigdaddy.monitor"
+        )
+        XCTAssertEqual(plist["AssociatedBundleIdentifiers"] as? [String], ["vip.bigdaddy.monitor"])
+
+        let parsed = try XCTUnwrap(LaunchAgentPlist.parse(XCTUnwrap(LaunchAgentPlist.data(from: plist))))
+        XCTAssertEqual(parsed["AssociatedBundleIdentifiers"] as? [String], ["vip.bigdaddy.monitor"])
+        XCTAssertTrue(LaunchAgentPlist.crashRelaunch(from: parsed))
+    }
+
+    /// 没有 bundle id（DEBUG 裸二进制）时不写这个键，而不是写一个空数组或空串。
+    func testPlistOmitsAssociationWithoutBundleIdentifier() {
+        let plist = LaunchAgentPlist.make(executablePath: "/tmp/BigDaddy", runAtLoad: true, crashRelaunch: true)
+        XCTAssertNil(plist["AssociatedBundleIdentifiers"])
+    }
+
     // MARK: - continuityModeUpdatedAt 解码（保留后端原文，不解析成 Date）
 
     func testMissingContinuityModeUpdatedAtDecodesNil() throws {
@@ -217,5 +239,72 @@ final class ContinuityModeTests: XCTestCase {
 
         ContinuityModePreference.overrideBaseline = nil
         XCTAssertNil(ContinuityModePreference.overrideBaseline)
+    }
+
+    // MARK: - ContinuityModeController.osStatus（心跳 continuityModeOsStatus）
+
+    private func status(
+        installed: Bool = true,
+        disabled: Bool = false,
+        allowed: Bool = true,
+        loaded: Bool = true,
+        managed: Bool = true
+    ) -> String {
+        ContinuityModeController.osStatus(
+            keepAliveInstalled: installed,
+            disabled: disabled,
+            backgroundAllowed: allowed,
+            loaded: loaded,
+            managed: managed
+        )
+    }
+
+    func testOsStatusHealthyIsKeepAliveLoaded() {
+        XCTAssertEqual(status(), "keepAliveLoaded")
+        XCTAssertEqual(status(managed: false), "keepAliveLoadedUnmanaged")
+    }
+
+    func testOsStatusWithoutKeepAlivePlistIsOff() {
+        XCTAssertEqual(status(installed: false, disabled: true, allowed: false, loaded: false), "off")
+    }
+
+    func testOsStatusLaunchctlDisabledWinsOverEverythingElse() {
+        XCTAssertEqual(status(disabled: true, allowed: false), "keepAliveDisabled")
+    }
+
+    /// 孩子那台 Mac 的真实现场：「允许在后台」被关，但手动打开时客户端自己 bootstrap 了，
+    /// 此刻 job 已加载、进程也被托管。必须报 keepAliveNotAllowed，不能报 keepAliveLoaded——
+    /// 后者正是家长端一直显示"已开启"、重启后却失联的原因。
+    func testOsStatusBackgroundNotAllowedWinsOverLoadedAndManaged() {
+        XCTAssertEqual(status(allowed: false, loaded: true, managed: true), "keepAliveNotAllowed")
+        XCTAssertEqual(status(allowed: false, loaded: false), "keepAliveNotAllowed")
+    }
+
+    func testOsStatusAllowedButNotLoadedIsPlistNotLoaded() {
+        XCTAssertEqual(status(loaded: false), "keepAlivePlistNotLoaded")
+    }
+
+    /// 每个输入背后都是一次 launchctl 子进程或 BTM 查询；结果一旦确定，后面的不该再跑。
+    func testOsStatusStopsProbingOnceResultIsDecided() {
+        var probed: [String] = []
+        func probe(_ name: String, _ value: Bool) -> Bool { probed.append(name); return value }
+
+        _ = ContinuityModeController.osStatus(
+            keepAliveInstalled: false,
+            disabled: probe("disabled", false),
+            backgroundAllowed: probe("allowed", true),
+            loaded: probe("loaded", true),
+            managed: probe("managed", true)
+        )
+        XCTAssertEqual(probed, [])
+
+        _ = ContinuityModeController.osStatus(
+            keepAliveInstalled: true,
+            disabled: probe("disabled", false),
+            backgroundAllowed: probe("allowed", false),
+            loaded: probe("loaded", true),
+            managed: probe("managed", true)
+        )
+        XCTAssertEqual(probed, ["disabled", "allowed"])
     }
 }

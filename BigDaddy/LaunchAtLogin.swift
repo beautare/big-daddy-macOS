@@ -30,8 +30,8 @@ enum LaunchAtLoginPreference {
 /// 开机自启的统一入口：macOS 13+ 用官方 SMAppService（能查询 OS 级实际状态、从而
 /// 察觉用户在「系统设置 → 登录项」里的手动关闭，且用 bundle 身份、不受 .app 被移动
 /// 影响），12.x 回退到手写 LaunchAgent plist。连续性模式打开时改由 ContinuityModeController
-/// 托管同一份用户级 LaunchAgent（RunAtLoad + KeepAlive），13+ 会先注销 SMAppService，
-/// 避免登录时双启动。全项目对"开机自启"的启停/查询都应经过这里；连续性模式打开期间
+/// 托管同一份用户级 LaunchAgent（RunAtLoad + KeepAlive），13+ 的 SMAppService 登录项
+/// 由它保留作开机兜底。全项目对"开机自启"的启停/查询都应经过这里；连续性模式打开期间
 /// enable/disable 直接 return，避免把 KeepAlive agent 拆掉。
 enum LaunchAtLoginController {
     /// 按 LaunchAtLoginPreference（默认开启）同步 OS 层的自启状态。连续性关闭时由
@@ -102,10 +102,11 @@ enum LaunchAtLoginController {
         OSLevelStatusCache.value(for: "launchAtLogin") { probeOSLevelStatus() }
     }
 
-    /// 连续性模式打开时 13+ 会注销 SMAppService、改用 LaunchAgent RunAtLoad，所以这里
-    /// 先看 agent 的 RunAtLoad，再回退到 SMAppService / 文件是否存在。
+    /// 先看 agent 的 RunAtLoad，再回退到 SMAppService / 文件是否存在。agent 被「允许在后台」
+    /// 关掉时它登录时不会被加载，开机自启实际只剩 SMAppService 登录项那一条，按后者报。
     private static func probeOSLevelStatus() -> String {
-        if let plist = LaunchAgentInstaller.readInstalled(), LaunchAgentPlist.runAtLoad(from: plist) {
+        if let plist = LaunchAgentInstaller.readInstalled(), LaunchAgentPlist.runAtLoad(from: plist),
+           LaunchAgentInstaller.isAllowedInBackground {
             return Launchctl.isLoaded() ? "enabled" : "plistPresent"
         }
         if #available(macOS 13.0, *) {
@@ -127,13 +128,25 @@ enum LaunchAgentPlist {
     static let label = "com.bigdaddy.client"
     static let launchedByLaunchdEnvKey = "BIGDADDY_LAUNCHED_BY_LAUNCHD"
 
-    static func make(executablePath: String, runAtLoad: Bool, crashRelaunch: Bool) -> [String: Any] {
+    /// associatedBundleIdentifier 写进 AssociatedBundleIdentifiers：没有它，系统设置「登录项与
+    /// 扩展 → 允许在后台」里这一项不叫 BigDaddy，而是挂在开发者名（Shanghai Jiamei Software
+    /// Development Co., Ltd）下面——2026-11 家长按告警去找"BigDaddy"，翻遍了也找不到开关。
+    /// launchd 本身不读这个键（man launchd.plist：给 Login Items 界面关联 App 用的）。
+    static func make(
+        executablePath: String,
+        runAtLoad: Bool,
+        crashRelaunch: Bool,
+        associatedBundleIdentifier: String? = nil
+    ) -> [String: Any] {
         var plist: [String: Any] = [
             "Label": label,
             "ProgramArguments": [executablePath],
             "RunAtLoad": runAtLoad,
             "EnvironmentVariables": [launchedByLaunchdEnvKey: "1"]
         ]
+        if let associatedBundleIdentifier {
+            plist["AssociatedBundleIdentifiers"] = [associatedBundleIdentifier]
+        }
         if crashRelaunch {
             // exit 0（验证退出、Sparkle 正常结束）不拉起；非 0 / 崩溃 / SIGKILL 拉起。
             plist["KeepAlive"] = ["SuccessfulExit": false]
@@ -321,7 +334,8 @@ enum LaunchAgentInstaller {
         let plist = LaunchAgentPlist.make(
             executablePath: executablePath,
             runAtLoad: runAtLoad,
-            crashRelaunch: crashRelaunch
+            crashRelaunch: crashRelaunch,
+            associatedBundleIdentifier: Bundle.main.bundleIdentifier
         )
         let url = launchAgentURL
         if let existingData = try? Data(contentsOf: url),
@@ -339,6 +353,18 @@ enum LaunchAgentInstaller {
     static func readInstalled() -> [String: Any]? {
         guard let data = try? Data(contentsOf: launchAgentURL) else { return nil }
         return LaunchAgentPlist.parse(data)
+    }
+
+    /// 系统设置「登录项与扩展 → 允许在后台」对这份 legacy agent 的开关。关掉后 BTM 把它
+    /// 标成 disallowed：登录时 launchd 不再加载它，可 `launchctl print-disabled` 里看不到
+    /// （Launchctl.isDisabled() 因此测不出来），运行时手动 bootstrap 也照样成功——平时一切
+    /// 正常，到下次重启才暴露。statusForLegacyPlist 是苹果专门留给 legacy agent 查这件事的
+    /// 接口，被关时返回 .requiresApproval；实测 RunAtLoad=true 却没被加载的几份 agent 都是它。
+    static var isAllowedInBackground: Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.statusForLegacyPlist(at: launchAgentURL) != .requiresApproval
+        }
+        return true
     }
 
     static func uninstall() {

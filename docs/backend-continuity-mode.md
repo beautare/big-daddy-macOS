@@ -2,7 +2,7 @@
 
 客户端新增家长控制的"连续性模式"：打开后，孩子这台 Mac 上的守护进程在崩溃、强制退出（Activity Monitor Force Quit / SIGKILL）后由 **用户级 LaunchAgent** 拉起。这不是隐蔽持久化——菜单栏图标仍在、首次运行披露会写明、本机审计日志会记下开关与拉起。
 
-`SMAppService.mainApp` 是登录项，**崩了不会拉**。KeepAlive 只在 **launchd 才是进程的管理者** 时生效。因此 macOS 13+ 打开连续性时会注销登录项，改用同一份用户级 plist（`~/Library/LaunchAgents/com.bigdaddy.client.plist`），避免登录时双启动。连续性打开期间这份 agent 的 `RunAtLoad` 强制为 true（否则 launchd 不会在当前会话把进程拉起来盯着）。孩子在菜单关掉"开机自启"不会拆掉这份 KeepAlive agent；意图与 OS 状态会分叉，心跳里能看出来。
+`SMAppService.mainApp` 是登录项，**崩了不会拉**。KeepAlive 只在 **launchd 才是进程的管理者** 时生效。因此打开连续性时进程交给同一份用户级 plist（`~/Library/LaunchAgents/com.bigdaddy.client.plist`）托管；macOS 13+ 的登录项**保留**作开机兜底——系统设置「允许在后台」关掉这份 agent 后，登录时 launchd 不会加载它，只剩登录项能把 App 打开，客户端再自己 bootstrap 回来。连续性打开期间这份 agent 的 `RunAtLoad` 强制为 true（否则 launchd 不会在当前会话把进程拉起来盯着）。孩子在菜单关掉"开机自启"不会拆掉这份 KeepAlive agent；意图与 OS 状态会分叉，心跳里能看出来。
 
 缺省关闭。旧后端不下发该字段时，客户端视为 `false`，行为与今天完全一致。
 
@@ -36,14 +36,15 @@
 | `keepAliveLoaded` | KeepAlive plist 已加载，且当前进程就是 launchd 拉起的那一份。 |
 | `keepAliveLoadedUnmanaged` | job 已加载，但当前进程不是 launchd 拉起的（交接中 / Sparkle 刚 relaunch）。 |
 | `keepAlivePlistNotLoaded` | 磁盘上已是 KeepAlive plist，但用户域 job 未加载——当前会话崩了不会拉，下次登录才会。 |
-| `keepAliveDisabled` | KeepAlive plist 在，但 job 被禁用（系统设置「允许在后台」关掉，或 `launchctl disable`）——崩了不会拉，下次登录也不会启动。 |
+| `keepAliveDisabled` | KeepAlive plist 在，但 job 被 `launchctl disable`——bootstrap 会失败，崩了不会拉，下次登录也不会启动。 |
+| `keepAliveNotAllowed` | 系统设置「允许在后台」关掉了这份 agent（`SMAppService.statusForLegacyPlist` 为 requiresApproval；`launchctl print-disabled` 里看不到）。当前进程可能仍被托管，但下次登录 launchd 不加载它，只能靠登录项兜底打开。plist 带 `AssociatedBundleIdentifiers` 后该项在系统设置里显示为 BigDaddy；0.22.4 及以前没写这个键，显示成开发者名 Shanghai Jiamei Software Development Co., Ltd。 |
 
 ### 为什么两个字段都要留
 
 与开机自启同一套哲学：`continuityModeEnabled` 是意图，`continuityModeOsStatus` 是系统实际状态，二者可能分叉。
 
 - `true` + `keepAliveLoaded`：正常。
-- `true` + `off` / `keepAlivePlistNotLoaded` / `keepAliveDisabled`：家长以为开着，本机没盯上。常见原因：孩子用验证码在本机关闭、在 `~/Library/LaunchAgents` 里删了 plist，或在系统设置里关掉了「允许在后台」。**建议 Dashboard 告警**。
+- `true` + `off` / `keepAlivePlistNotLoaded` / `keepAliveDisabled` / `keepAliveNotAllowed`：家长以为开着，本机没盯上。常见原因：孩子用验证码在本机关闭、在 `~/Library/LaunchAgents` 里删了 plist，或在系统设置里关掉了「允许在后台」。**建议 Dashboard 告警**。
 - `false` + 非 `off`：关闭尚未落到 OS，通常是交接瞬间，不必当故障。
 
 ### 建议的 Dashboard 展示
@@ -55,7 +56,7 @@ if continuityModeEnabled and osStatus == keepAliveLoaded:
     显示"已开启"
 elif continuityModeEnabled and osStatus == keepAlivePlistNotLoaded:
     显示"已配置，当前会话未生效"
-elif continuityModeEnabled and osStatus == keepAliveDisabled:
+elif continuityModeEnabled and osStatus in (keepAliveDisabled, keepAliveNotAllowed):
     显示"⚠️ 已在系统设置中被禁止后台运行"
 elif continuityModeEnabled and osStatus == off:
     显示"⚠️ 已被本机关闭或卸载"

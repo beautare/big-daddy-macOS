@@ -43,9 +43,9 @@ enum ContinuityModePreference {
 }
 
 /// 连续性模式：家长打开后，用用户级 LaunchAgent 的 KeepAlive `{ SuccessfulExit: false }`
-/// 在崩溃 / 强制退出后拉起客户端。SMAppService.mainApp 是登录项，崩了不会拉，所以
-/// 13+ 打开连续性时注销登录项、改由 launchd 托管。不隐藏第二份 .app，删除应用后
-/// launchd 拉不起来——那是产品限制，不是没做完的恢复。
+/// 在崩溃 / 强制退出后拉起客户端。SMAppService.mainApp 是登录项，崩了不会拉，所以进程
+/// 交给 launchd 托管；但登录项**保留**作开机兜底（见 registerLoginItemFallbackIfNeeded）。
+/// 不隐藏第二份 .app，删除应用后 launchd 拉不起来——那是产品限制，不是没做完的恢复。
 enum ContinuityModeController {
     /// 最近一次 sync 的目标状态。LaunchAtLoginController 用它避免拆掉 KeepAlive agent。
     private(set) static var isActive = false
@@ -119,13 +119,33 @@ enum ContinuityModeController {
     }
 
     private static func probeOSLevelStatus() -> String {
-        guard let plist = LaunchAgentInstaller.readInstalled(),
-              LaunchAgentPlist.crashRelaunch(from: plist) else {
-            return "off"
-        }
-        if Launchctl.isDisabled() { return "keepAliveDisabled" }
-        guard Launchctl.isLoaded() else { return "keepAlivePlistNotLoaded" }
-        return isLaunchdManaged ? "keepAliveLoaded" : "keepAliveLoadedUnmanaged"
+        osStatus(
+            keepAliveInstalled: LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false,
+            disabled: Launchctl.isDisabled(),
+            backgroundAllowed: LaunchAgentInstaller.isAllowedInBackground,
+            loaded: Launchctl.isLoaded(),
+            managed: isLaunchdManaged
+        )
+    }
+
+    /// 心跳 continuityModeOsStatus 的取值，先后顺序就是严重程度。输入都是 autoclosure：
+    /// 前面的条件一旦决定结果，后面那几次 launchctl / BTM 查询就不跑。
+    ///
+    /// keepAliveNotAllowed 排在"已加载"之前：「允许在后台」关掉后，眼下这份进程照样可能
+    /// 被托管着（手动打开时客户端自己 bootstrap 进去的），但下次登录 launchd 不会加载它，
+    /// 家长必须现在就知道，而不是等下一次重启后失联。
+    static func osStatus(
+        keepAliveInstalled: Bool,
+        disabled: @autoclosure () -> Bool,
+        backgroundAllowed: @autoclosure () -> Bool,
+        loaded: @autoclosure () -> Bool,
+        managed: @autoclosure () -> Bool
+    ) -> String {
+        guard keepAliveInstalled else { return "off" }
+        if disabled() { return "keepAliveDisabled" }
+        if !backgroundAllowed() { return "keepAliveNotAllowed" }
+        guard loaded() else { return "keepAlivePlistNotLoaded" }
+        return managed() ? "keepAliveLoaded" : "keepAliveLoadedUnmanaged"
     }
 
     static func sync(enabled: Bool) {
@@ -181,7 +201,7 @@ enum ContinuityModeController {
         // launchd 必须在加载 job 时把进程拉起来，KeepAlive 才能盯着。连续性打开期间
         // 因此强制 RunAtLoad：否则 bootstrap 后交接 exit(0)，job 停着没人拉，守护直接没了。
         LaunchAgentInstaller.installIfNeeded(crashRelaunch: true, runAtLoad: true)
-        unregisterLoginItemIfNeeded()
+        registerLoginItemFallbackIfNeeded()
         isActive = true
 
         let keepAliveInstalled = LaunchAgentInstaller.readInstalled().map { LaunchAgentPlist.crashRelaunch(from: $0) } ?? false
@@ -214,7 +234,7 @@ enum ContinuityModeController {
             Launchctl.bootout()
         }
         let bootstrapped = Launchctl.bootstrap(plistURL: LaunchAgentInstaller.launchAgentURL)
-        AuditLog.record("CONTINUITY_MODE_ENABLED via=bootstrap success=\(bootstrapped)")
+        AuditLog.record("CONTINUITY_MODE_ENABLED via=bootstrap success=\(bootstrapped) backgroundAllowed=\(LaunchAgentInstaller.isAllowedInBackground)")
         if bootstrapped && !isLaunchdManaged && launchdStartedSuccessor() {
             handoverExit()
         }
@@ -278,16 +298,29 @@ enum ContinuityModeController {
         }
     }
 
-    private static func unregisterLoginItemIfNeeded() {
+    /// 连续性打开时保留（必要时补注册）SMAppService 登录项，给 KeepAlive agent 当开机兜底。
+    ///
+    /// 以前这里是注销登录项、只靠 agent 的 RunAtLoad 开机自启，图的是登录时别起两份。
+    /// 2026-11 孩子那台 Mac 上栽了：系统设置「允许在后台」把这份 legacy agent 关成了
+    /// disallowed，登录时 launchd 根本不加载它，登录项又被我们自己注销了，于是从 10-25 起
+    /// 每次重启守护都起不来，要人手动打开（launchctl print-disabled 看不到这种关法，见
+    /// LaunchAgentInstaller.isAllowedInBackground）。
+    ///
+    /// 保留登录项后：agent 被拦，登录项照样把 App 打开，enableKeepAlive 走 bootstrap 把
+    /// agent 加载回来（运行时 bootstrap 不受这个开关拦，那台 Mac 上 21:03 实测成功），
+    /// KeepAlive 重新接管。agent 没被拦时两条都会在登录时拉 App：已有实例时 LaunchServices
+    /// 通常不会再起一份；真起了，后来者在 shouldExitAsDuplicate / enableKeepAlive 的交接里收敛。
+    /// .requiresApproval 是家长/孩子在系统设置里把登录项关了，不硬注册回去，靠心跳上报暴露。
+    private static func registerLoginItemFallbackIfNeeded() {
         if #available(macOS 13.0, *) {
             let status = SMAppService.mainApp.status
-            guard status == .enabled || status == .requiresApproval else { return }
+            guard status == .notRegistered || status == .notFound else { return }
             do {
-                try SMAppService.mainApp.unregister()
+                try SMAppService.mainApp.register()
                 OSLevelStatusCache.invalidate()
-                AuditLog.record("LAUNCH_AT_LOGIN_UNREGISTERED via=SMAppService reason=continuity")
+                AuditLog.record("LAUNCH_AT_LOGIN_REGISTERED via=SMAppService reason=continuity-fallback")
             } catch {
-                NSLog("BigDaddy: SMAppService unregister for continuity failed: \(error.localizedDescription)")
+                NSLog("BigDaddy: SMAppService register for continuity fallback failed: \(error.localizedDescription)")
             }
         }
     }
